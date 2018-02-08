@@ -7,6 +7,18 @@ License: GPLv2+
 Group: Applications/Engineering
 URL: https://github.com/redBorder/pmacct
 Source0: %{name}-%{version}.tar.gz
+Source1: nfacctd.service
+Source2: nfacctd
+Source3: pmacctd.service
+Source4: pmacctd
+Source5: sfacctd.service
+Source6: sfacctd
+Source7: pmbgpd.service
+Source8: pmbgpd
+Source9: pmbmpd.service
+Source10: pmbmpd
+Source11: pmtelemetryd.service
+Source12: pmtelemetryd
 
 Requires: bash redborder-common redborder-rubyrvm bash-completion bash-completion-extras
 BuildRequires: gcc
@@ -69,13 +81,8 @@ install -Dp examples/pmacctd-sql_v2.conf.example %{buildroot}/%{_sysconfdir}/%{n
 
 # install systemd units
 install -d %{buildroot}/%{_unitdir} %{buildroot}/%{_sysconfdir}/sysconfig/%{name}
-install packaging/rpm/*.service %{buildroot}/%{_unitdir}
-install packaging/rpm/sysconfig_nfacctd %{buildroot}/%{_sysconfdir}/sysconfig/%{name}/nfacctd
-install packaging/rpm/sysconfig_pmacctd %{buildroot}/%{_sysconfdir}/sysconfig/%{name}/pmacctd
-install packaging/rpm/sysconfig_sfacctd %{buildroot}/%{_sysconfdir}/sysconfig/%{name}/sfacctd
-install packaging/rpm/sysconfig_pmbgpd %{buildroot}/%{_sysconfdir}/sysconfig/%{name}/pmbgpd
-install packaging/rpm/sysconfig_pmbmpd %{buildroot}/%{_sysconfdir}/sysconfig/%{name}/pmbmpd
-install packaging/rpm/sysconfig_pmtelemetryd %{buildroot}/%{_sysconfdir}/sysconfig/%{name}/pmtelemetryd
+install %{SOURCE1} %{SOURCE3} %{SOURCE5} %{SOURCE7} %{SOURCE9} %{SOURCE11} %{buildroot}/%{_unitdir}
+install %{SOURCE2} %{SOURCE4} %{SOURCE6} %{SOURCE8} %{SOURCE10} %{SOURCE12} %{buildroot}/%{_sysconfdir}/sysconfig/%{name}
 
 %post
 %systemd_post nfacctd.service

@@ -1,6 +1,7 @@
 PACKAGE_NAME?=	pmacct
 
-VERSION?=	$(shell git describe --abbrev=6 --tags HEAD --always | sed 's/-/_/g')
+VERSION?= 1.6.2
+COMMIT?= 0aa79f0b0c4b18eaefb9976bee9cfc4e18a533d6
 
 BUILD_NUMBER?= 1
 
@@ -17,8 +18,14 @@ SOURCES:
 archive: SOURCES
 	cd ../../ && \
 	git archive --prefix=$(PACKAGE_NAME)-$(VERSION)/ \
-		-o packaging/rpm/SOURCES/$(PACKAGE_NAME)-$(VERSION).tar.gz HEAD
-
+		-o packaging/rpm/SOURCES/$(PACKAGE_NAME)-$(VERSION).tar.gz $(COMMIT)
+	cp *.service SOURCES
+	cp nfacctd SOURCES
+	cp pmacctd SOURCES
+	cp pmbgpd SOURCES
+	cp pmbmpd SOURCES
+	cp pmtelemetryd SOURCES
+	cp sfacctd SOURCES
 
 build_prepare: archive
 	mkdir -p $(RESULT_DIR)
