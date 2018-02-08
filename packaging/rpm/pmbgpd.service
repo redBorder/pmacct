@@ -1,0 +1,12 @@
+[Unit]
+Description=pmacct BGP Collector Daemon
+Wants=network.target
+After=network.target
+ConditionPathExists=/etc/pmacct/pmbgpd.conf
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/pmacct/pmbgpd
+ExecStart=/usr/sbin/pmbgpd -f /etc/pmacct/pmbgpd.conf $OPTIONS
+
+[Install]
+WantedBy=multi-user.target

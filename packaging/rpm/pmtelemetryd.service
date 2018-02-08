@@ -1,0 +1,12 @@
+[Unit]
+Description=Streaming Network Telemetry Daemon
+Wants=network.target
+After=network.target
+ConditionPathExists=/etc/pmacct/pmtelemetryd.conf
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/pmacct/pmtelemetryd
+ExecStart=/usr/sbin/pmtelemetryd -f /etc/pmacct/pmtelemetryd.conf $OPTIONS
+
+[Install]
+WantedBy=multi-user.target

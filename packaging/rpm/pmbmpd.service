@@ -1,0 +1,12 @@
+[Unit]
+Description=pmacct BMP Collector Daemon
+Wants=network.target
+After=network.target
+ConditionPathExists=/etc/pmacct/pmbmpd.conf
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/pmacct/pmbmpd
+ExecStart=/usr/sbin/pmbmpd -f /etc/pmacct/pmbmpd.conf $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
