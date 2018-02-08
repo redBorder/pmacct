@@ -19,13 +19,8 @@ archive: SOURCES
 	cd ../../ && \
 	git archive --prefix=$(PACKAGE_NAME)-$(VERSION)/ \
 		-o packaging/rpm/SOURCES/$(PACKAGE_NAME)-$(VERSION).tar.gz $(COMMIT)
-	cp *.service SOURCES
-	cp nfacctd SOURCES
-	cp pmacctd SOURCES
-	cp pmbgpd SOURCES
-	cp pmbmpd SOURCES
-	cp pmtelemetryd SOURCES
-	cp sfacctd SOURCES
+	cp service/* SOURCES
+	cp sysconfig/* SOURCES
 
 build_prepare: archive
 	mkdir -p $(RESULT_DIR)
