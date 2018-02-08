@@ -20,9 +20,17 @@ DOCUMENTATION
 # BUILDING
 
 - Build GitHub code:
-  * git clone https://github.com/pmacct/pmacct.git
+  * git clone https://github.com/redborder/pmacct.git
   * cd pmacct
   * ./autogen.sh *[pkg-config, libtool, autoconf, automake and bash packages required]*
   * ./configure *[check-out available configure knobs via ./configure --help]* 
   * make
   * make install *[with super-user permission]*
+
+# redborder add-on:
+
+- Build rpm package for redborder platform:
+  * git clone https://github.com/redborder/pmacct.git
+  * cd pmacct/packaging/rpm
+  * VERSION=1.6.2 make
+  * RPM packages is under pmacct/packaging/rpm/pkgs/
