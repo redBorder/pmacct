@@ -84,6 +84,13 @@ install -d %{buildroot}/%{_unitdir} %{buildroot}/%{_sysconfdir}/sysconfig/%{name
 install %{SOURCE1} %{SOURCE3} %{SOURCE5} %{SOURCE7} %{SOURCE9} %{SOURCE11} %{buildroot}/%{_unitdir}
 install %{SOURCE2} %{SOURCE4} %{SOURCE6} %{SOURCE8} %{SOURCE10} %{SOURCE12} %{buildroot}/%{_sysconfdir}/sysconfig/%{name}
 
+%pre
+getent group %{name} >/dev/null || groupadd -r %{name}
+getent passwd %{name} >/dev/null || \
+    useradd -r -g %{name} -d / -s /sbin/nologin \
+    -c "User of %{name} service" %{name}
+exit 0
+
 %post
 %systemd_post nfacctd.service
 %systemd_post pmacctd.service
