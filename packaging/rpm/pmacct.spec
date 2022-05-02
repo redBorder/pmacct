@@ -112,13 +112,6 @@ install %{SOURCE2} %{SOURCE4} %{SOURCE6} %{SOURCE8} %{SOURCE10} %{SOURCE12} %{bu
 %{_sbindir}/pmbmpd
 %{_sbindir}/pmtelemetryd
 #
-%{_unitdir}/nfacctd.service
-%{_unitdir}/pmacctd.service
-%{_unitdir}/sfacctd.service
-%{_unitdir}/pmbgpd.service
-%{_unitdir}/pmbmpd.service
-%{_unitdir}/pmtelemetryd.service
-#
 %{_sysconfdir}/sysconfig/%{name}/nfacctd
 %{_sysconfdir}/sysconfig/%{name}/pmacctd
 %{_sysconfdir}/sysconfig/%{name}/sfacctd
@@ -129,8 +122,18 @@ install %{SOURCE2} %{SOURCE4} %{SOURCE6} %{SOURCE8} %{SOURCE10} %{SOURCE12} %{bu
 %dir %{_sysconfdir}/pmacct
 %attr(600,root,root) %config(noreplace) %{_sysconfdir}/pmacct/nfacctd.conf
 %attr(600,root,root) %config(noreplace) %{_sysconfdir}/pmacct/pmacctd.conf
+#
+%defattr(0644,root,root)
+%{_unitdir}/nfacctd.service
+%{_unitdir}/pmacctd.service
+%{_unitdir}/sfacctd.service
+%{_unitdir}/pmbgpd.service
+%{_unitdir}/pmbmpd.service
+%{_unitdir}/pmtelemetryd.service
 
 %changelog
+* Thu Apr 7 2022 Eduardo Reyes <eareyes@redborder.com> - 
+- Change services permissions
 * Thu Feb 8 2018 Juan J. Prieto <jjprieto@redborder.com> - 1.7.0-1
 - redborder spec version
 
