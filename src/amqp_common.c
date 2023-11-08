@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
 */
 
 /*
@@ -19,12 +19,26 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __AMQP_COMMON_C
-
 /* includes */
 #include "pmacct.h"
 #include "pmacct-data.h"
+#include "plugin_common.h"
 #include "amqp_common.h"
+
+/* Global variables */
+struct p_amqp_host amqpp_amqp_host;
+struct p_amqp_host bgp_daemon_msglog_amqp_host;
+struct p_amqp_host bmp_daemon_msglog_amqp_host;
+struct p_amqp_host sfacctd_counter_amqp_host;
+struct p_amqp_host telemetry_daemon_msglog_amqp_host;
+
+char rabbitmq_user[] = "guest";
+char rabbitmq_pwd[] = "guest";
+char default_amqp_exchange[] = "pmacct";
+char default_amqp_exchange_type[] = "direct";
+char default_amqp_routing_key[] = "acct";
+char default_amqp_host[] = "127.0.0.1";
+char default_amqp_vhost[] = "/";
 
 /* Functions */
 void p_amqp_init_host(struct p_amqp_host *amqp_host)
@@ -349,3 +363,45 @@ int write_and_free_json_amqp(void *amqp_log, void *obj)
   if (config.debug) Log(LOG_DEBUG, "DEBUG ( %s/%s ): write_and_free_json_amqp(): JSON object not created due to missing --enable-jansson\n", config.name, config.type);
 }
 #endif
+
+int write_binary_amqp(void *amqp_log, void *obj, size_t len)
+{
+  char *orig_amqp_routing_key = NULL, dyn_amqp_routing_key[SRVBUFLEN];
+  struct p_amqp_host *alog = (struct p_amqp_host *) amqp_log;
+  int ret = ERR;
+
+  if (obj && len) {
+    if (alog->rk_rr.max) {
+      orig_amqp_routing_key = p_amqp_get_routing_key(alog);
+      P_handle_table_dyn_rr(dyn_amqp_routing_key, SRVBUFLEN, orig_amqp_routing_key, &alog->rk_rr);
+      p_amqp_set_routing_key(alog, dyn_amqp_routing_key);
+    }
+
+    ret = p_amqp_publish_binary(alog, obj, len);
+
+    if (alog->rk_rr.max) p_amqp_set_routing_key(alog, orig_amqp_routing_key);
+  }
+
+  return ret;
+}
+
+int write_string_amqp(void *amqp_log, char *obj)
+{
+  char *orig_amqp_routing_key = NULL, dyn_amqp_routing_key[SRVBUFLEN];
+  struct p_amqp_host *alog = (struct p_amqp_host *) amqp_log;
+  int ret = ERR;
+
+  if (obj) {
+    if (alog->rk_rr.max) {
+      orig_amqp_routing_key = p_amqp_get_routing_key(alog);
+      P_handle_table_dyn_rr(dyn_amqp_routing_key, SRVBUFLEN, orig_amqp_routing_key, &alog->rk_rr);
+      p_amqp_set_routing_key(alog, dyn_amqp_routing_key);
+    }
+
+    ret = p_amqp_publish_string(alog, obj);
+
+    if (alog->rk_rr.max) p_amqp_set_routing_key(alog, orig_amqp_routing_key);
+  }
+
+  return ret;
+}

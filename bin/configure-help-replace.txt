@@ -21,6 +21,10 @@
   ZMQ_LIBS			linker flags for ZMQ, overriding pkg-config
   KAFKA_CFLAGS			C compiler flags for KAFKA, overriding pkg-config
   KAFKA_LIBS			linker flags for KAFKA, overriding pkg-config
+  REDIS_CFLAGS			C compiler flags for REDIS, overriding pkg-config
+  REDIS_LIBS			linker flags for REDIS, overriding pkg-config
+  GNUTLS_CFLAGS			C compiler flags for GNUTLS, overriding pkg-config
+  GNUTLS_LIBS			linker flags for GNUTLS, overriding pkg-config
   GEOIP_CFLAGS			C compiler flags for GEOIP, overriding pkg-config
   GEOIP_LIBS			linker flags for GEOIP, overriding pkg-config
   GEOIPV2_CFLAGS		C compiler flags for GEOIPV2, overriding pkg-config
@@ -29,8 +33,14 @@
   JANSSON_LIBS			linker flags for JANSSON, overriding pkg-config
   AVRO_CFLAGS			C compiler flags for AVRO, overriding pkg-config
   AVRO_LIBS			linker flags for AVRO, overriding pkg-config
+  SERDES_CFLAGS			C compiler flags for SERDES, overriding pkg-config
+  SERDES_LIBS			linker flags for SEREDES, overriding pkg-config
   NFLOG_CFLAGS			C compiler flags for NFLOG, overriding pkg-config
   NFLOG_LIBS			linker flags for NFLOG, overriding pkg-config
   NDPI_CFLAGS			C compiler flags for dynamic nDPI, overriding pkg-config
   NDPI_LIBS			linker flags for dynamic nDPI, overriding pkg-config
+  UNYTE_UDP_NOTIF_CFLAGS	C compiler flags for dynamic Unyte UDP Notif, overriding pkg-config
+  UNYTE_UDP_NOTIF_LIBS		linker flags for dynamic Unyte UDP Notif, overriding pkg-config
+  EBPF_CFLAGS			C compiler flags for dynamic libbpf, overriding pkg-config
+  EBPF_LIBS			linker flags for dynamic libbpf, overriding pkg-config
 

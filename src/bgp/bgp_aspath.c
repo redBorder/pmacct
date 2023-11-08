@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /* 
@@ -24,63 +24,17 @@ along with GNU Zebra; see the file COPYING.  If not, write to the Free
 Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 02111-1307, USA.  */
 
-#define __BGP_ASPATH_C
-
 #include "pmacct.h"
 #include "jhash.h"
 #include "bgp.h"
-
-/* Attr. Flags and Attr. Type Code. */
-#define AS_HEADER_SIZE        2	 
 
-/* Now FOUR octets are used for AS value. */
-#define AS_VALUE_SIZE         sizeof (as_t)
-/* This is the old one */
-#define AS16_VALUE_SIZE	      sizeof (as16_t)
-
-/* Maximum protocol segment length value */
-#define AS_SEGMENT_MAX		255
-
-/* Calculated size in bytes of ASN segment data to hold N ASN's */
-#define ASSEGMENT_DATA_SIZE(N,S) \
-	((N) * ( (S) ? AS_VALUE_SIZE : AS16_VALUE_SIZE) )
-
-/* Calculated size of segment struct to hold N ASN's */
-#define ASSEGMENT_SIZE(N,S)  (AS_HEADER_SIZE + ASSEGMENT_DATA_SIZE (N,S))
-
-/* AS segment octet length. */
-#define ASSEGMENT_LEN(X,S) ASSEGMENT_SIZE((X)->length,S)
-
-/* AS_SEQUENCE segments can be packed together */
-/* Can the types of X and Y be considered for packing? */
-#define ASSEGMENT_TYPES_PACKABLE(X,Y) \
-  ( ((X)->type == (Y)->type) \
-   && ((X)->type == AS_SEQUENCE))
-/* Types and length of X,Y suitable for packing? */
-#define ASSEGMENTS_PACKABLE(X,Y) \
-  ( ASSEGMENT_TYPES_PACKABLE( (X), (Y)) \
-   && ( ((X)->length + (Y)->length) <= AS_SEGMENT_MAX ) )
-
-/* As segment header - the on-wire representation 
- * NOT the internal representation!
- */
-struct assegment_header
-{
-  u_char type;
-  u_char length;
-};
-
-/* Hash for aspath.  This is the top level structure of AS path. */
-// struct hash *ashash;
-
-
 void *
 assegment_data_new (int num)
 {
-  return (malloc(ASSEGMENT_DATA_SIZE (num, 1)));
+  return (malloc(ASSEGMENT_DATA_SIZE (num, TRUE)));
 }
 
-static inline void
+__attribute__((unused)) static inline void
 assegment_data_free (as_t *asdata)
 {
   free(asdata);
@@ -99,7 +53,7 @@ assegment_new (u_char type, u_short length)
   new = malloc(sizeof (struct assegment));
   if (!new) {
     Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (assegment_new: new). Exiting ..\n", config.name); // XXX
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(new, 0, sizeof (struct assegment));
   
@@ -107,7 +61,7 @@ assegment_new (u_char type, u_short length)
     new->as = assegment_data_new (length);
     if (!new->as) {
       Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (assegment_new: new->as). Exiting ..\n", config.name); // XXX
-      exit_all(1);
+      exit_gracefully(1);
     }
     memset(new->as, 0, length);
   }
@@ -153,7 +107,7 @@ assegment_dup (struct assegment *seg)
   struct assegment *new;
   
   new = assegment_new (seg->type, seg->length);
-  memcpy (new->as, seg->as, ASSEGMENT_DATA_SIZE (new->length, 1) );
+  memcpy (new->as, seg->as, ASSEGMENT_DATA_SIZE (new->length, TRUE /* 32-bit ASN */) );
     
   return new;
 }
@@ -180,49 +134,18 @@ assegment_dup_all (struct assegment *seg)
   return head;
 }
 
-/* prepend the as number to given segment, given num of times */
-static struct assegment *
-assegment_prepend_asns (struct assegment *seg, as_t asnum, int num)
-{
-  as_t *newas;
-  
-  if (!num)
-    return seg;
-  
-  if (num >= AS_SEGMENT_MAX)
-    return seg; /* we don't do huge prepends */
-  
-  newas = assegment_data_new (seg->length + num);
-  
-  if (newas)
-    {
-      int i;
-      for (i = 0; i < num; i++)
-        newas[i] = asnum;
-      
-      memcpy (newas + num, seg->as, ASSEGMENT_DATA_SIZE (seg->length, 1));
-      free(seg->as);
-      seg->as = newas; 
-      seg->length += num;
-      return seg;
-    }
-
-  assegment_free_all (seg);
-  return NULL;
-}
-
 /* append given array of as numbers to the segment */
 static struct assegment *
 assegment_append_asns (struct assegment *seg, as_t *asnos, int num)
 {
   as_t *newas;
   
-  newas = realloc(seg->as, ASSEGMENT_DATA_SIZE (seg->length + num, 1));
+  newas = realloc(seg->as, ASSEGMENT_DATA_SIZE (seg->length + num, TRUE));
 
   if (newas)
     {
       seg->as = newas;
-      memcpy (seg->as + seg->length, asnos, ASSEGMENT_DATA_SIZE(num, 1));
+      memcpy (seg->as + seg->length, asnos, ASSEGMENT_DATA_SIZE(num, TRUE));
       seg->length += num;
       return seg;
     }
@@ -311,25 +234,20 @@ assegment_normalise (struct assegment *head)
     }
   return head;
 }
-
+
 static struct aspath *
-aspath_new (struct bgp_peer *peer)
+aspath_new ()
 {
-  struct bgp_misc_structs *bms;
   struct aspath *aspath;
 
-  if (!peer) return NULL;
-
-  bms = bgp_select_misc_db(peer->type);
-
-  if (!bms) return NULL;
-
   aspath = malloc(sizeof (struct aspath));
+
   if (!aspath) {
-    Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (aspath_new). Exiting ..\n", config.name, bms->log_str);
-    exit_all(1);
+    Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (aspath_new). Exiting ..\n", config.name); // XXX
+    exit_gracefully(1);
   }
   memset (aspath, 0, sizeof (struct aspath));
+
   return aspath;
 }
 
@@ -350,7 +268,8 @@ void
 aspath_unintern(struct bgp_peer *peer, struct aspath *aspath)
 {
   struct bgp_rt_structs *inter_domain_routing_db;
-  struct aspath *ret;
+  struct aspath *ret = NULL;
+  (void) ret;
 
   if (!peer) return;
 
@@ -367,6 +286,34 @@ aspath_unintern(struct bgp_peer *peer, struct aspath *aspath)
     assert (ret != NULL);
     aspath_free (aspath);
   }
+}
+
+/* Add new as segment to the as path. */
+static void
+aspath_segment_add (struct aspath *as, int type)
+{
+  struct assegment *seg = as->segments;
+  struct assegment *new = assegment_new (type, 0);
+
+  if (seg) {
+    while (seg->next) seg = seg->next;
+    seg->next = new;
+  }
+  else as->segments = new;
+}
+
+/* Add new as value to as path structure. */
+static void
+aspath_as_add (struct aspath *as, as_t asno)
+{
+  struct assegment *seg = as->segments;
+
+  if (!seg) return;
+
+  /* Last segment search procedure. */
+  while (seg->next) seg = seg->next;
+
+  assegment_append_asns (seg, &asno, 1);
 }
 
 /* Return the start or end delimiters for a particular Segment type */
@@ -530,6 +477,22 @@ aspath_count_numas (struct aspath *aspath)
   return num;
 }
 
+char *aspath_make_empty()
+{
+  char *str_buf;
+
+  str_buf = malloc(1);
+
+  if (!str_buf) {
+    Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (aspath_make_str_count). Exiting ..\n", config.name); // XXX
+    exit_gracefully(1);
+  }
+
+  str_buf[0] = '\0';
+
+  return str_buf;
+}
+
 /* Convert aspath structure to string expression. */
 static char *
 aspath_make_str_count (struct aspath *as)
@@ -540,16 +503,10 @@ aspath_make_str_count (struct aspath *as)
   char *str_buf;
 
   /* Empty aspath. */
-  if (!as->segments)
-    {
-      str_buf = malloc(1);
-      if (!str_buf) {
-	Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (aspath_make_str_count). Exiting ..\n", config.name); // XXX
-	exit_all(1);
-      }
-      str_buf[0] = '\0';
-      return str_buf;
-    }
+  if (!as->segments) {
+    str_buf = aspath_make_empty();
+    return str_buf;
+  }
 
   seg = as->segments;
   
@@ -568,14 +525,14 @@ aspath_make_str_count (struct aspath *as)
   str_buf = malloc(str_size);
   if (!str_buf) {
     Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (aspath_make_str_count). Exiting ..\n", config.name); // XXX
-    exit_all(1);
+    exit_gracefully(1);
   }
 
   while (seg)
     {
       int i;
       char seperator;
-      
+
       /* Check AS type validity. Set seperator for segment */
       switch (seg->type)
         {
@@ -589,7 +546,8 @@ aspath_make_str_count (struct aspath *as)
             break;
           default:
             free(str_buf);
-            return NULL;
+	    str_buf = aspath_make_empty();
+	    return str_buf;
         }
       
       /* We might need to increase str_buf, particularly if path has
@@ -688,7 +646,7 @@ aspath_dup (struct aspath *aspath)
   new = malloc(sizeof (struct aspath));
   if (!new) {
     Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (aspath_dup). Exiting ..\n", config.name); // XXX
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(new, 0, sizeof(struct aspath));
 
@@ -723,7 +681,7 @@ aspath_hash_alloc (void *arg)
 
 /* parse as-segment in struct assegment */
 static struct assegment *
-assegments_parse(char *s, size_t length, int use32bit)
+assegments_parse(struct bgp_peer *peer, char *s, size_t length, int use32bit)
 {
   struct assegment_header segh;
   struct assegment *seg, *prev = NULL, *head = NULL;
@@ -747,6 +705,17 @@ assegments_parse(char *s, size_t length, int use32bit)
       /* softly softly, get the header first on its own */
       tmp8 = (u_char *) s; segh.type = *tmp8; s++;
       tmp8 = (u_char *) s; segh.length = *tmp8; s++;
+
+      /* small BMP heuristics: since BGP OPENs are fabricated, they may
+	 not always reflect the reality of what is encoded in BGP UPDATE
+	 msgs */
+      if (peer->type == FUNC_TYPE_BMP && aspathlen > 2 && segh.length) {
+	if ((aspathlen - 2) / segh.length == AS_VALUE_SIZE) {
+	  if (!use32bit) {
+	    use32bit = TRUE;
+	  }
+	}
+      }
       
       seg_size = ASSEGMENT_SIZE(segh.length, use32bit);
 
@@ -810,7 +779,7 @@ struct aspath *aspath_parse(struct bgp_peer *peer, char *s, size_t length, int u
   if (length % AS16_VALUE_SIZE ) return NULL;
 
   memset (&as, 0, sizeof (struct aspath));
-  as.segments = assegments_parse(s, length, use32bit);
+  as.segments = assegments_parse(peer, s, length, use32bit);
   
   /* If already same aspath exist then return it. */
   find = hash_get (peer, inter_domain_routing_db->ashash, &as, aspath_hash_alloc);
@@ -959,13 +928,13 @@ aspath_cmp_left (const struct aspath *aspath1, const struct aspath *aspath2)
  * interned by the caller, as desired.
  */
 struct aspath *
-aspath_reconcile_as4 (struct bgp_peer *peer, struct aspath *aspath, struct aspath *as4path)
+aspath_reconcile_as4 (struct aspath *aspath, struct aspath *as4path)
 {
   struct assegment *seg, *newseg, *prevseg = NULL;
   struct aspath *newpath = NULL, *mergedpath;
   int hops, cpasns = 0;
   
-  if (!aspath || !peer) return NULL;
+  if (!aspath) return NULL;
   
   seg = aspath->segments;
   
@@ -1018,7 +987,7 @@ aspath_reconcile_as4 (struct bgp_peer *peer, struct aspath *aspath, struct aspat
 
       if (!newpath)
         {
-          newpath = aspath_new (peer);
+          newpath = aspath_new ();
           newpath->segments = newseg;
         }
       else
@@ -1114,4 +1083,171 @@ const char *
 aspath_print (struct aspath *as)
 {
   return (as ? as->str : NULL);
+}
+
+/* Return next token and point for string parse. */
+const char *
+aspath_gettoken (const char *buf, enum as_token *token, as_t *asno)
+{
+  const char *p = buf;
+
+  /* Skip seperators (space for sequences, ',' for sets). */
+  while (isspace ((int) *p) || *p == ',') p++;
+
+  /* Check the end of the string and type specify characters
+     (e.g. {}()). */
+  switch (*p) {
+  case '\0':
+    return NULL;
+  case '{':
+    *token = as_token_set_start;
+    p++;
+    return p;
+  case '}':
+    *token = as_token_set_end;
+    p++;
+    return p;
+  case '(':
+    *token = as_token_confed_seq_start;
+    p++;
+    return p;
+  case ')':
+    *token = as_token_confed_seq_end;
+    p++;
+    return p;
+  case '[':
+    *token = as_token_confed_set_start;
+    p++;
+    return p;
+  case ']':
+    *token = as_token_confed_set_end;
+    p++;
+    return p;
+  }
+
+  /* Check actual AS value. */
+  if (isdigit ((int) *p)) {
+    as_t asval;
+
+    *token = as_token_asval;
+    asval = (*p - '0');
+    p++;
+
+    while (isdigit ((int) *p)) {
+      asval *= 10;
+      asval += (*p - '0');
+      p++;
+    }
+
+    *asno = asval;
+    return p;
+  }
+
+  /* There is no match then return unknown token. */
+  *token = as_token_unknown;
+  return  p++;
+}
+
+struct aspath *
+aspath_str2aspath (const char *str)
+{
+  enum as_token token = as_token_unknown;
+  u_short as_type;
+  as_t asno = 0;
+  struct aspath *aspath;
+  int needtype;
+
+  aspath = aspath_new ();
+
+  /* We start default type as AS_SEQUENCE. */
+  as_type = AS_SEQUENCE;
+  needtype = 1;
+
+  while ((str = aspath_gettoken (str, &token, &asno)) != NULL) {
+    switch (token) {
+    case as_token_asval:
+      if (needtype) {
+        aspath_segment_add (aspath, as_type);
+        needtype = 0;
+      }
+
+      aspath_as_add (aspath, asno);
+      break;
+    case as_token_set_start:
+      as_type = AS_SET;
+      aspath_segment_add (aspath, as_type);
+      needtype = 0;
+      break;
+    case as_token_set_end:
+      as_type = AS_SEQUENCE;
+      needtype = 1;
+      break;
+    case as_token_confed_seq_start:
+      as_type = AS_CONFED_SEQUENCE;
+      aspath_segment_add (aspath, as_type);
+      needtype = 0;
+      break;
+    case as_token_confed_seq_end:
+      as_type = AS_SEQUENCE;
+      needtype = 1;
+      break;
+    case as_token_confed_set_start:
+      as_type = AS_CONFED_SET;
+      aspath_segment_add (aspath, as_type);
+      needtype = 0;
+      break;
+    case as_token_confed_set_end:
+      as_type = AS_SEQUENCE;
+      needtype = 1;
+      break;
+    case as_token_unknown:
+    default:
+      aspath_free (aspath);
+      return NULL;
+    }
+  }
+
+  aspath_make_str_count (aspath);
+
+  return aspath;
+}
+
+struct aspath *
+aspath_ast2aspath (as_t asn)
+{
+  struct aspath *aspath;
+
+  aspath = aspath_new ();
+  aspath_segment_add (aspath, AS_SEQUENCE);
+  aspath_as_add (aspath, asn);
+  aspath_make_str_count (aspath);
+
+  return aspath;
+}
+
+struct aspath *
+aspath_parse_ast(struct bgp_peer *peer, as_t asn)
+{
+  struct bgp_rt_structs *inter_domain_routing_db;
+  struct aspath *aspath, *find;
+
+  if (!peer) return NULL;
+
+  inter_domain_routing_db = bgp_select_routing_db(peer->type);
+
+  if (!inter_domain_routing_db) return NULL;
+
+  aspath = aspath_ast2aspath(asn);
+  find = hash_get (peer, inter_domain_routing_db->ashash, aspath, aspath_hash_alloc);
+
+  /* aspath_hash_alloc dupes stuff */
+  assegment_free_all (aspath->segments);
+  if (aspath->str) free(aspath->str);
+  free(aspath);
+
+  if (!find) return NULL;
+
+  find->refcnt++;
+
+  return find;
 }

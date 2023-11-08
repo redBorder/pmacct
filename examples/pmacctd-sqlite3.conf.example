@@ -1,0 +1,28 @@
+!
+! pmacctd configuration example
+!
+! Did you know CONFIG-KEYS contains the detailed list of all configuration keys supported ?
+!
+! General configs
+!
+! debug: true
+daemonize: false
+!
+! libpcap daemon configs
+!
+pcap_interface: eth0
+!
+! Plugins definitions
+!
+plugins: sqlite3[foo]
+!
+! 'foo' plugin configuration
+!
+aggregate[foo]: src_host, dst_host
+sql_db[foo]: /path/to/pmacct.db 
+sql_table_version[foo]: 1 
+! sql_table_version[foo]: 2 
+! sql_table_version[foo]: 3 
+sql_refresh_time[foo]: 60
+sql_history[foo]: 1m 
+sql_history_roundoff[foo]: m

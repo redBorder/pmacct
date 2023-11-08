@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /* 
@@ -24,8 +24,6 @@
  * 02111-1307, USA.  
  */
 
-#define __BGP_PREFIX_C
-
 #include "pmacct.h"
 #include "bgp_packet.h"
 #include "bgp_prefix.h"
@@ -47,10 +45,8 @@ afi2family (int afi)
 {
   if (afi == AFI_IP)
     return AF_INET;
-#ifdef ENABLE_IPV6
   else if (afi == AFI_IP6)
     return AF_INET6;
-#endif /* ENABLE_IPV6 */
   return 0;
 }
 
@@ -59,10 +55,8 @@ family2afi (int family)
 {
   if (family == AF_INET)
     return AFI_IP;
-#ifdef ENABLE_IPV6
   else if (family == AF_INET6)
     return AFI_IP6;
-#endif /* ENABLE_IPV6 */
   return 0;
 }
 
@@ -103,10 +97,8 @@ prefix_copy (struct prefix *dest, const struct prefix *src)
 
   if (src->family == AF_INET)
     dest->u.prefix4 = src->u.prefix4;
-#ifdef ENABLE_IPV6
   else if (src->family == AF_INET6)
     dest->u.prefix6 = src->u.prefix6;
-#endif /* ENABLE_IPV6 */
   // XXX: "else if (src->family == AF_UNSPEC)" case
   // XXX: "else" case
 }
@@ -127,11 +119,9 @@ prefix_same (const struct prefix *p1, const struct prefix *p2)
       if (p1->family == AF_INET)
 	if (IPV4_ADDR_SAME (&p1->u.prefix, &p2->u.prefix))
 	  return 1;
-#ifdef ENABLE_IPV6
       if (p1->family == AF_INET6 )
 	if (IPV6_ADDR_SAME (&p1->u.prefix, &p2->u.prefix))
 	  return 1;
-#endif /* ENABLE_IPV6 */
     }
   return 0;
 }
@@ -179,10 +169,9 @@ prefix_family_str (const struct prefix *p)
 {
   if (p->family == AF_INET)
     return "inet";
-#ifdef ENABLE_IPV6
   if (p->family == AF_INET6)
     return "inet6";
-#endif /* ENABLE_IPV6 */
+
   return "unspec";
 }
 
@@ -238,7 +227,7 @@ str2prefix_ipv4 (const char *str, struct prefix_ipv4 *p)
       cp = malloc ((pnt - str) + 1);
       if (!cp) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (str2prefix_ipv4). Exiting ..\n", config.name, config.type);
-	exit_all(1);
+	exit_gracefully(1);
       }
       strncpy (cp, str, pnt - str);
       *(cp + (pnt - str)) = '\0';
@@ -339,8 +328,6 @@ prefix_ipv4_any (const struct prefix_ipv4 *p)
 {
   return (p->prefix.s_addr == 0 && p->prefixlen == 0);
 }
-
-#ifdef ENABLE_IPV6
 
 /* Allocate a new ip version 6 route */
 struct prefix_ipv6 *
@@ -387,7 +374,7 @@ str2prefix_ipv6 (const char *str, struct prefix_ipv6 *p)
       cp = malloc((pnt - str) + 1);
       if (!cp) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (str2prefix_ipv6). Exiting ..\n", config.name, config.type);
-	exit_all(1);
+	exit_gracefully(1);
       }
       strncpy (cp, str, pnt - str);
       *(cp + (pnt - str)) = '\0';
@@ -489,7 +476,6 @@ str2in6_addr (const char *str, struct in6_addr *addr)
       addr->s6_addr[i] = x & 0xff;
     }
 }
-#endif /* ENABLE_IPV6 */
 
 void
 apply_mask (struct prefix *p)
@@ -499,11 +485,9 @@ apply_mask (struct prefix *p)
       case AF_INET:
         apply_mask_ipv4 ((struct prefix_ipv4 *)p);
         break;
-#ifdef ENABLE_IPV6
       case AF_INET6:
         apply_mask_ipv6 ((struct prefix_ipv6 *)p);
         break;
-#endif /* ENABLE_IPV6 */
       default:
         break;
     }
@@ -518,11 +502,9 @@ prefix_blen (const struct prefix *p)
     case AF_INET:
       return IPV4_MAX_BYTELEN;
       break;
-#ifdef ENABLE_IPV6
     case AF_INET6:
       return IPV6_MAX_BYTELEN;
       break;
-#endif /* ENABLE_IPV6 */
     }
   return 0;
 }
@@ -538,12 +520,10 @@ str2prefix (const char *str, struct prefix *p)
   if (ret)
     return ret;
 
-#ifdef ENABLE_IPV6
   /* Next we try to convert string to struct prefix_ipv6. */
   ret = str2prefix_ipv6 (str, (struct prefix_ipv6 *) p);
   if (ret)
     return ret;
-#endif /* ENABLE_IPV6 */
 
   return 0;
 }
@@ -566,7 +546,7 @@ prefix_new ()
   p = malloc (sizeof *p);
   if (!p) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (prefix_new). Exiting ..\n", config.name, config.type);
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(p, 0, sizeof *p); 
 
@@ -687,7 +667,6 @@ netmask_str2prefix_str (const char *net_str, const char *mask_str,
   return 1;
 }
 
-#ifdef ENABLE_IPV6
 /* Utility function for making IPv6 address string. */
 const char *
 inet6_ntoa (struct in6_addr addr)
@@ -697,4 +676,3 @@ inet6_ntoa (struct in6_addr addr)
   inet_ntop (AF_INET6, &addr, buf, INET6_ADDRSTRLEN);
   return buf;
 }
-#endif /* ENABLE_IPV6 */

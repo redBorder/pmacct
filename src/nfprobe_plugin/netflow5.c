@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2014 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2020 by Paolo Lucente
 */
 
 /*
@@ -35,12 +35,8 @@
 #include "treetype.h"
 #include "nfprobe_plugin.h"
 
-RCSID("$Id$");
-
 /*
  * This is the Cisco Netflow(tm) version 5 packet format
- * Based on:
- * http://www.cisco.com/univercd/cc/td/doc/product/rtrmgmt/nfc/nfc_3_0/nfc_ug/nfcform.htm
  */
 struct NF5_HEADER {
 	u_int16_t version, flows;
@@ -60,7 +56,13 @@ struct NF5_FLOW {
 	u_int8_t src_mask, dst_mask;
 	u_int16_t pad2;
 };
+
+#ifdef WITH_GNUTLS
+#define NF5_MAXFLOWS		20
+#else
 #define NF5_MAXFLOWS		30
+#endif
+
 #define NF5_MAXPACKET_SIZE	(sizeof(struct NF5_HEADER) + \
 				 (NF5_MAXFLOWS * sizeof(struct NF5_FLOW)))
 
@@ -69,17 +71,21 @@ struct NF5_FLOW {
  * Returns number of packets sent or -1 on error
  */
 int
-send_netflow_v5(struct FLOW **flows, int num_flows, int nfsock,
+send_netflow_v5(struct FLOW **flows, int num_flows, int nfsock, void *dtls,
     u_int64_t *flows_exported, struct timeval *system_boot_time,
-    int verbose_flag, u_int8_t engine_type, u_int8_t engine_id)
+    int verbose_flag, u_int8_t engine_type, u_int32_t engine_id)
 {
 	struct timeval now;
 	u_int32_t uptime_ms;
 	u_int8_t packet[NF5_MAXPACKET_SIZE];	/* Maximum allowed packet size (24 flows) */
 	struct NF5_HEADER *hdr = NULL;
 	struct NF5_FLOW *flw = NULL;
-	int i, j, offset, num_packets, err;
+	int i, j, offset, num_packets, err, ret;
 	socklen_t errsz;
+
+#ifdef WITH_GNUTLS
+	pm_dtls_peer_t *dtls_peer = dtls;
+#endif
 	
 	gettimeofday(&now, NULL);
 	uptime_ms = timeval_sub_ms(&now, system_boot_time);
@@ -91,12 +97,22 @@ send_netflow_v5(struct FLOW **flows, int num_flows, int nfsock,
 			  Log(LOG_DEBUG, "DEBUG ( %s/%s ): Sending NetFlow v5 packet: len = %d\n", config.name, config.type, offset);
 			hdr->flows = htons(hdr->flows);
 			errsz = sizeof(err);
-			getsockopt(nfsock, SOL_SOCKET, SO_ERROR,
-			    &err, &errsz); /* Clear ICMP errors */
-			if (send(nfsock, packet, (size_t)offset, 0) == -1) {
-			  Log(LOG_WARNING, "WARN ( %s/%s ): send() failed: %s\n", config.name, config.type, strerror(errno));
-			  return (-1);
+			getsockopt(nfsock, SOL_SOCKET, SO_ERROR, &err, &errsz); /* Clear ICMP errors */
+
+			if (!config.nfprobe_dtls) {
+			  ret = send(nfsock, packet, (size_t)offset, 0);
+
+			  if (ret == ERR) {
+			    Log(LOG_WARNING, "WARN ( %s/%s ): send() failed: %s\n", config.name, config.type, strerror(errno));
+			    return ret;
+			  }
 			}
+#ifdef WITH_GNUTLS
+			else {
+			  ret = pm_dtls_client_send(dtls_peer, packet, (size_t)offset);
+			  if (ret < 0) return ret;
+			}
+#endif
 			*flows_exported += j;
 			j = 0;
 			num_packets++;
@@ -145,16 +161,11 @@ send_netflow_v5(struct FLOW **flows, int num_flows, int nfsock,
 			  if (tmp_as > 65535) flw->dest_as = htons(23456);
 			  else flw->dest_as = htons(tmp_as);
 			}
-#if defined HAVE_64BIT_COUNTERS
 			rec32 = flows[i]->packets[0];
 			flw->flow_packets = htonl(rec32);
 
 			rec32 = flows[i]->octets[0];
 			flw->flow_octets = htonl(rec32);
-#else
-			flw->flow_packets = htonl(flows[i]->packets[0]);
-			flw->flow_octets = htonl(flows[i]->octets[0]);
-#endif
 
 			flw->flow_start =
 			    htonl(timeval_sub_ms(&flows[i]->flow_start,
@@ -193,16 +204,12 @@ send_netflow_v5(struct FLOW **flows, int num_flows, int nfsock,
 			  if (tmp_as > 65535) flw->dest_as = htons(23456);
 			  else flw->dest_as = htons(tmp_as);
 			}
-#if defined HAVE_64BIT_COUNTERS
 			rec32 = flows[i]->packets[1];
 			flw->flow_packets = htonl(rec32);
 
 			rec32 = flows[i]->octets[1];
 			flw->flow_octets = htonl(rec32);
-#else
-			flw->flow_packets = htonl(flows[i]->packets[1]);
-			flw->flow_octets = htonl(flows[i]->octets[1]);
-#endif
+
 			flw->flow_start =
 			    htonl(timeval_sub_ms(&flows[i]->flow_start,
 			    system_boot_time));
@@ -224,16 +231,25 @@ send_netflow_v5(struct FLOW **flows, int num_flows, int nfsock,
 		  Log(LOG_DEBUG, "DEBUG ( %s/%s ): Sending NetFlow v5 packet: len = %d\n", config.name, config.type, offset);
 		hdr->flows = htons(hdr->flows);
 		errsz = sizeof(err);
-		getsockopt(nfsock, SOL_SOCKET, SO_ERROR,
-		    &err, &errsz); /* Clear ICMP errors */
-		if (send(nfsock, packet, (size_t)offset, 0) == -1) {
-		  Log(LOG_WARNING, "WARN ( %s/%s ): send() failed: %s\n", config.name, config.type, strerror(errno));
-	 	  return (-1);
+		getsockopt(nfsock, SOL_SOCKET, SO_ERROR, &err, &errsz); /* Clear ICMP errors */
+
+		if (!config.nfprobe_dtls) {
+		  ret = send(nfsock, packet, (size_t)offset, 0);
+
+		  if (ret == ERR) {
+		    Log(LOG_WARNING, "WARN ( %s/%s ): send() failed: %s\n", config.name, config.type, strerror(errno));
+		    return ret;
+		  }
+                }
+#ifdef WITH_GNUTLS
+		else {
+		  ret = pm_dtls_client_send(dtls_peer, packet, (size_t)offset);
+		  if (ret < 0) return ret;
 		}
+#endif
 		num_packets++;
 	}
 
 	*flows_exported += j;
 	return (num_packets);
 }
-

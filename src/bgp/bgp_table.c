@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
 */
 
 /* 
@@ -22,9 +22,6 @@ You should have received a copy of the GNU General Public License
 along with GNU Zebra; see the file COPYING.  If not, write to the Free
 Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 02111-1307, USA.  */
-
-/* defines */
-#define __BGP_TABLE_C
 
 /* includes */
 #include "pmacct.h"
@@ -52,7 +49,7 @@ bgp_table_init (afi_t afi, safi_t safi)
   }
   else {
     Log(LOG_ERR, "ERROR ( %s/core/BGP ): malloc() failed (bgp_table_init). Exiting ..\n", config.name); // XXX
-    exit_all(1);
+    exit_gracefully(1);
   }
   
   return rt;
@@ -84,7 +81,9 @@ bgp_node_create (struct bgp_peer *peer)
 
   malloc_failed:
   Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (bgp_node_create). Exiting ..\n", config.name, bms->log_str);
-  exit_all(1);
+  exit_gracefully(1);
+
+  return NULL; /* silence compiler warning */
 }
 
 /* Allocate new route node with prefix set. */
@@ -92,6 +91,7 @@ static struct bgp_node *
 bgp_node_set (struct bgp_peer *peer, struct bgp_table *table, struct prefix *prefix)
 {
   struct bgp_misc_structs *bms = bgp_select_misc_db(peer->type);
+  (void)bms;
   struct bgp_node *node;
   
   node = bgp_node_create (peer);
@@ -106,7 +106,11 @@ bgp_node_set (struct bgp_peer *peer, struct bgp_table *table, struct prefix *pre
 static void
 bgp_node_free (struct bgp_node *node)
 {
-  free (node->info);
+  if (node->info) {
+    free (node->info);
+    node->info = NULL;
+  }
+
   free (node);
 }
 
@@ -191,7 +195,14 @@ set_link (struct bgp_node *node, struct bgp_node *new)
 struct bgp_node *
 bgp_lock_node (struct bgp_peer *peer, struct bgp_node *node)
 {
-  node->lock++;
+  struct bgp_misc_structs *bms = bgp_select_misc_db(peer->type);
+
+  assert(bms);
+
+  if (!bms->is_readonly) {
+    node->lock++;
+  }
+
   return node;
 }
 
@@ -199,10 +210,36 @@ bgp_lock_node (struct bgp_peer *peer, struct bgp_node *node)
 void
 bgp_unlock_node (struct bgp_peer *peer, struct bgp_node *node)
 {
-  node->lock--;
+  struct bgp_misc_structs *bms = bgp_select_misc_db(peer->type);
 
-  if (node->lock == 0)
-    bgp_node_delete (peer, node);
+  assert(bms);
+
+  if (!bms->is_readonly) {
+    node->lock--;
+
+    if (node->lock == 0) {
+      bgp_node_delete (peer, node);
+    }
+  }
+}
+
+void bgp_node_vector_debug(struct bgp_node_vector *bnv, struct prefix *p)
+{
+  char prefix_str[PREFIX_STRLEN];
+  int idx;
+  
+
+  if (bnv && p) {
+    memset(prefix_str, 0, PREFIX_STRLEN);
+    prefix2str(p, prefix_str, PREFIX_STRLEN);
+    Log(LOG_DEBUG, "DEBUG ( %s/core/BGP ): bgp_node_vector_debug(): levels=%u lookup=%s\n", config.name, bnv->entries, prefix_str);
+    
+    for (idx = 0; idx < bnv->entries; idx++) {
+      memset(prefix_str, 0, PREFIX_STRLEN);
+      prefix2str(bnv->v[idx].p, prefix_str, PREFIX_STRLEN);
+      Log(LOG_DEBUG, "DEBUG ( %s/core/BGP ): bgp_node_vector_debug(): level=%u prefix=%s\n", config.name, idx, prefix_str);
+    }
+  }
 }
 
 /* Find matched prefix. */
@@ -210,7 +247,7 @@ void
 bgp_node_match (const struct bgp_table *table, struct prefix *p, struct bgp_peer *peer,
 		u_int32_t (*modulo_func)(struct bgp_peer *, path_id_t *, int),
 		int (*cmp_func)(struct bgp_info *, struct node_match_cmp_term2 *),
-		struct node_match_cmp_term2 *nmct2,
+		struct node_match_cmp_term2 *nmct2, struct bgp_node_vector *bnv,
 		struct bgp_node **result_node, struct bgp_info **result_info)
 {
   struct bgp_misc_structs *bms;
@@ -218,7 +255,7 @@ bgp_node_match (const struct bgp_table *table, struct prefix *p, struct bgp_peer
   struct bgp_info *info, *matched_info;
   u_int32_t modulo, modulo_idx, local_modulo, modulo_max;
 
-  if (!table || !peer || !modulo_func || !cmp_func) return;
+  if (!table || !peer || !cmp_func) return;
 
   bms = bgp_select_misc_db(peer->type);
   if (!bms) return;
@@ -227,11 +264,13 @@ bgp_node_match (const struct bgp_table *table, struct prefix *p, struct bgp_peer
   if (bms->table_per_peer_hash == BGP_ASPATH_HASH_PATHID) modulo_max = bms->table_per_peer_buckets;
   else modulo_max = 1;
 
-  modulo = modulo_func(peer, NULL, modulo_max);
+  if (modulo_func) modulo = modulo_func(peer, NULL, modulo_max);
+  else modulo = 0;
 
   matched_node = NULL;
   matched_info = NULL;
   node = table->top;
+  if (bnv) bnv->entries = 0;
 
   /* Walk down tree.  If there is matched route then store it to matched. */
   while (node && node->p.prefixlen <= p->prefixlen && prefix_match(&node->p, p)) {
@@ -240,7 +279,14 @@ bgp_node_match (const struct bgp_table *table, struct prefix *p, struct bgp_peer
 	if (!cmp_func(info, nmct2)) {
 	  matched_node = node;
 	  matched_info = info;
-	  break;
+
+	  if (bnv) {
+	    bnv->v[bnv->entries].p = &node->p;
+	    bnv->v[bnv->entries].info = info;
+	    bnv->entries++;
+	  }
+
+	  if (node->p.prefixlen == p->prefixlen) break;
 	}
       }
     }
@@ -248,10 +294,12 @@ bgp_node_match (const struct bgp_table *table, struct prefix *p, struct bgp_peer
     node = node->link[check_bit(&p->u.prefix, node->p.prefixlen)];
   }
 
+  if (config.debug && bnv) bgp_node_vector_debug(bnv, p); 
+
   if (matched_node) {
     (*result_node) = matched_node;
     (*result_info) = matched_info;
-    bgp_lock_node (NULL /* XXX */, matched_node);
+    bgp_lock_node (peer, matched_node);
   }
   else {
     (*result_node) = NULL;
@@ -263,7 +311,7 @@ void
 bgp_node_match_ipv4 (const struct bgp_table *table, struct in_addr *addr, struct bgp_peer *peer,
 		     u_int32_t (*modulo_func)(struct bgp_peer *, path_id_t *, int),
 		     int (*cmp_func)(struct bgp_info *, struct node_match_cmp_term2 *),
-		     struct node_match_cmp_term2 *nmct2,
+		     struct node_match_cmp_term2 *nmct2, struct bgp_node_vector *bnv,
 		     struct bgp_node **result_node, struct bgp_info **result_info)
 {
   struct prefix_ipv4 p;
@@ -273,15 +321,14 @@ bgp_node_match_ipv4 (const struct bgp_table *table, struct in_addr *addr, struct
   p.prefixlen = IPV4_MAX_PREFIXLEN;
   p.prefix = *addr;
 
-  bgp_node_match (table, (struct prefix *) &p, peer, modulo_func, cmp_func, nmct2, result_node, result_info);
+  bgp_node_match (table, (struct prefix *) &p, peer, modulo_func, cmp_func, nmct2, bnv, result_node, result_info);
 }
 
-#ifdef ENABLE_IPV6
 void
 bgp_node_match_ipv6 (const struct bgp_table *table, struct in6_addr *addr, struct bgp_peer *peer,
 		     u_int32_t (*modulo_func)(struct bgp_peer *, path_id_t *, int),
 		     int (*cmp_func)(struct bgp_info *, struct node_match_cmp_term2 *),
-		     struct node_match_cmp_term2 *nmct2,
+		     struct node_match_cmp_term2 *nmct2, struct bgp_node_vector *bnv,
 		     struct bgp_node **result_node, struct bgp_info **result_info)
 {
   struct prefix_ipv6 p;
@@ -291,15 +338,15 @@ bgp_node_match_ipv6 (const struct bgp_table *table, struct in6_addr *addr, struc
   p.prefixlen = IPV6_MAX_PREFIXLEN;
   p.prefix = *addr;
 
-  bgp_node_match (table, (struct prefix *) &p, peer, modulo_func, cmp_func, nmct2, result_node, result_info);
+  bgp_node_match (table, (struct prefix *) &p, peer, modulo_func, cmp_func, nmct2, bnv, result_node, result_info);
 }
-#endif /* ENABLE_IPV6 */
 
 /* Add node to routing table. */
 struct bgp_node *
 bgp_node_get (struct bgp_peer *peer, struct bgp_table *const table, struct prefix *p)
 {
   struct bgp_misc_structs *bms = bgp_select_misc_db(peer->type);
+  (void)bms;
   struct bgp_node *new;
   struct bgp_node *node;
   struct bgp_node *match;
@@ -458,43 +505,56 @@ bgp_route_next (struct bgp_peer *peer, struct bgp_node *node)
   return NULL;
 }
 
-/* Unlock current node and lock next node until limit. */
-struct bgp_node *
-bgp_route_next_until (struct bgp_peer *peer, struct bgp_node *node, struct bgp_node *limit)
+/* Free route table. */
+void bgp_table_free (struct bgp_table *rt)
 {
-  struct bgp_node *next;
-  struct bgp_node *start;
+  struct bgp_node *tmp_node;
+  struct bgp_node *node;
 
-  /* Node may be deleted from bgp_unlock_node so we have to preserve
-     next node's pointer. */
+  if (rt == NULL)
+    return;
 
-  if (node->l_left)
-    {
-      next = node->l_left;
-      bgp_lock_node (peer, next);
-      bgp_unlock_node (peer, node);
-      return next;
-    }
-  if (node->l_right)
-    {
-      next = node->l_right;
-      bgp_lock_node (peer, next);
-      bgp_unlock_node (peer, node);
-      return next;
-    }
+  node = rt->top;
 
-  start = node;
-  while (node->parent && node != limit)
+  /* Bulk deletion of nodes remaining in this table.  This function is not
+     called until workers have completed their dependency on this table.
+     A final route_unlock_node() will not be called for these nodes. */
+  while (node)
     {
-      if (node->parent->l_left == node && node->parent->l_right)
+      if (node->l_left)
 	{
-	  next = node->parent->l_right;
-	  bgp_lock_node (peer, next);
-	  bgp_unlock_node (peer, start);
-	  return next;
+	  node = node->l_left;
+	  continue;
 	}
+
+      if (node->l_right)
+	{
+	  node = node->l_right;
+	  continue;
+	}
+
+      tmp_node = node;
       node = node->parent;
+
+      tmp_node->table->count--;
+      tmp_node->lock = 0;  /* to cause assert if unlocked after this */
+      bgp_node_free (tmp_node);
+
+      if (node != NULL)
+	{
+	  if (node->l_left == tmp_node)
+	    node->l_left = NULL;
+	  else
+	    node->l_right = NULL;
+	}
+      else
+	{
+	  break;
+	}
     }
-  bgp_unlock_node (peer, start);
-  return NULL;
+ 
+  assert (rt->count == 0);
+
+  free(rt);
+  return;
 }

@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,9 +19,6 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-/* defines */
-#define __PMBMPD_C
-
 /* includes */
 #include "pmacct.h"
 #include "bgp/bgp.h"
@@ -32,11 +29,7 @@
 #include "plugin_hooks.h"
 #include "pkt_handlers.h"
 #include "ip_flow.h"
-#include "classifier.h"
 #include "net_aggr.h"
-
-/* global var */
-struct channels_list_entry channels_list[MAX_N_PLUGINS]; /* communication channels: core <-> plugins */
 
 /* Functions */
 void usage_daemon(char *prog_name)
@@ -50,6 +43,10 @@ void usage_daemon(char *prog_name)
   printf("  -V  \tShow version and compile-time options and exit\n");
   printf("  -L  \tBind to the specified IP address\n");
   printf("  -l  \tListen on the specified TCP port\n");
+  printf("  -I  \tRead packets from the specified savefile\n");
+  printf("  -Z  \tReading from a savefile, sleep the given amount of seconds at startup and between replays\n");
+  printf("  -Y  \tReading from a savefile, replay the number of times specified\n");
+  printf("  -T  \tReading from a savefile, apply the filter specified with tcpdump syntax, ie. \"dst port 1790\"\n");
   printf("  -f  \tLoad configuration from the specified file\n");
   printf("  -D  \tDaemonize\n");
   printf("  -d  \tEnable debug\n");
@@ -77,6 +74,10 @@ int main(int argc,char **argv, char **envp)
   extern int optind, opterr, optopt;
   int errflag, cp;
 
+#ifdef WITH_REDIS
+  struct p_redis_host redis_host;
+#endif
+
 #if defined HAVE_MALLOPT
   mallopt(M_CHECK_ACTION, 0);
 #endif
@@ -86,14 +87,21 @@ int main(int argc,char **argv, char **envp)
   memset(cfg_cmdline, 0, sizeof(cfg_cmdline));
   memset(&config, 0, sizeof(struct configuration));
   memset(&config_file, 0, sizeof(config_file));
+  memset(empty_mem_area_256b, 0, sizeof(empty_mem_area_256b));
 
   log_notifications_init(&log_notifications);
   config.acct_type = ACCT_PMBMP;
+  config.progname = pmbmpd_globstr;
 
   find_id_func = NULL;
   plugins_list = NULL;
   errflag = 0;
   rows = 0;
+
+  /* needed for pre_tag_map support */
+  PvhdrSz = sizeof(struct pkt_vlen_hdr_primitives);
+  PmLabelTSz = sizeof(pm_label_t);
+  PtLabelTSz = sizeof(pt_label_t);
 
   /* getting commandline values */
   while (!errflag && ((cp = getopt(argc, argv, ARGS_PMBMPD)) != -1)) {
@@ -106,6 +114,26 @@ int main(int argc,char **argv, char **envp)
       break;
     case 'l':
       strlcpy(cfg_cmdline[rows], "bmp_daemon_port: ", SRVBUFLEN);
+      strncat(cfg_cmdline[rows], optarg, CFG_LINE_LEN(cfg_cmdline[rows]));
+      rows++;
+      break;
+    case 'I':
+      strlcpy(cfg_cmdline[rows], "pcap_savefile: ", SRVBUFLEN);
+      strncat(cfg_cmdline[rows], optarg, CFG_LINE_LEN(cfg_cmdline[rows]));
+      rows++;
+      break;
+    case 'Z':
+      strlcpy(cfg_cmdline[rows], "pcap_savefile_delay: ", SRVBUFLEN);
+      strncat(cfg_cmdline[rows], optarg, CFG_LINE_LEN(cfg_cmdline[rows]));
+      rows++;
+      break;
+    case 'Y':
+      strlcpy(cfg_cmdline[rows], "pcap_savefile_replay: ", SRVBUFLEN);
+      strncat(cfg_cmdline[rows], optarg, CFG_LINE_LEN(cfg_cmdline[rows]));
+      rows++;
+      break;
+    case 'T':
+      strlcpy(cfg_cmdline[rows], "pcap_filter: ", SRVBUFLEN);
       strncat(cfg_cmdline[rows], optarg, CFG_LINE_LEN(cfg_cmdline[rows]));
       rows++;
       break;
@@ -151,7 +179,7 @@ int main(int argc,char **argv, char **envp)
       exit(0);
       break;
     case 'V':
-      version_daemon(PMBMPD_USAGE_HEADER);
+      version_daemon(config.acct_type, PMBMPD_USAGE_HEADER);
       exit(0);
       break;
     default:
@@ -160,7 +188,6 @@ int main(int argc,char **argv, char **envp)
       break;
     }
   }
-
 
   /* post-checks and resolving conflicts */
   if (strlen(config_file)) {
@@ -175,6 +202,7 @@ int main(int argc,char **argv, char **envp)
   list = plugins_list;
   while (list) {
     list->cfg.acct_type = ACCT_PMBMP;
+    list->cfg.progname = pmbmpd_globstr;
     set_default_preferences(&list->cfg);
     if (!strcmp(list->type.string, "core")) {
       memcpy(&config, &list->cfg, sizeof(struct configuration));
@@ -186,13 +214,8 @@ int main(int argc,char **argv, char **envp)
 
   if (config.files_umask) umask(config.files_umask);
 
-  if (config.daemon) {
-    if (debug || config.debug)
-      printf("WARN ( %s/core ): debug is enabled; forking in background. Logging to standard error (stderr) will get lost.\n", config.name);
-    daemonize();
-  }
-
   initsetproctitle(argc, argv, envp);
+
   if (config.syslog) {
     logf = parse_log_facility(config.syslog);
     if (logf == ERR) {
@@ -203,13 +226,22 @@ int main(int argc,char **argv, char **envp)
     Log(LOG_INFO, "INFO ( %s/core ): Start logging ...\n", config.name);
   }
 
-  if (config.logfile)
-  {
+  if (config.logfile) {
     config.logfile_fd = open_output_file(config.logfile, "a", FALSE);
     while (list) {
       list->cfg.logfile_fd = config.logfile_fd ;
       list = list->next;
     }
+  }
+
+  if (config.daemon) {
+    if (!config.syslog && !config.logfile) {
+      if (debug || config.debug) {
+	printf("WARN ( %s/core ): debug is enabled; forking in background. Logging to standard error (stderr) will get lost.\n", config.name);
+      }
+    }
+
+    daemonize();
   }
 
   if (config.proc_priority) {
@@ -219,6 +251,9 @@ int main(int argc,char **argv, char **envp)
     if (ret) Log(LOG_WARNING, "WARN ( %s/core ): proc_priority failed (errno: %d)\n", config.name, errno);
     else Log(LOG_INFO, "INFO ( %s/core ): proc_priority set to %d\n", config.name, getpriority(PRIO_PROCESS, 0));
   }
+
+  Log(LOG_INFO, "INFO ( %s/core ): %s %s (%s)\n", config.name, PMBMPD_USAGE_HEADER, PMACCT_VERSION, PMACCT_BUILD);
+  Log(LOG_INFO, "INFO ( %s/core ): %s\n", config.name, PMACCT_COMPILE_ARGS);
 
   if (strlen(config_file)) {
     char canonical_path[PATH_MAX], *canonical_path_ptr;
@@ -232,14 +267,51 @@ int main(int argc,char **argv, char **envp)
   if (config.pidfile) write_pid_file(config.pidfile);
 
   /* signal handling we want to inherit to plugins (when not re-defined elsewhere) */
-  signal(SIGCHLD, startup_handle_falling_child); /* takes note of plugins failed during startup phase */
-  signal(SIGHUP, reload); /* handles reopening of syslog channel */
-  signal(SIGUSR1, SIG_IGN);
-  signal(SIGUSR2, reload_maps); /* sets to true the reload_maps flag */
-  signal(SIGPIPE, SIG_IGN); /* we want to exit gracefully when a pipe is broken */
+  memset(&sighandler_action, 0, sizeof(sighandler_action)); /* To ensure the struct holds no garbage values */
+  sigemptyset(&sighandler_action.sa_mask);  /* Within a signal handler all the signals are enabled */
+  sighandler_action.sa_flags = SA_RESTART;  /* To enable re-entering a system call afer done with signal handling */
 
-  if (!config.nfacctd_bmp_port) config.nfacctd_bmp_port = BMP_TCP_PORT;
+  /* handles reopening of syslog channel */
+  sighandler_action.sa_handler = reload;
+  sigaction(SIGHUP, &sighandler_action, NULL);
+
+  /* logs various statistics via Log() calls */
+  sighandler_action.sa_handler = SIG_IGN;
+  sigaction(SIGUSR1, &sighandler_action, NULL);
+
+  /* sets to true the reload_maps flag */
+  sighandler_action.sa_handler = reload_maps;
+  sigaction(SIGUSR2, &sighandler_action, NULL);
+
+  /* we want to exit gracefully when a pipe is broken */
+  sighandler_action.sa_handler = SIG_IGN;
+  sigaction(SIGPIPE, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = PM_sigint_handler;
+  sigaction(SIGINT, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = PM_sigint_handler;
+  sigaction(SIGTERM, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = SIG_IGN;
+  sigaction(SIGCHLD, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = PM_sigalrm_noop_handler;
+  sigaction(SIGALRM, &sighandler_action, NULL);
+
+  if (!config.bmp_daemon_port) config.bmp_daemon_port = BMP_TCP_PORT;
+
+#ifdef WITH_REDIS
+  if (config.redis_host) {
+    char log_id[SHORTBUFLEN];
+
+    snprintf(log_id, sizeof(log_id), "%s/%s", config.name, config.type);
+    p_redis_init(&redis_host, log_id, p_redis_thread_produce_common_core_handler);
+  }
+#endif
 
   bmp_prepare_daemon();
   skinny_bmp_daemon();
+
+  return 0;
 }

@@ -1,5 +1,5 @@
 See how to configure and compile pmacct for PostgreSQL use in the "Configuring
-pmacct for compilation and installing" chapter of QUICKSTART. 
+pmacct for compilation and installing" chapter of QUICKSTART.
 
 To create the database and grant default permission to the daemon you have to execute
 the two scripts below, in the same order; which user has to execute them and how to
@@ -28,11 +28,11 @@ shell> su - postgres
 
 [ ... ]
 
-- To create v7 tables:
+- To create v7 or v8 tables:
   * psql -d template1 -f /tmp/pmacct-create-db.pgsql
-  * psql -d pmacct -f /tmp/pmacct-create-table_v7.pgsql
+  * psql -d pmacct -f /tmp/pmacct-create-table_v7_v8.pgsql
 
-- To use v7 tables:
+- To use v7 or v8 tables:
   * data will be available in 'acct_v7' table of 'pmacct' DB.
   * Add 'sql_table_version: 7' line to your configuration.
 
@@ -52,20 +52,19 @@ Until SQL table schemas v5 a few tables are created in the 'pmacct' database:
 when in 'typed' mode (see 'sql_data' option in CONFIG-KEYS text file; default
 value is 'typed'); 'acct_uni' (or 'acct_uni_vN') is the default table where
 data will be written when in 'unified' mode. Starting with v6 unified schemas
-are no longer supplied as part of the PostgreSQL table creation script: the
-'typed' schema instead can still be customized, ie. to write IP addresses in
-CHAR fields because making use of IP prefix labels, transparently to pmacct.
+are no longer supplied as part of the PostgreSQL table creation script.
 
-- To understand difference between the various table versions: 
+- To understand difference between the various table versions:
   * Do you need any of the BGP primitives ? Then look the next section.
+  * Do you need tags for traffic tagging ? Then you have to use v9.
   * Do you need TCP flags ? Then you have to use v7.
   * Do you need both IP addresses and AS numbers in the same table ? Then you have to use v6.
   * Do you need packet classification ? Then you have to use v5.
   * Do you need flows (other than packets) accounting ? Then you have to use v4.
   * Do you need ToS/DSCP field (QoS) accounting ? Then you have to use v3.
-  * Do you need agent ID for distributed accounting and packet tagging ? Then you have to use v2. 
   * Do you need VLAN traffic accounting ? Then you have to use v2.
-  * If all of the above point sound useless, then use v1.
+  * If all of the above points sound useless, then use v1.
+  * v8 changes field names so to bring all supported databases to the same naming convention.
 
 - To understand difference between the various BGP table versions:
   * Only BGP table v1 is currently available.
@@ -96,12 +95,14 @@ CHAR fields because making use of IP prefix labels, transparently to pmacct.
   * as_path => as_path (CHAR(21) NOT NULL DEFAULT ' ')
   * local_pref => local_pref (BIGINT NOT NULL DEFAULT 0)
   * med => med (BIGINT NOT NULL DEFAULT 0)
+  * dst_roa => roa_dst (CHAR(1) NOT NULL DEFAULT ' ')
   * src_std_comm => comms_src (CHAR(24) NOT NULL DEFAULT ' ')
   * src_ext_comm => ecomms_src (CHAR(24) NOT NULL DEFAULT ' ')
   * src_lrg_comm => lcomms_src (CHAR(24) NOT NULL DEFAULT ' ')
   * src_as_path => as_path_src (CHAR(21) NOT NULL DEFAULT ' ')
   * src_local_pref => local_pref_src (BIGINT NOT NULL DEFAULT 0)
   * src_med => med_src (BIGINT NOT NULL DEFAULT 0)
+  * src_roa => roa_src (CHAR(1) NOT NULL DEFAULT ' ')
   * in_iface => iface_in (BIGINT NOT NULL DEFAULT 0, see README.iface)
   * out_iface => iface_out (BIGINT NOT NULL DEFAULT 0, see README.iface)
   * src_mask => mask_src (SMALLINT NOT NULL DEFAULT 0, see README.mask)
@@ -112,11 +113,18 @@ CHAR fields because making use of IP prefix labels, transparently to pmacct.
   * dst_host_country => country_ip_dst (CHAR (2) NOT NULL DEFAULT '--', see README.GeoIP)
   * src_host_pocode => pocode_ip_src (CHAR (12) NOT NULL DEFAULT ' ', see README.GeoIP)
   * dst_host_pocode => pocode_ip_dst (CHAR (12) NOT NULL DEFAULT ' ', see README.GeoIP)
-  * sampling_rate => sampling_rate (BIGINT NOT NULL DEFAULT 0, see README.sampling_rate)
+  * src_host_coords => lat_ip_src (REAL NOT NULL DEFAULT 0, see README.GeoIP)
+  * src_host_coords => lon_ip_src (REAL NOT NULL DEFAULT 0, see README.GeoIP)
+  * dst_host_coords => lat_ip_dst (REAL NOT NULL DEFAULT 0, see README.GeoIP)
+  * dst_host_coords => lon_ip_dst (REAL NOT NULL DEFAULT 0, see README.GeoIP)
+  * sampling_rate => sampling_rate (BIGINT NOT NULL DEFAULT 0, see README.sampling)
+  * sampling_direction => sampling_direction (CHAR (1) NOT NULL DEFAULT ' ', see README.sampling)
   * class => class_id (CHAR(16) NOT NOT NULL DEFAULT ' ')
   * src_mac => mac_src (macaddr NOT NULL DEFAULT '0:0:0:0:0:0')
   * dst_mac => mac_dst (macaddr NOT NULL DEFAULT '0:0:0:0:0:0')
   * vlan => vlan (INT NOT NULL DEFAULT 0)
+  * in_vlan => vlan_in (INT NOT NULL DEFAULT 0)
+  * out_vlan => vlan_out (INT NOT NULL DEFAULT 0)
   * src_as => as_src (BIGINT NOT NULL DEFAULT 0)
   * dst_as => as_dst (BIGINT NOT NULL DEFAULT 0)
   * src_host => ip_src (inet NOT NULL DEFAULT '0.0.0.0', see README.IPv6)
@@ -133,13 +141,20 @@ CHAR fields because making use of IP prefix labels, transparently to pmacct.
   * post_nat_src_port => post_nat_port_src (INT NOT NULL DEFAULT 0)
   * post_nat_dst_port => post_nat_port_dst (INT NOT NULL DEFAULT 0)
   * nat_event => nat_event (INT NOT NULL DEFAULT 0)
+  * fwd_status => fwd_status (INT NOT NULL DEFAULT 0)
+    - or (VARCHAR(50) NOT NULL DEFAULT ' ', if fwd_status_encode_as_string: true)
   * mpls_label_top => mpls_label_top (INT NOT NULL DEFAULT 0)
   * mpls_label_bottom => mpls_label_bottom (INT NOT NULL DEFAULT 0)
-  * mpls_stack_depth => mpls_stack_depth (INT NOT NULL DEFAULT 0)
+  * mpls_label_stack => mpls_label_stack (VARCHAR(255) NOT NULL DEFAULT ' ')
+  * tunnel_src_mac => tunnel_mac_src (macaddr NOT NULL DEFAULT '0:0:0:0:0:0')
+  * tunnel_dst_mac => tunnel_mac_dst (macaddr NOT NULL DEFAULT '0:0:0:0:0:0')
   * tunnel_src_host => tunnel_ip_src (inet NOT NULL DEFAULT '0.0.0.0', see README.IPv6)
   * tunnel_dst_host => tunnel_ip_dst (inet NOT NULL DEFAULT '0.0.0.0', see README.IPv6)
   * tunnel_proto => tunnel_ip_proto (SMALLINT NOT NULL DEFAULT 0)
   * tunnel_tos => tunnel_tos (INT NOT NULL DEFAULT 0)
+  * tunnel_src_port => tunnel_port_src (INT NOT NULL DEFAULT 0)
+  * tunnel_dst_port => tunnel_port_dst (INT NOT NULL DEFAULT 0)
+  * tunnel_tcpflags => tunnel_tcp_flags (SMALLINT NOT NULL DEFAULT 0)
   * timestamp_start => timestamp_start, timestamp_start_residual:
     - timestamp_start timestamp without time zone NOT NULL DEFAULT '0000-01-01 00:00:00', see README.timestamp)
     - timestamp_start_residual INT NOT NULL DEFAULT 0, see README.timestamp)
@@ -155,6 +170,9 @@ CHAR fields because making use of IP prefix labels, transparently to pmacct.
   * timestamp_max => timestamp_max, timestamp_max_residual:
     - timestamp_max timestamp without time zone NOT NULL DEFAULT '0000-01-01 00:00:00', see README.timestamp)
     - timestamp_max_residual INT NOT NULL DEFAULT 0, see README.timestamp)
+  * export_proto_seqno => export_proto_seqno (INT NOT NULL DEFAULT 0, see README.export_proto)
+  * export_proto_version => export_proto_version (SMALLINT NOT NULL DEFAULT 0, see README.export_proto)
+  * export_proto_sysid => export_proto_sysid (INT NOT NULL DEFAULT 0, see README.export_proto)
 
 - If not using COPY statements (sql_use_copy, sql_dont_try_update both enabled)
   'packets' and 'bytes' counters need to be defined as part of the SQL schema
@@ -164,16 +182,21 @@ CHAR fields because making use of IP prefix labels, transparently to pmacct.
   'stamp_updated' time references are mandatory only if temporal aggregation
   (sql_history) is enabled:
   * packets (INT NOT NULL)
+    - or (packets BIGINT NOT NULL)
+  * flows (INT NOT NULL)
+    - or (flows BIGINT NOT NULL)
   * bytes (BIGINT NOT NULL)
   * stamp_inserted (timestamp without time zone NOT NULL DEFAULT '0000-01-01 00:00:00')
+    or (stamp_inserted bigint NOT NULL DEFAULT 0, if timestamps_since_epoch: true)
   * stamp_updated (timestamp without time zone)
+    or (stamp_updated bigint DEFAULT 0, if timestamps_since_epoch: true)
 
 - For custom-defined primitives refer to the README.custom_primitives doc.
 
 - What is the difference between 'typed' and 'unified' modes ? 
 Read this section only if using a table schema v5 or below and does not apply to BGP table
 schemas. The 'unified' table has IP addresses and MAC addresses specified as standard CHAR
-strings, slower but flexible; 'typed' tables sport PostgreSQL own types (inet, mac, etc.),
+strings, slower but flexible; 'typed' tables feature PostgreSQL own types (inet, mac, etc.),
 faster but rigid. When not specifying your own 'sql_table', this switch instructs the plugin
 which tables has to use, default being 'typed'. Since v6 this is all deprecated but default
 typed schemas, the only still supplied as part of the PostgreSQL table creation script, can
@@ -184,6 +207,14 @@ The auxiliar 'proto' table will be created by default. Its tuples are simply num
 pairs: the protocol field of both typed and unified tables is numerical. This table helps 
 in looking up protocol names by their number and viceversa. Because joins are expensive,
 'proto' table has been created *only* for your personal reference. 
+
+NOTE: certain primitives, ie. BGP attributtes like AS-PATH and communities
+(as_path, std_comm, etc.), can get arbitrarily long if not properly scoped
+(ie. bgp_aspath_radius, bgp_stdcomm_pattern, etc.) and hence not fit in
+default field definitions (ie. CHAR(21) or CHAR(24)). It is possible to
+define these as arbitrarily-long variable-length strings using VARCHAR or
+TEXT data types. Consult latest PostgreSQL docs for examples and notes
+(charset choices, etc.).
 
 NOTE: mind to specify EVERYTIME which SQL table version you
 intend to adhere to by using the following config directives:

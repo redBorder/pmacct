@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,16 +19,33 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __PLUGIN_COMMON_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
-#include "pmacct-data.h"
 #include "plugin_common.h"
+#include "pmacct-data.h"
+#include "plugin_hooks.h"
 #include "ip_flow.h"
 #include "classifier.h"
 #include "crc32.h"
+#include "preprocess-internal.h"
+
+/* Global variables */
+void (*insert_func)(struct primitives_ptrs *, struct insert_data *); /* pointer to INSERT function */
+void (*purge_func)(struct chained_cache *[], int, int); /* pointer to purge function */ 
+struct scratch_area sa;
+struct chained_cache *cache;
+struct chained_cache **queries_queue, **pending_queries_queue, *pqq_container;
+struct timeval flushtime;
+int qq_ptr, pqq_ptr, pp_size, pb_size, pn_size, pm_size, pt_size, pc_size;
+int dbc_size, quit; 
+time_t refresh_deadline;
+
+void (*basetime_init)(time_t);
+void (*basetime_eval)(struct timeval *, struct timeval *, time_t);
+int (*basetime_cmp)(struct timeval *, struct timeval *);
+struct timeval basetime, ibasetime, new_basetime;
+time_t timeslot;
+int dyn_table, dyn_table_time_only;
 
 /* Functions */
 void P_set_signals()
@@ -85,7 +102,7 @@ void P_init_default_values()
   sa.num = config.print_cache_entries*AVERAGE_CHAIN_LEN;
   sa.size = sa.num*dbc_size;
 
-  Log(LOG_INFO, "INFO ( %s/%s ): cache entries=%llu base cache memory=%llu bytes\n", config.name, config.type,
+  Log(LOG_INFO, "INFO ( %s/%s ): cache entries=%d base cache memory=%" PRIu64 " bytes\n", config.name, config.type,
 	config.print_cache_entries, ((config.print_cache_entries * dbc_size) + (2 * ((sa.num +
 	config.print_cache_entries) * sizeof(struct chained_cache *))) + sa.size));
 
@@ -101,6 +118,7 @@ void P_init_default_values()
   memset(pending_queries_queue, 0, (sa.num+config.print_cache_entries)*sizeof(struct chained_cache *));
   memset(sa.base, 0, sa.size);
   memset(&flushtime, 0, sizeof(flushtime));
+  memset(empty_mem_area_256b, 0, sizeof(empty_mem_area_256b));
 
   /* handling purge preprocessor */
   set_preprocess_funcs(config.sql_preprocess, &prep, PREP_DICT_PRINT);
@@ -116,7 +134,7 @@ void P_config_checks()
   return;
 
 exit_lane:
-  exit_plugin(1);
+  exit_gracefully(1);
 }
 
 unsigned int P_cache_modulo(struct primitives_ptrs *prim_ptrs)
@@ -127,7 +145,7 @@ unsigned int P_cache_modulo(struct primitives_ptrs *prim_ptrs)
   struct pkt_nat_primitives *pnat = prim_ptrs->pnat;
   struct pkt_mpls_primitives *pmpls = prim_ptrs->pmpls;
   struct pkt_tunnel_primitives *ptun = prim_ptrs->ptun;
-  char *pcust = prim_ptrs->pcust;
+  u_char *pcust = prim_ptrs->pcust;
   struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
   register unsigned int modulo;
 
@@ -150,7 +168,7 @@ struct chained_cache *P_cache_search(struct primitives_ptrs *prim_ptrs)
   struct pkt_nat_primitives *pnat = prim_ptrs->pnat;
   struct pkt_mpls_primitives *pmpls = prim_ptrs->pmpls;
   struct pkt_tunnel_primitives *ptun = prim_ptrs->ptun;
-  char *pcust = prim_ptrs->pcust;
+  u_char *pcust = prim_ptrs->pcust;
   struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
   unsigned int modulo = P_cache_modulo(prim_ptrs);
   struct chained_cache *cache_ptr = &cache[modulo];
@@ -215,7 +233,7 @@ void P_cache_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata
   struct pkt_nat_primitives *pnat = prim_ptrs->pnat;
   struct pkt_mpls_primitives *pmpls = prim_ptrs->pmpls;
   struct pkt_tunnel_primitives *ptun = prim_ptrs->ptun;
-  char *pcust = prim_ptrs->pcust;
+  u_char *pcust = prim_ptrs->pcust;
   struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
   unsigned int modulo = P_cache_modulo(prim_ptrs);
   struct chained_cache *cache_ptr = &cache[modulo];
@@ -250,34 +268,6 @@ void P_cache_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata
         if (tot_flows) data->flo_num = MAX((float)tot_flows / ratio, 1);
       }
     }
-  }
-
-  /* We are classifing packets. We have a non-zero bytes accumulator (ba)
-     and a non-zero class. Before accounting ba to this class, we have to
-     remove ba from class zero. */
-  if (config.what_to_count & COUNT_CLASS && data->cst.ba && data->primitives.class) {
-    struct chained_cache *Cursor;
-    pm_class_t lclass = data->primitives.class;
-
-    data->primitives.class = 0;
-    Cursor = P_cache_search(prim_ptrs);
-    data->primitives.class = lclass;
-
-    /* We can assign the flow to a new class only if we are able to subtract
-       the accumulator from the zero-class. If this is not the case, we will
-       discard the accumulators. The assumption is that accumulators are not
-       retroactive */
-
-    if (Cursor) {
-      if (timeval_cmp(&data->cst.stamp, &flushtime) >= 0) {
-	/* MIN(): ToS issue */
-        Cursor->bytes_counter -= MIN(Cursor->bytes_counter, data->cst.ba);
-        Cursor->packet_counter -= MIN(Cursor->packet_counter, data->cst.pa);
-        Cursor->flow_counter -= MIN(Cursor->flow_counter, data->cst.fa);
-      }
-      else memset(&data->cst, 0, CSSz);
-    }
-    else memset(&data->cst, 0, CSSz);
   }
 
   start:
@@ -410,31 +400,15 @@ void P_cache_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata
     cache_ptr->bytes_counter = data->pkt_len;
     cache_ptr->flow_type = data->flow_type;
     cache_ptr->tcp_flags = data->tcp_flags;
-
-    if (config.what_to_count & COUNT_CLASS) {
-      cache_ptr->bytes_counter += data->cst.ba;
-      cache_ptr->packet_counter += data->cst.pa;
-      cache_ptr->flow_counter += data->cst.fa;
-    }
+    cache_ptr->tunnel_tcp_flags = data->tunnel_tcp_flags;
 
     if (config.nfacctd_stitching) {
-      if (!cache_ptr->stitch) cache_ptr->stitch = (struct pkt_stitching *) malloc(sizeof(struct pkt_stitching));
-      if (cache_ptr->stitch) {
-	if (data->time_start.tv_sec) {
-	  memcpy(&cache_ptr->stitch->timestamp_min, &data->time_start, sizeof(struct timeval));
-	}
-	else {
-	  cache_ptr->stitch->timestamp_min.tv_sec = idata->now; 
-	  cache_ptr->stitch->timestamp_min.tv_usec = 0;
-	}
+      if (!cache_ptr->stitch) {
+	cache_ptr->stitch = (struct pkt_stitching *) malloc(sizeof(struct pkt_stitching));
+      }
 
-	if (data->time_end.tv_sec) {
-	  memcpy(&cache_ptr->stitch->timestamp_max, &data->time_end, sizeof(struct timeval));
-	}
-	else {
-	  cache_ptr->stitch->timestamp_max.tv_sec = idata->now;
-	  cache_ptr->stitch->timestamp_max.tv_usec = 0;
-	}
+      if (cache_ptr->stitch) {
+	P_set_stitch(cache_ptr, data, idata);
       }
       else Log(LOG_WARNING, "WARN ( %s/%s ): Finished memory for flow stitching.\n", config.name, config.type);
     }
@@ -452,24 +426,11 @@ void P_cache_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata
       cache_ptr->bytes_counter += data->pkt_len;
       cache_ptr->flow_type = data->flow_type;
       cache_ptr->tcp_flags |= data->tcp_flags;
-
-      if (config.what_to_count & COUNT_CLASS) {
-        cache_ptr->bytes_counter += data->cst.ba;
-        cache_ptr->packet_counter += data->cst.pa;
-        cache_ptr->flow_counter += data->cst.fa;
-      }
+      cache_ptr->tunnel_tcp_flags |= data->tunnel_tcp_flags;
 
       if (config.nfacctd_stitching) {
 	if (cache_ptr->stitch) {
-	  if (data->time_end.tv_sec) {
-	    if (data->time_end.tv_sec > cache_ptr->stitch->timestamp_max.tv_sec && 
-		data->time_end.tv_usec > cache_ptr->stitch->timestamp_max.tv_usec)
-	      memcpy(&cache_ptr->stitch->timestamp_max, &data->time_end, sizeof(struct timeval));
-	  }
-	  else {
-	    cache_ptr->stitch->timestamp_max.tv_sec = idata->now;
-	    cache_ptr->stitch->timestamp_max.tv_usec = 0;
-	  }
+	  P_update_stitch(cache_ptr, data, idata);
 	}
       }
     }
@@ -480,11 +441,12 @@ void P_cache_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata
       cache_ptr->bytes_counter = data->pkt_len;
       cache_ptr->flow_type = data->flow_type;
       cache_ptr->tcp_flags = data->tcp_flags;
-      if (config.what_to_count & COUNT_CLASS) {
-        cache_ptr->bytes_counter += data->cst.ba;
-        cache_ptr->packet_counter += data->cst.pa;
-        cache_ptr->flow_counter += data->cst.fa;
+      cache_ptr->tunnel_tcp_flags = data->tunnel_tcp_flags;
+
+      if (config.nfacctd_stitching) {
+	P_set_stitch(cache_ptr, data, idata);
       }
+
       cache_ptr->valid = PRINT_CACHE_INUSE;
       cache_ptr->basetime.tv_sec = ibasetime.tv_sec;
       cache_ptr->basetime.tv_usec = ibasetime.tv_usec;
@@ -520,8 +482,11 @@ void P_cache_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata
       switch (ret = fork()) {
       case 0: /* Child */
 	pm_setproctitle("%s %s [%s]", config.type, "Plugin -- Writer (urgent)", config.name);
+	config.is_forked = TRUE;
+
         (*purge_func)(queries_queue, qq_ptr, TRUE);
-        exit(0);
+
+        exit_gracefully(0);
       default: /* Parent */
         if (ret == -1) Log(LOG_WARNING, "WARN ( %s/%s ): Unable to fork writer: %s\n", config.name, config.type, strerror(errno));
         else dump_writers_add(ret);
@@ -609,7 +574,7 @@ void P_cache_insert_pending(struct chained_cache *queue[], int index, struct cha
   free(container);
 }
 
-void P_cache_handle_flush_event(struct ports_table *pt)
+void P_cache_handle_flush_event(struct ports_table *pt, struct protos_table *prt, struct protos_table *tost)
 {
   pid_t ret;
 
@@ -620,8 +585,11 @@ void P_cache_handle_flush_event(struct ports_table *pt)
     switch (ret = fork()) {
     case 0: /* Child */
       pm_setproctitle("%s %s [%s]", config.type, "Plugin -- Writer", config.name);
+      config.is_forked = TRUE;
+
       (*purge_func)(queries_queue, qq_ptr, FALSE);
-      exit(0);
+
+      exit_gracefully(0);
     default: /* Parent */
       if (ret == -1) Log(LOG_WARNING, "WARN ( %s/%s ): Unable to fork writer: %s\n", config.name, config.type, strerror(errno));
       else dump_writers_add(ret);
@@ -646,7 +614,15 @@ void P_cache_handle_flush_event(struct ports_table *pt)
   if (reload_map) {
     load_networks(config.networks_file, &nt, &nc);
     load_ports(config.ports_file, pt);
+    load_protos(config.protos_file, prt);
+    load_tos(config.tos_file, tost);
+
     reload_map = FALSE;
+  }
+
+  if (reload_log) {
+    reload_logs(NULL);
+    reload_log = FALSE;
   }
 }
 
@@ -681,7 +657,7 @@ void P_cache_mark_flush(struct chained_cache *queue[], int index, int exiting)
       pqq_container = (struct chained_cache *) malloc(pqq_ptr*dbc_size); 
       if (!pqq_container) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): P_cache_mark_flush() cannot allocate pqq_container. Exiting ..\n", config.name, config.type);
-	exit_plugin(1); 
+	exit_gracefully(1); 
       }
     }
     
@@ -723,12 +699,12 @@ void P_cache_flush(struct chained_cache *queue[], int index)
 
 struct chained_cache *P_cache_attach_new_node(struct chained_cache *elem)
 {
-  if ((sa.ptr+sizeof(struct chained_cache)) <= (sa.base+sa.size)) {
+  if ((sa.ptr + (2 * sizeof(struct chained_cache))) <= (sa.base + sa.size)) {
     sa.ptr += sizeof(struct chained_cache);
     elem->next = (struct chained_cache *) sa.ptr;
     return (struct chained_cache *) sa.ptr;
   }
-  else return NULL; /* XXX */
+  else return NULL;
 }
 
 void P_sum_host_insert(struct primitives_ptrs *prim_ptrs, struct insert_data *idata)
@@ -792,7 +768,7 @@ void P_exit_now(int signum)
   if (config.pidfile) remove_pid_file(config.pidfile);
 
   wait(NULL);
-  exit_plugin(0);
+  exit_gracefully(0);
 }
 
 int P_trigger_exec(char *filename)
@@ -800,12 +776,16 @@ int P_trigger_exec(char *filename)
   char *args[2] = { filename, NULL };
   int pid;
 
+#ifdef HAVE_VFORK
   switch (pid = vfork()) {
+#else
+  switch (pid = fork()) {
+#endif
   case -1:
     return -1;
   case 0:
     execv(filename, args);
-    exit(0);
+    _exit(0);
   }
 
   return 0;
@@ -839,7 +819,7 @@ void P_init_historical_acct(time_t now)
   if (config.sql_history_offset) {
     if (config.sql_history_offset >= timeslot) {
       Log(LOG_ERR, "ERROR ( %s/%s ): History offset (ie. sql_history_offset) must be < history (ie. sql_history).\n", config.name, config.type);
-      exit(1);
+      exit_gracefully(1);
     }
 
     t = t - (timeslot + config.sql_history_offset);
@@ -897,26 +877,6 @@ int P_cmp_historical_acct(struct timeval *entry_basetime, struct timeval *insert
   return ret;
 }
 
-int P_test_zero_elem(struct chained_cache *elem)
-{
-  if (elem) {
-    if (elem->flow_type == NF9_FTYPE_NAT_EVENT) {
-      if (elem->pnat && elem->pnat->nat_event) return FALSE;
-      else return TRUE;
-    }
-    else if (elem->flow_type == NF9_FTYPE_OPTION) {
-      /* not really much we can test */
-      return FALSE;
-    }
-    else {
-      if (elem->bytes_counter || elem->packet_counter || elem->flow_counter) return FALSE;
-      else return TRUE;
-    }
-  }
-
-  return TRUE;
-}
-
 void primptrs_set_all_from_chained_cache(struct primitives_ptrs *prim_ptrs, struct chained_cache *entry)
 {
   struct pkt_data *data;
@@ -959,6 +919,14 @@ void P_update_time_reference(struct insert_data *idata)
 {
   idata->now = time(NULL);
 
+  if (config.nfacctd_stitching) {
+    gettimeofday(&idata->nowtv, NULL);
+
+    if (config.timestamps_secs) {
+      idata->nowtv.tv_usec = 0;
+    }
+  }
+
   if (config.sql_history) {
     while (idata->now > (basetime.tv_sec + timeslot)) {
       new_basetime.tv_sec = basetime.tv_sec;
@@ -969,55 +937,375 @@ void P_update_time_reference(struct insert_data *idata)
   }
 }
 
-void P_broker_timers_set_last_fail(struct p_broker_timers *btimers, time_t timestamp)
+void P_set_stitch(struct chained_cache *cache_ptr, struct pkt_data *data, struct insert_data *idata)
 {
-  if (btimers) btimers->last_fail = timestamp;
-}
-
-time_t P_broker_timers_get_last_fail(struct p_broker_timers *btimers)
-{
-  if (btimers) return btimers->last_fail;
-
-  return FALSE;
-}
-
-void P_broker_timers_unset_last_fail(struct p_broker_timers *btimers)
-{
-  if (btimers) btimers->last_fail = FALSE;
-}
-
-void P_broker_timers_set_retry_interval(struct p_broker_timers *btimers, int interval)
-{
-  if (btimers) btimers->retry_interval = interval;
-}
-
-int P_broker_timers_get_retry_interval(struct p_broker_timers *btimers)
-{
-  if (btimers) return btimers->retry_interval;
-
-  return ERR;
-}
-
-void P_zmq_pipe_init(void *zh, int *pipe_fd, int *seq)
-{
-  plugin_pipe_zmq_compile_check();
-
-#ifdef WITH_ZMQ
-  if (zh) {
-    struct p_zmq_host *zmq_host = zh;
-    char log_id[SHORTBUFLEN];
-
-    p_zmq_plugin_pipe_init_plugin(zmq_host);
-
-    snprintf(log_id, sizeof(log_id), "%s/%s", config.name, config.type);
-    p_zmq_set_log_id(zmq_host, log_id);
-
-    p_zmq_plugin_pipe_consume(zmq_host);
-    p_zmq_set_retry_timeout(zmq_host, config.pipe_zmq_retry);
-    p_zmq_set_hwm(zmq_host, config.pipe_zmq_hwm);
-
-    if (pipe_fd) (*pipe_fd) = p_zmq_get_fd(zmq_host);
-    if (seq) (*seq) = 0;
+  if (data->time_start.tv_sec) {
+    memcpy(&cache_ptr->stitch->timestamp_min, &data->time_start, sizeof(struct timeval));
   }
-#endif
+  else {
+    memcpy(&cache_ptr->stitch->timestamp_min, &idata->nowtv, sizeof(struct timeval));
+  }
+
+  if (data->time_end.tv_sec) {
+    memcpy(&cache_ptr->stitch->timestamp_max, &data->time_end, sizeof(struct timeval));
+  }
+  else {
+    memcpy(&cache_ptr->stitch->timestamp_max, &idata->nowtv, sizeof(struct timeval));
+  }
+}
+
+void P_update_stitch(struct chained_cache *cache_ptr, struct pkt_data *data, struct insert_data *idata)
+{
+  if (data->time_end.tv_sec) {
+    if (data->time_end.tv_sec > cache_ptr->stitch->timestamp_max.tv_sec &&
+        data->time_end.tv_usec > cache_ptr->stitch->timestamp_max.tv_usec) {
+      memcpy(&cache_ptr->stitch->timestamp_max, &data->time_end, sizeof(struct timeval));
+    }
+  }
+  else {
+    memcpy(&cache_ptr->stitch->timestamp_max, &idata->nowtv, sizeof(struct timeval));
+  }
+}
+
+cdada_list_t *ptm_labels_to_linked_list(const char *ptm_labels)
+{
+  /* Max amount of tokens per string: 128 Labels */
+  const int MAX_TOKENS = 256;
+
+  /* len of the incoming/normalized string */
+  size_t PTM_LABELS_LEN = strlen(ptm_labels);
+
+  /* incoming/normalized str to array */
+  char ptm_array_labels[PTM_LABELS_LEN + 1];
+  memset(&ptm_array_labels, 0, sizeof(ptm_array_labels));
+  /* no overflow risk */
+  strcpy(ptm_array_labels, ptm_labels);
+
+  cdada_list_t *ptm_linked_list = cdada_list_create(ptm_label);
+  ptm_label lbl;
+
+  char *token = NULL;
+  char *tokens[MAX_TOKENS];
+
+  /* init pointers to NULL */
+  size_t idx_0;
+  for (idx_0 = 0; idx_0 < MAX_TOKENS; idx_0++) {
+    tokens[idx_0] = NULL;
+  }
+
+  size_t tokens_counter = 0;
+  for (token = strtok(ptm_array_labels, DEFAULT_SEP); token != NULL; token = strtok(NULL, DEFAULT_SEP)) {
+    tokens[tokens_counter] = token;
+    tokens_counter++;
+  }
+
+  size_t list_counter;
+  for (list_counter = 0;
+	(list_counter < tokens_counter) && (tokens[list_counter] != NULL) &&
+	((list_counter + 1) < tokens_counter) && (tokens[list_counter + 1] != NULL);
+	list_counter += 2) {
+    memset(&lbl, 0, sizeof(lbl));
+
+    if (strlen(tokens[list_counter]) > (MAX_PTM_LABEL_TOKEN_LEN - 1)) {
+      tokens[list_counter][MAX_PTM_LABEL_TOKEN_LEN - 2] = '$';
+      tokens[list_counter][MAX_PTM_LABEL_TOKEN_LEN - 1] = '\0';
+    }
+
+    if (strlen(tokens[list_counter + 1]) > (MAX_PTM_LABEL_TOKEN_LEN - 1)) {
+      tokens[list_counter + 1][MAX_PTM_LABEL_TOKEN_LEN - 2] = '$';
+      tokens[list_counter + 1][MAX_PTM_LABEL_TOKEN_LEN - 1] = '\0';
+    }
+
+    strncpy(lbl.key, tokens[list_counter], (MAX_PTM_LABEL_TOKEN_LEN - 1));
+    strncpy(lbl.value, tokens[list_counter + 1], (MAX_PTM_LABEL_TOKEN_LEN - 1));
+    cdada_list_push_back(ptm_linked_list, &lbl);
+  }
+
+  return ptm_linked_list;
+}
+
+cdada_list_t *tcpflags_to_linked_list(size_t tcpflags_decimal)
+{
+  const int TCP_FLAGS = 6;
+
+  /* Generate the tcpflag's binary array */
+  const char tcpflags_mask[][TCP_FLAG_LEN] = {"URG", "ACK", "PSH", "RST", "SYN", "FIN"};
+  size_t tcpflags_binary[TCP_FLAGS];
+  memset(&tcpflags_binary, 0, sizeof(tcpflags_binary));
+
+  /* tcpflags binary format (valid decimals between 1 & 63) */
+  size_t idx_0;
+  if ((tcpflags_decimal > 0) && (tcpflags_decimal) < 64) {
+    for (idx_0 = (TCP_FLAGS -1); tcpflags_decimal > 0 && idx_0 >= 0; idx_0--) {
+      tcpflags_binary[idx_0] = (tcpflags_decimal % 2);
+      tcpflags_decimal /= 2;
+    }
+  }
+
+  /* Generate the tcpflags' linked-list */
+  cdada_list_t *tcpflag_linked_list = cdada_list_create(tcpflag);
+  tcpflag tcpstate;
+
+  size_t idx_1;
+  for (idx_1 = 0; idx_1 < TCP_FLAGS; idx_1++) {
+    memset(&tcpstate, 0, sizeof(tcpstate));
+    if (!tcpflags_binary[idx_1]) {
+      strncpy(tcpstate.flag, "NULL", (TCP_FLAG_LEN - 1));
+    }
+    else {
+      strncpy(tcpstate.flag, tcpflags_mask[idx_1], (TCP_FLAG_LEN - 1));
+    }
+    cdada_list_push_back(tcpflag_linked_list, &tcpstate);
+  }
+
+  return tcpflag_linked_list;
+}
+
+cdada_list_t *fwd_status_to_linked_list()
+{
+  const int FWD_STATUS_REASON_CODES = 23;
+
+  /* RFC-7270: forwardingStatus with a compliant reason code */
+  const unsigned int fwd_status_decimal[] = {
+    64, 65, 66,
+    128, 129, 130,
+    131, 132, 133,
+    134, 135, 136,
+    137, 138, 139,
+    140, 141, 142,
+    143, 192, 193,
+    194, 195
+  };
+
+  const char fwd_status_description[][FWD_TYPES_STR_LEN] = {
+    "FORWARDED Unknown",
+    "FORWARDED Fragmented",
+    "FORWARDED Not Fragmented",
+    "DROPPED Unknown",
+    "DROPPED ACL deny",
+    "DROPPED ACL drop",
+    "DROPPED Unroutable",
+    "DROPPED Adjacency",
+    "DROPPED Fragmentation and DF set",
+    "DROPPED Bad header checksum",
+    "DROPPED Bad total Length",
+    "DROPPED Bad header length",
+    "DROPPED bad TTL",
+    "DROPPED Policer",
+    "DROPPED WRED",
+    "DROPPED RPF",
+    "DROPPED For us",
+    "DROPPED Bad output interface",
+    "DROPPED Hardware",
+    "CONSUMED Unknown",
+    "CONSUMED Punt Adjacency",
+    "CONSUMED Incomplete Adjacency",
+    "CONSUMED For us",
+  };
+
+  /* Generate the fwd_status' linked-list */
+  cdada_list_t *fwd_status_linked_list = cdada_list_create(fwd_status);
+  fwd_status fwdstate;
+
+  size_t idx_0;
+  for (idx_0 = 0; idx_0 < FWD_STATUS_REASON_CODES; idx_0++) {
+    memset(&fwdstate, 0, sizeof(fwdstate));
+    fwdstate.decimal = fwd_status_decimal[idx_0];
+    strncpy(fwdstate.description, fwd_status_description[idx_0], (FWD_TYPES_STR_LEN - 1));
+
+    cdada_list_push_back(fwd_status_linked_list, &fwdstate);
+  }
+
+  return fwd_status_linked_list;
+}
+
+void mpls_label_stack_to_str(char *str_label_stack, int sls_len, u_int32_t *label_stack, int ls_len)
+{
+  int max_mpls_label_stack_dec = 0, idx_0;
+  char label_buf[MAX_MPLS_LABEL_LEN];
+  u_int8_t ls_depth = 0;
+
+  if (!(ls_len % 4)) {
+    ls_depth = (ls_len / 4);
+  }
+  else {
+    return;
+  }
+
+  memset(str_label_stack, 0, sls_len);
+
+  for (idx_0 = 0; idx_0 < ls_depth; idx_0++) {
+    memset(&label_buf, 0, sizeof(label_buf));
+    snprintf(label_buf, MAX_MPLS_LABEL_LEN, "%u", label_stack[idx_0]);
+    strncat(str_label_stack, label_buf, (sls_len - max_mpls_label_stack_dec));
+
+    /* Avoiding separator to last label */
+    if (idx_0 != (ls_depth - 1)) {
+      strncat(str_label_stack, "_", (sls_len - max_mpls_label_stack_dec));
+      max_mpls_label_stack_dec = (strlen(label_buf) + strlen("_") + 2);
+    }
+    else {
+      max_mpls_label_stack_dec = (strlen(label_buf) + 2);
+    }
+  }
+}
+
+/* XXX, merge load_protos() and load_ports() */
+
+void load_protos(char *filename, struct protos_table *pt)
+{
+  FILE *file;
+  char buf[SUPERSHORTBUFLEN];
+  int ret, rows = 1, newline = TRUE, buf_eff_len, idx;
+  struct stat st;
+
+  memset(&st, 0, sizeof(st));
+
+  if (filename) {
+    if ((file = fopen(filename,"r")) == NULL) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): [%s] file not found.\n", config.name, config.type, filename);
+      goto handle_error;
+    }
+    else {
+      memset(pt, 0, sizeof(struct protos_table));
+
+      while (!feof(file)) {
+        if (fgets(buf, sizeof(buf), file)) { 
+	  if (strchr(buf, '\n')) { 
+            if (!newline) {
+	      newline = TRUE; 
+	      continue;
+	    }
+	  }
+	  else {
+            if (!newline) continue;
+	    newline = FALSE;
+	  }
+	  trim_spaces(buf);
+	  buf_eff_len = strlen(buf);
+	  if (!buf_eff_len || (buf[0] == '!')) {
+	    continue;
+	  }
+
+	  for (idx = 0, ret = 0; idx < buf_eff_len; idx++) {
+	    ret = isdigit(buf[idx]);
+	    if (!ret) {
+	      break;
+	    }
+	  }
+
+	  if (!ret) {
+	    for (idx = 0; _protocols[idx].number != -1; idx++) {
+	      if (!strcmp(buf, _protocols[idx].name)) {
+		ret = _protocols[idx].number;
+		break;
+	      }
+	    }
+	  }
+	  else {
+	    ret = atoi(buf); 
+	  }
+
+	  /* 255 / 'others' excluded from valid IP protocols */
+	  if ((ret >= 0) && (ret < (PROTOS_TABLE_ENTRIES - 1))) {
+	    pt->table[ret] = TRUE;
+	  }
+	  else {
+	    Log(LOG_WARNING, "WARN ( %s/%s ): [%s:%u] invalid protocol specified.\n", config.name, config.type, filename, rows); 
+	  }
+
+	  rows++;
+	}
+      }
+      fclose(file);
+
+      stat(filename, &st);
+      pt->timestamp = st.st_mtime;
+    }
+  }
+
+  /* filename check to not print nulls as load_networks()
+     may not be secured inside an if statement */ 
+  if (filename) {
+    Log(LOG_INFO, "INFO ( %s/%s ): [%s] map successfully (re)loaded.\n", config.name, config.type, filename);
+  }
+
+  return;
+
+  handle_error:
+  if (pt->timestamp) {
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Rolling back the old Protocols Table.\n", config.name, config.type, filename);
+
+    /* we update the timestamp to avoid loops */
+    stat(filename, &st);
+    pt->timestamp = st.st_mtime;
+  }
+  else exit_gracefully(1);
+}
+
+void load_ports(char *filename, struct ports_table *pt)
+{
+  FILE *file;
+  char buf[8];
+  int ret, rows = 0, newline = TRUE;
+  struct stat st;
+
+  memset(&st, 0, sizeof(st));
+
+  if (filename) {
+    if ((file = fopen(filename,"r")) == NULL) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): [%s] file not found.\n", config.name, config.type, filename);
+      goto handle_error;
+    }
+    else {
+      memset(pt, 0, sizeof(struct ports_table));
+
+      while (!feof(file)) {
+        if (fgets(buf, 8, file)) { 
+	  if (strchr(buf, '\n')) { 
+            if (!newline) {
+	      newline = TRUE; 
+	      continue;
+	    }
+	  }
+	  else {
+            if (!newline) continue;
+	    newline = FALSE;
+	  }
+	  trim_spaces(buf);
+	  if (!strlen(buf) || (buf[0] == '!')) continue;
+	  ret = atoi(buf); 
+	  if ((ret > 0) && (ret < PORTS_TABLE_ENTRIES)) pt->table[ret] = TRUE;
+	  else Log(LOG_WARNING, "WARN ( %s/%s ): [%s:%u] invalid port specified.\n", config.name, config.type, filename, rows); 
+	}
+      }
+      fclose(file);
+
+      stat(filename, &st);
+      pt->timestamp = st.st_mtime;
+    }
+  }
+
+  /* filename check to not print nulls as load_networks()
+     may not be secured inside an if statement */ 
+  if (filename) {
+    Log(LOG_INFO, "INFO ( %s/%s ): [%s] map successfully (re)loaded.\n", config.name, config.type, filename);
+  }
+
+  return;
+
+  handle_error:
+  if (pt->timestamp) {
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Rolling back the old Ports Table.\n", config.name, config.type, filename);
+
+    /* we update the timestamp to avoid loops */
+    stat(filename, &st);
+    pt->timestamp = st.st_mtime;
+  }
+  else exit_gracefully(1);
+}
+
+void load_tos(char *filename, struct protos_table *tost)
+{
+  load_protos(filename, tost);
 }

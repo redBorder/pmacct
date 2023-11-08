@@ -10,12 +10,14 @@
 !
 ! 'id'			SET: BGP-signalled MPLS L2/L3 VPN Route Distinguisher
 !			(RD) value. Encoding types #0, #1 and #2 are supported
-!			as per rfc4364.
+!			as per rfc4364 in asplain notation as per rfc5396.
 ! 'ip'                  MATCH: in nfacctd this is compared against the source
 !                       IP address of the device originating NetFlow packets;
 !                       in sfacctd this is compared against the AgentId field
 !                       of received sFlow samples. Expected argument are an IP
-!                       address or prefix (ie. XXX.XXX.XXX.XXX/NN)
+!                       address or prefix (ie. XXX.XXX.XXX.XXX/NN). 0.0.0.0/0
+!			would match all IPv4 addresses; ::/0 would match all
+!			IPv6 addresses.
 ! 'in'                  MATCH: Input interface.
 ! 'out'                 MATCH: Output interface.
 ! 'bgp_nexthop'         MATCH: IPv4/IPv6 address of the next-hop BGP router. In
@@ -27,7 +29,7 @@
 !			against field types #234 and #235.
 ! 'mpls_label_bottom'	MATCH: MPLS bottom label value.
 !
-! A couple of straightforward examples follow.  
+! Examples:
 !
 ! Maps input interface 100 of router 192.168.1.1 to RD 0:65512:1 - ie.
 ! a BGP/MPLS VPN Route Distinguisher encoded as type #0 according to
@@ -46,3 +48,9 @@ id=0:65512:1		ip=192.168.1.1
 ! to rfc4364: <IPv4 Address>:<value>
 !
 id=1:192.168.1.1:1	ip=192.168.1.1          in=100
+!
+! Maps input interface 100 of router 192.168.1.1 to RD 2:4200000000:1
+! ie. a BGP/MPLS VPN Route Distinguisher encoded as type #2 according 
+! to rfc4364: <IPv4 Address>:<value>
+!
+id=2:4200000000:1	ip=192.168.1.1          in=100

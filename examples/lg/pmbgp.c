@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2020 by Paolo Lucente
 */
 
 /*
@@ -25,13 +25,15 @@
 #include "pmacct.h"
 #include "pmacct-data.h"
 #include "addr.h"
+#ifdef WITH_ZMQ
 #include "zmq_common.h"
+#endif
 #include "bgp/bgp.h"
 #include "pmbgpd.h"
 #include "pmbgp.h"
 
 /* functions */
-#ifdef WITH_ZMQ
+#if defined (WITH_ZMQ) && defined (WITH_JANSSON) 
 void usage_pmbgp(char *prog)
 {
   printf("%s %s (%s)\n", PMBGP_USAGE_HEADER, PMACCT_VERSION, PMACCT_BUILD);
@@ -65,8 +67,7 @@ int main(int argc,char **argv)
   char address_str[SRVBUFLEN], peer_str[SRVBUFLEN], rd_str[SRVBUFLEN], port_str[SRVBUFLEN];
   char *req_str = NULL, *req_type_str = NULL, *rep_str = NULL, *pfx_delim = NULL;
   char *zmq_host_str_ptr, zmq_host_str[SRVBUFLEN], default_zmq_host_str[] = "127.0.0.1";
-  int ret, zmq_port = 0, default_zmq_port = 17900, results = 0, query_type = 0, idx = 0;
-  u_int16_t peer_port;
+  int zmq_port = 0, default_zmq_port = 17900, results = 0, query_type = 0, idx = 0;
 
   struct p_zmq_host zmq_host;
   struct host_addr peer_ha, address_ha;
@@ -74,7 +75,7 @@ int main(int argc,char **argv)
   /* getopt() stuff */
   extern char *optarg;
   extern int optind, opterr, optopt;
-  int errflag, cp, ip_lookup_query, get_peers_query;
+  int cp, ip_lookup_query, get_peers_query;
 
   memset(address_str, 0, sizeof(address_str));
   memset(rd_str, 0, sizeof(rd_str));
@@ -87,7 +88,7 @@ int main(int argc,char **argv)
   ip_lookup_query = FALSE;
   get_peers_query = FALSE;
 
-  while (!errflag && ((cp = getopt(argc, argv, ARGS_PMBGP)) != -1)) {
+  while ((cp = getopt(argc, argv, ARGS_PMBGP)) != -1) {
     switch (cp) {
     case 'h':
       usage_pmbgp(argv[0]);
@@ -258,8 +259,6 @@ int main(int argc,char **argv)
         else results = json_integer_value(results_json);
       }
 
-      json_decref(query_type_json);
-      json_decref(results_json);
       json_decref(rep_results_obj);
     }
 
@@ -277,6 +276,8 @@ int main(int argc,char **argv)
       free(rep_str);
     }
   }
+
+  return 0;
 }
 
 void pmbgp_zmq_req_setup(struct p_zmq_host *zmq_host, char *host, int port)
@@ -345,6 +346,7 @@ int pmbgp_zmq_sendmore_str(struct p_zmq_sock *sock, char *buf)
 #else
 int main(int argc,char **argv)
 {
-  printf("WARN: pmbgp: tool depends on missing --enable-zmq. Exiting.\n");
+  printf("WARN: pmbgp: tool depends on missing --enable-zmq and --enable-jansson. Exiting.\n");
+  return 1;
 }
 #endif

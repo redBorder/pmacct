@@ -19,8 +19,6 @@
  * 02111-1307, USA.  
  */
 
-#define __THREAD_C
-
 #include "pmacct.h"
 #include "isis.h"
 
@@ -216,8 +214,7 @@ recent_relative_time (void)
 static unsigned int
 cpu_record_hash_key (struct cpu_thread_history *a)
 {
-  /* XXX: uintptr_t not portable: changed to "unsigned int *" */
-  return (unsigned int) a->func;
+  return (uintptr_t) a->func;
 }
 
 static int 
@@ -246,20 +243,6 @@ cpu_record_hash_free (void *a)
   free(hist);
 }
 
-static void
-cpu_record_hash_clear (struct hash_backet *bucket, 
-		      void *args)
-{
-  thread_type *filter = args;
-  struct cpu_thread_history *a = bucket->data;
-  
-  a = bucket->data;
-  if ( !(a->types & *filter) )
-       return;
-  
-  isis_hash_release (cpu_record, bucket->data);
-}
-
 /* Allocate new thread master.  */
 struct thread_master *
 thread_master_create ()

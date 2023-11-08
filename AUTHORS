@@ -1,5 +1,5 @@
-pmacct [IP traffic accounting : BGP : BMP : IGP : Streaming Telemetry]
-pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+pmacct [IP traffic accounting : BGP : BMP : RPKI : IGP : Streaming Telemetry]
+pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 
 Founder:
 
@@ -7,51 +7,68 @@ Founder:
 
 Package maintainers:
 
-	Marcelo Goes (Gentoo)		<vanquirius@gentoo.org>
-	Ryan Steinmetz (FreeBSD)	<rpsfa@rit.edu>
+	Ryan Steinmetz (FreeBSD)	<zi@freebsd.org>
 	Bernd Zeimetz (Debian)		<bzed@debian.org>
+	MOTU Developers (Ubuntu)	<ubuntu-motu@lists.ubuntu.com>
+	Martin Hauke (OpenSUSE)		<mardnh@gmx.de>
+	netmon (Gentoo)			<netmon@gentoo.org>
    KP Kirchdoerfer (LEAF Bering-uClibc)	<kapeka@users.sourceforge.net> 
-	Peter Nixon (OpenSUSE RPMs)	<listuser@peternixon.net>
-	Viacheslav Dubrovskyi(ALTLinux)	<dubrsl@gmail.com>
+	Slava Dubrovskyi (ALTLinux)	<dubrsl@gmail.com>
+
+A (non-exhaustive) list of code and documentation contributors:
+
+https://github.com/pmacct/pmacct/graphs/contributors 
 
 Thanks to the following people for their strong support along the time: 
 
 	Arash Afrakhteh
 	Martin Anderberg
 	Sven Anderson
+	Matthias Arnold
+        Raphael Barazzutti
 	David Barroso
 	Joerg Behrens
 	Vincent Bernat
 	Robert Blechinger
 	Stefano Birmani
-	Codethink.co.uk
+	Juan Camilo Cardona
 	Pier Carlo Chiodi
+	Codethink.co.uk
+	Salvatore Cuzzilla
 	Arnaud De-Bermingham
 	Francois Deppierraz 
 	Pierre Francois
 	Rich Gade
 	Aaron Glenn
 	Alan Gous
+	Thomas Graf
 	Gianluca Guida
         Elisa Jasinska
 	Wim Kerkhoff
 	Tim LaBerge
 	Paul Mabey
 	Arman Maghbouleh
+	Jared Mauch
 	Peter Nixon
+	Claudio Ortega
 	Ivan Pepelnjak
+	Vaibhav Phatarpekar
+	Peter Pothier
 	Karl O. Pinc
 	Vasiliy Ponomarev
 	Martin Pot
+	Pether Pothier
 	A.O. Prokofiev
 	Edwin Punt
 	Anik Rahman
 	Job Snijders
 	Gabriel Snook
 	Rene Stoutjesdijk
+	Marc Sune
 	Thomas Telkamp
 	Matthieu Texier
 	Stig Thormodsrud
+	Marco Tollini
 	Luca Tosolini
 	Brent Van Dussen
 	Markus Weber

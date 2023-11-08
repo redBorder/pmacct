@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2011 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -27,14 +27,8 @@
 /* structures */
 
 /* prototypes */
-#if (!defined __ISIS_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void isis_sll_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void isis_sll_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
 
 /* global variables */
 
-#undef EXT
 #endif

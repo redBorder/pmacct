@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -19,27 +19,33 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
+#ifndef TELEMETRY_MSG_H
+#define TELEMETRY_MSG_H
+
 /* includes */
 
 /* defines */
 
 /* prototypes */
-#if (!defined __TELEMETRY_MSG_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void telemetry_process_data(telemetry_peer *, struct telemetry_data *, int);
+extern void telemetry_process_data(telemetry_peer *, struct telemetry_data *, int);
 
-EXT int telemetry_recv_generic(telemetry_peer *, u_int32_t);
-EXT int telemetry_recv_jump(telemetry_peer *, u_int32_t, int *);
-EXT int telemetry_recv_json(telemetry_peer *, u_int32_t, int *);
-EXT int telemetry_recv_zjson(telemetry_peer *, telemetry_peer_z *, u_int32_t, int *);
-EXT int telemetry_recv_cisco(telemetry_peer *, int *, int *);
-EXT int telemetry_recv_cisco_json(telemetry_peer *, int *);
-EXT int telemetry_recv_cisco_zjson(telemetry_peer *, telemetry_peer_z *, int *);
-EXT int telemetry_recv_cisco_gpb(telemetry_peer *);
-EXT int telemetry_recv_cisco_gpb_kv(telemetry_peer *, int *);
-EXT void telemetry_basic_process_json(telemetry_peer *);
-EXT int telemetry_basic_validate_json(telemetry_peer *);
-#undef EXT
+extern int telemetry_recv_generic(telemetry_peer *, u_int32_t);
+extern int telemetry_recv_jump(telemetry_peer *, u_int32_t, int *);
+extern int telemetry_recv_json(telemetry_peer *, u_int32_t, int *);
+extern int telemetry_recv_gpb(telemetry_peer *, u_int32_t);
+extern int telemetry_recv_cisco(telemetry_peer *, int *, int *, u_int32_t, u_int32_t);
+extern int telemetry_recv_cisco_v0(telemetry_peer *, int *, int *);
+extern int telemetry_recv_cisco_v1(telemetry_peer *, int *, int *);
+extern void telemetry_basic_process_json(telemetry_peer *);
+extern int telemetry_basic_validate_json(telemetry_peer *);
+extern int telemetry_decode_producer_peer(struct telemetry_data *, void *, u_char *, size_t, struct sockaddr *, socklen_t *);
+
+#if defined (WITH_ZMQ)
+extern int telemetry_recv_zmq_generic(telemetry_peer *, u_int32_t);
+#endif
+
+#if defined (WITH_KAFKA)
+extern int telemetry_recv_kafka_generic(telemetry_peer *, u_int32_t);
+#endif
+
+#endif//TELEMETRY_MSG_H

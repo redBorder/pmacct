@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -20,8 +20,6 @@
 */
 
 /*  Based on BGP standard and extended communities implementation from Quagga  */
-
-#define __BGP_LCOMMUNITY_C
 
 #include "pmacct.h"
 #include "bgp_prefix.h"
@@ -43,7 +41,7 @@ lcommunity_new (struct bgp_peer *peer)
   tmp = malloc(sizeof (struct lcommunity));
   if (!tmp) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (lcommunity_new). Exiting ..\n", config.name, bms->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(tmp, 0, sizeof (struct lcommunity));
 
@@ -85,7 +83,7 @@ lcommunity_add_val (struct bgp_peer *peer, struct lcommunity *lcom, struct lcomm
       lcom->val = malloc(lcom_length (lcom));
       if (!lcom->val) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (lcommunity_add_val). Exiting ..\n", config.name, bms->log_str);
-	exit_all(1);
+	exit_gracefully(1);
       }
       memcpy (lcom->val, lval->val, LCOMMUNITY_SIZE);
       return 1;
@@ -192,7 +190,8 @@ void
 lcommunity_unintern (struct bgp_peer *peer, struct lcommunity *lcom)
 {
   struct bgp_rt_structs *inter_domain_routing_db;
-  struct lcommunity *ret;
+  struct lcommunity *ret = NULL;
+  (void) ret;
 
   if (!peer) return;
 
@@ -256,7 +255,7 @@ lcommunity_lcom2str (struct bgp_peer *peer, struct lcommunity *lcom)
   int idx, str_pnt, str_size, first = TRUE;
   u_int32_t npart1, npart2, npart3;
   u_int32_t hpart1, hpart2, hpart3;
-  char *str_buf;
+  char *str_buf = NULL;
   u_int8_t *pnt;
 
   if (!peer) return NULL;
@@ -300,5 +299,24 @@ lcommunity_lcom2str (struct bgp_peer *peer, struct lcommunity *lcom)
 
   exit_lane:
   Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (lcommunity_lcom2str). Exiting ..\n", config.name, bms->log_str);
-  exit_all(1);
+  exit_gracefully(1);
+
+  return NULL; /* silence compiler warning */
+}
+
+struct lcommunity *lcommunity_dup(struct lcommunity *lcom)
+{
+  struct lcommunity *new;
+
+  new = malloc(sizeof(struct lcommunity));
+
+  new->size = lcom->size;
+
+  if (new->size) {
+    new->val = malloc(lcom->size * LCOMMUNITY_SIZE);
+    memcpy (new->val, lcom->val, lcom->size * LCOMMUNITY_SIZE);
+  }
+  else new->val = NULL;
+
+  return new;
 }

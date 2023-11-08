@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,24 +19,33 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-/* defines */
-#define __TELEMETRY_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
 #include "thread_pool.h"
-#include "../bgp/bgp.h"
+#include "bgp/bgp.h"
 #include "telemetry.h"
+#if defined WITH_EBPF
+#include "ebpf/ebpf_rp_balancer.h"
+#endif
 #if defined WITH_RABBITMQ
 #include "amqp_common.h"
 #endif
 #ifdef WITH_KAFKA
 #include "kafka_common.h"
 #endif
+#if defined WITH_ZMQ
+#include "zmq_common.h"
+#endif
 
-/* variables to be exported away */
+/* Global variables */
 thread_pool_t *telemetry_pool;
+telemetry_misc_structs *telemetry_misc_db;
+telemetry_peer *telemetry_peers;
+void *telemetry_peers_cache;
+telemetry_peer_timeout *telemetry_peers_timeout;
+int zmq_input = 0, kafka_input = 0, unyte_udp_notif_input = 0;
+telemetry_tag_t telemetry_logdump_tag;
+struct sockaddr_storage telemetry_logdump_tag_peer;
 
 /* Functions */
 void telemetry_wrapper()
@@ -51,7 +60,7 @@ void telemetry_wrapper()
   t_data = malloc(sizeof(struct telemetry_data));
   if (!t_data) {
     Log(LOG_ERR, "ERROR ( %s/core/TELE ): malloc() struct telemetry_data failed. Terminating.\n", config.name);
-    exit_all(1);
+    exit_gracefully(1);
   }
   telemetry_prepare_thread(t_data);
 
@@ -59,40 +68,55 @@ void telemetry_wrapper()
   send_to_pool(telemetry_pool, telemetry_daemon, t_data);
 }
 
-void telemetry_daemon(void *t_data_void)
+int telemetry_daemon(void *t_data_void)
 {
   struct telemetry_data *t_data = t_data_void;
-  telemetry_peer_udp_cache tpuc;
+  telemetry_peer_cache tpc;
 
-  int slen, clen, ret, rc, peers_idx, allowed, yes=1, no=0;
+  int ret, rc, peers_idx, allowed, yes=1;
   int peers_idx_rr = 0, max_peers_idx = 0, peers_num = 0;
-  int decoder = 0, data_decoder = 0, recv_flags = 0;
+  int data_decoder = 0, recv_flags = 0;
+  int capture_methods = 0;
   u_int16_t port = 0;
   char *srv_proto = NULL;
-  time_t last_udp_timeout_check;
+  time_t last_peers_timeout_check;
+  socklen_t slen = {0}, clen;
 
   telemetry_peer *peer = NULL;
-  telemetry_peer_z *peer_z = NULL;
 
-#if defined ENABLE_IPV6
   struct sockaddr_storage server, client;
-#else
-  struct sockaddr server, client;
-#endif
   struct hosts_table allow;
   struct host_addr addr;
 
+  sigset_t signal_set;
+
   /* select() stuff */
   fd_set read_descs, bkp_read_descs;
-  int fd, select_fd, bkp_select_fd, recalc_fds, select_num;
+  int fd, select_fd, bkp_select_fd, recalc_fds, select_num = 0;
 
   /* logdump time management */
-  time_t dump_refresh_deadline;
+  time_t dump_refresh_deadline = {0};
   struct timeval dump_refresh_timeout, *drt_ptr;
+
+  /* ZeroMQ and Kafka stuff */
+  char *saved_peer_buf = NULL;
+  u_char consumer_buf[PKT_MSG_SIZE];
+
+  /* telemetry_tag_map stuff */
+  struct plugin_requests req;
+  struct id_table telemetry_logdump_tag_table;
+  int telemetry_logdump_tag_map_allocated;
+
+#if defined WITH_UNYTE_UDP_NOTIF
+  unyte_udp_collector_t *uun_collector = NULL;
+  void *seg_ptr = NULL;
+  char udp_notif_port[6];
+  char udp_notif_null_ip_address[] = "0.0.0.0";
+#endif
 
   if (!t_data) {
     Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon(): missing telemetry data. Terminating.\n", config.name, t_data->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
 
   /* initial cleanups */
@@ -102,129 +126,154 @@ void telemetry_daemon(void *t_data_void)
   memset(&client, 0, sizeof(client));
   memset(&allow, 0, sizeof(struct hosts_table));
   clen = sizeof(client);
-  telemetry_peers_udp_cache = NULL;
-  last_udp_timeout_check = FALSE;
+  telemetry_peers_cache = NULL;
+  last_peers_timeout_check = FALSE;
 
   telemetry_misc_db = &inter_domain_misc_dbs[FUNC_TYPE_TELEMETRY];
   memset(telemetry_misc_db, 0, sizeof(telemetry_misc_structs));
 
   /* initialize variables */
-  if (config.telemetry_port_tcp && config.telemetry_port_udp) {
-    Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_port_tcp and telemetry_daemon_port_udp are mutually exclusive. Terminating.\n", config.name, t_data->log_str);
-    exit_all(1);
+  if (config.telemetry_ip || config.telemetry_port_tcp || config.telemetry_port_udp) {
+    capture_methods++;
   }
-  else if (!config.telemetry_port_tcp && !config.telemetry_port_udp) {
-    /* defaulting to TCP */
-    port = config.telemetry_port_tcp = TELEMETRY_TCP_PORT;
-    srv_proto = malloc(strlen("tcp") + 1);
-    strcpy(srv_proto, "tcp");
+
+  if (config.telemetry_udp_notif_ip || config.telemetry_udp_notif_port) {
+#if defined WITH_UNYTE_UDP_NOTIF
+    capture_methods++;
+    unyte_udp_notif_input = TRUE;
+#endif
   }
-  else {
-    if (config.telemetry_port_tcp) {
-      port = config.telemetry_port_tcp;
+
+  if (config.telemetry_zmq_address) {
+#if defined WITH_ZMQ
+    capture_methods++;
+    zmq_input = TRUE;
+#else 
+    Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_zmq_* require --enable-zmq. Terminating.\n", config.name, t_data->log_str);
+    exit_gracefully(1);
+#endif
+  }
+  if (config.telemetry_kafka_broker_host || config.telemetry_kafka_topic) {
+#if defined WITH_KAFKA
+    capture_methods++;
+    kafka_input = TRUE;
+
+    if ((config.telemetry_kafka_broker_host && !config.telemetry_kafka_topic) || (config.telemetry_kafka_topic && !config.telemetry_kafka_broker_host)) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): Kafka collection requires both broker host and topic to be specified. Terminating.\n\n", config.name, t_data->log_str);
+      exit_gracefully(1);
+    }
+#else
+    Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_kafka_* require --enable-kafka. Terminating.\n", config.name, t_data->log_str);
+    exit_gracefully(1);
+#endif
+  }
+
+  if (capture_methods > 1) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_ip, telemetry_daemon_zmq_* and telemetry_kafka_* are mutually exclusive. Exiting...\n",
+	config.name, t_data->log_str);
+    exit_gracefully(1);
+  }
+
+  memset(consumer_buf, 0, sizeof(consumer_buf));
+
+  if (!zmq_input && !kafka_input && !unyte_udp_notif_input) {
+    if (config.telemetry_port_tcp && config.telemetry_port_udp) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_port_tcp and telemetry_daemon_port_udp are mutually exclusive. Terminating.\n", config.name, t_data->log_str);
+      exit_gracefully(1);
+    }
+    else if (!config.telemetry_port_tcp && !config.telemetry_port_udp) {
+      /* defaulting to TCP */
+      port = config.telemetry_port_tcp = TELEMETRY_TCP_PORT;
       srv_proto = malloc(strlen("tcp") + 1);
       strcpy(srv_proto, "tcp");
     }
+    else {
+      if (config.telemetry_port_tcp) {
+	port = config.telemetry_port_tcp;
+	srv_proto = malloc(strlen("tcp") + 1);
+	strcpy(srv_proto, "tcp");
+      }
 
-    if (config.telemetry_port_udp) {
-      port = config.telemetry_port_udp;
-      srv_proto = malloc(strlen("udp") + 1);
-      strcpy(srv_proto, "udp");
+      if (config.telemetry_port_udp) {
+	port = config.telemetry_port_udp;
+	srv_proto = malloc(strlen("udp") + 1);
+	strcpy(srv_proto, "udp");
+      }
     }
-  }
 
-  /* socket creation for telemetry server: IPv4 only */
-#if (defined ENABLE_IPV6)
-  if (!config.telemetry_ip) {
-    struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&server;
+    /* socket creation for telemetry server: IPv4 only */
+    if (!config.telemetry_ip) {
+      struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&server;
 
-    sa6->sin6_family = AF_INET6;
-    sa6->sin6_port = htons(port);
-    slen = sizeof(struct sockaddr_in6);
-  }
-#else
-  if (!config.telemetry_ip) {
-    struct sockaddr_in *sa4 = (struct sockaddr_in *)&server;
-
-    sa4->sin_family = AF_INET;
-    sa4->sin_addr.s_addr = htonl(0);
-    sa4->sin_port = htons(port);
-    slen = sizeof(struct sockaddr_in);
-  }
-#endif
-  else {
-    trim_spaces(config.telemetry_ip);
-    ret = str_to_addr(config.telemetry_ip, &addr);
-    if (!ret) {
-      Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_ip value is not a valid IPv4/IPv6 address. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+      sa6->sin6_family = AF_INET6;
+      sa6->sin6_port = htons(port);
+      slen = sizeof(struct sockaddr_in6);
     }
-    slen = addr_to_sa((struct sockaddr *)&server, &addr, port);
+    else {
+      trim_spaces(config.telemetry_ip);
+      ret = str_to_addr(config.telemetry_ip, &addr);
+      if (!ret) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_ip value is not a valid IPv4/IPv6 address. Terminating.\n", config.name, t_data->log_str);
+	exit_gracefully(1);
+      }
+      slen = addr_to_sa((struct sockaddr *)&server, &addr, port);
+    }
   }
 
   if (!config.telemetry_decoder) {
     Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_decoder is not specified. Terminating.\n", config.name, t_data->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   else {
-    if (!strcmp(config.telemetry_decoder, "json")) decoder = TELEMETRY_DECODER_JSON;
-    else if (!strcmp(config.telemetry_decoder, "zjson")) {
-#if defined (HAVE_ZLIB)
-      decoder = TELEMETRY_DECODER_ZJSON;
-#else
-      Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_decoder set to 'zjson' but zlib not available. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
-#endif
-    }
-    else if (!strcmp(config.telemetry_decoder, "cisco_json")) decoder = TELEMETRY_DECODER_CISCO_JSON;
-    else if (!strcmp(config.telemetry_decoder, "cisco_zjson")) {
-#if defined (HAVE_ZLIB)
-      decoder = TELEMETRY_DECODER_CISCO_ZJSON;
-#else
-      Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_decoder set to 'cisco_zjson' but zlib not available. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
-#endif
-    }
-    else if (!strcmp(config.telemetry_decoder, "cisco")) decoder = TELEMETRY_DECODER_CISCO;
-    else if (!strcmp(config.telemetry_decoder, "cisco_gpb")) decoder = TELEMETRY_DECODER_CISCO_GPB;
-    else if (!strcmp(config.telemetry_decoder, "cisco_gpb_kv")) decoder = TELEMETRY_DECODER_CISCO_GPB_KV;
+    if (!strcmp(config.telemetry_decoder, "json")) config.telemetry_decoder_id = TELEMETRY_DECODER_JSON;
+    else if (!strcmp(config.telemetry_decoder, "gpb")) config.telemetry_decoder_id = TELEMETRY_DECODER_GPB;
+    else if (!strcmp(config.telemetry_decoder, "cisco_v0")) config.telemetry_decoder_id = TELEMETRY_DECODER_CISCO_V0;
+    else if (!strcmp(config.telemetry_decoder, "cisco_v1")) config.telemetry_decoder_id = TELEMETRY_DECODER_CISCO_V1;
     else {
       Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_decoder set to unknown value. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+      exit_gracefully(1);
+    }
+
+    if (config.telemetry_decoder_id != TELEMETRY_DECODER_JSON) {
+      if (zmq_input) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): ZeroMQ collection supports only 'json' decoder (telemetry_daemon_decoder). Terminating.\n", config.name, t_data->log_str);
+	exit_gracefully(1);
+      }
+
+      if (kafka_input) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): Kafka collection supports only 'json' decoder (telemetry_daemon_decoder). Terminating.\n", config.name, t_data->log_str);
+	exit_gracefully(1);
+      }
+
+      if (unyte_udp_notif_input) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): Unyte UDP Notif collection supports only 'json' decoder (telemetry_daemon_decoder). Terminating.\n", config.name, t_data->log_str);
+	exit_gracefully(1);
+      }
     }
   }
 
   if (!config.telemetry_max_peers) config.telemetry_max_peers = TELEMETRY_MAX_PEERS_DEFAULT;
   Log(LOG_INFO, "INFO ( %s/%s ): maximum telemetry peers allowed: %d\n", config.name, t_data->log_str, config.telemetry_max_peers);
 
-  if (config.telemetry_port_udp) {
-    if (!config.telemetry_udp_timeout) config.telemetry_udp_timeout = TELEMETRY_UDP_TIMEOUT_DEFAULT;
-    Log(LOG_INFO, "INFO ( %s/%s ): telemetry UDP peers timeout: %u\n", config.name, t_data->log_str, config.telemetry_udp_timeout);
+  if (config.telemetry_port_udp || zmq_input || kafka_input || unyte_udp_notif_input) {
+    if (!config.telemetry_peer_timeout) config.telemetry_peer_timeout = TELEMETRY_PEER_TIMEOUT_DEFAULT;
+    Log(LOG_INFO, "INFO ( %s/%s ): telemetry peers timeout: %u\n", config.name, t_data->log_str, config.telemetry_peer_timeout);
   }
 
   telemetry_peers = malloc(config.telemetry_max_peers*sizeof(telemetry_peer));
   if (!telemetry_peers) {
     Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() telemetry_peers structure. Terminating.\n", config.name, t_data->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(telemetry_peers, 0, config.telemetry_max_peers*sizeof(telemetry_peer));
 
-  if (telemetry_is_zjson(decoder)) {
-    telemetry_peers_z = malloc(config.telemetry_max_peers*sizeof(telemetry_peer_z));
-    if (!telemetry_peers_z) {
-      Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() telemetry_peers_z structure. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+  if (config.telemetry_port_udp || zmq_input || kafka_input || unyte_udp_notif_input) {
+    telemetry_peers_timeout = malloc(config.telemetry_max_peers*sizeof(telemetry_peer_timeout));
+    if (!telemetry_peers_timeout) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() telemetry_peers_timeout structure. Terminating.\n", config.name, t_data->log_str);
+      exit_gracefully(1);
     }
-    memset(telemetry_peers_z, 0, config.telemetry_max_peers*sizeof(telemetry_peer_z));
-  }
-
-  if (config.telemetry_port_udp) {
-    telemetry_peers_udp_timeout = malloc(config.telemetry_max_peers*sizeof(telemetry_peer_udp_timeout));
-    if (!telemetry_peers_udp_timeout) {
-      Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() telemetry_peers_udp_timeout structure. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
-    }
-    memset(telemetry_peers_udp_timeout, 0, config.telemetry_max_peers*sizeof(telemetry_peer_udp_timeout));
+    memset(telemetry_peers_timeout, 0, config.telemetry_max_peers*sizeof(telemetry_peer_timeout));
   }
 
   if (config.telemetry_msglog_file || config.telemetry_msglog_amqp_routing_key || config.telemetry_msglog_kafka_topic) {
@@ -234,7 +283,7 @@ void telemetry_daemon(void *t_data_void)
 
     if (telemetry_misc_db->msglog_backend_methods > 1) {
       Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_daemon_msglog_file, telemetry_daemon_msglog_amqp_routing_key and telemetry_daemon_msglog_kafka_topic are mutually exclusive. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+      exit_gracefully(1);
     }
   }
 
@@ -245,7 +294,7 @@ void telemetry_daemon(void *t_data_void)
 
     if (telemetry_misc_db->dump_backend_methods > 1) {
       Log(LOG_ERR, "ERROR ( %s/%s ): telemetry_dump_file, telemetry_dump_amqp_routing_key and telemetry_dump_kafka_topic are mutually exclusive. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+      exit_gracefully(1);
     }
   }
 
@@ -256,7 +305,7 @@ void telemetry_daemon(void *t_data_void)
     telemetry_misc_db->peers_log = malloc(config.telemetry_max_peers*sizeof(telemetry_peer_log));
     if (!telemetry_misc_db->peers_log) {
       Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() telemetry peers_log structure. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+      exit_gracefully(1);
     }
     memset(telemetry_misc_db->peers_log, 0, config.telemetry_max_peers*sizeof(telemetry_peer_log));
 
@@ -281,90 +330,96 @@ void telemetry_daemon(void *t_data_void)
     }
   }
 
-  if (config.telemetry_port_tcp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_STREAM, 0);
-  else if (config.telemetry_port_udp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_DGRAM, 0);
-
-  if (config.telemetry_sock < 0) {
-#if (defined ENABLE_IPV6)
-    /* retry with IPv4 */
-    if (!config.telemetry_ip) {
-      struct sockaddr_in *sa4 = (struct sockaddr_in *)&server;
-
-      sa4->sin_family = AF_INET;
-      sa4->sin_addr.s_addr = htonl(0);
-      sa4->sin_port = htons(port);
-      slen = sizeof(struct sockaddr_in);
-
-      if (config.telemetry_port_tcp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_STREAM, 0);
-      else if (config.telemetry_port_udp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_DGRAM, 0);
-    }
-#endif
+  if (!zmq_input && !kafka_input && !unyte_udp_notif_input) {
+    if (config.telemetry_port_tcp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_STREAM, 0);
+    else if (config.telemetry_port_udp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_DGRAM, 0);
 
     if (config.telemetry_sock < 0) {
-      Log(LOG_ERR, "ERROR ( %s/%s ): socket() failed. Terminating.\n", config.name, t_data->log_str);
-      exit_all(1);
+      /* retry with IPv4 */
+      if (!config.telemetry_ip) {
+	struct sockaddr_in *sa4 = (struct sockaddr_in *)&server;
+
+	sa4->sin_family = AF_INET;
+	sa4->sin_addr.s_addr = htonl(0);
+	sa4->sin_port = htons(port);
+	slen = sizeof(struct sockaddr_in);
+
+	if (config.telemetry_port_tcp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_STREAM, 0);
+	else if (config.telemetry_port_udp) config.telemetry_sock = socket(((struct sockaddr *)&server)->sa_family, SOCK_DGRAM, 0);
+      }
+
+      if (config.telemetry_sock < 0) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): socket() failed. Terminating.\n", config.name, t_data->log_str);
+	exit_gracefully(1);
+      }
+
+      if (config.telemetry_port_tcp) setsockopt(config.telemetry_sock, SOL_SOCKET, SO_KEEPALIVE, (void *)&yes, sizeof(yes));
     }
-  }
 
-  if (config.telemetry_ipprec) {
-    int opt = config.telemetry_ipprec << 5;
+    if (config.telemetry_ipprec) {
+      int opt = config.telemetry_ipprec << 5;
 
-    rc = setsockopt(config.telemetry_sock, IPPROTO_IP, IP_TOS, &opt, sizeof(opt));
-    if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for IP_TOS (errno: %d).\n", config.name, t_data->log_str, errno);
-  }
+      rc = setsockopt(config.telemetry_sock, IPPROTO_IP, IP_TOS, &opt, (socklen_t) sizeof(opt));
+      if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for IP_TOS (errno: %d).\n", config.name, t_data->log_str, errno);
+    }
 
-#if (defined LINUX) && (defined HAVE_SO_REUSEPORT)
-  rc = setsockopt(config.telemetry_sock, SOL_SOCKET, SO_REUSEADDR|SO_REUSEPORT, (char *)&yes, sizeof(yes));
-  if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for SO_REUSEADDR|SO_REUSEPORT (errno: %d).\n", config.name, t_data->log_str, errno);
-#else
-  rc = setsockopt(config.telemetry_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&yes, sizeof(yes));
-  if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for SO_REUSEADDR (errno: %d).\n", config.name, t_data->log_str, errno);
+#if (defined HAVE_SO_REUSEPORT)
+    rc = setsockopt(config.telemetry_sock, SOL_SOCKET, SO_REUSEPORT, (char *) &yes, (socklen_t) sizeof(yes));
+    if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for SO_REUSEPORT (errno: %d).\n", config.name, t_data->log_str, errno);
 #endif
 
-#if (defined ENABLE_IPV6) && (defined IPV6_BINDV6ONLY)
-  rc = setsockopt(config.telemetry_sock, IPPROTO_IPV6, IPV6_BINDV6ONLY, (char *) &no, (socklen_t) sizeof(no));
-  if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for IPV6_BINDV6ONLY (errno: %d).\n", config.name, t_data->log_str, errno);
+#if (defined HAVE_SO_BINDTODEVICE)
+    if (config.telemetry_interface)  {
+      rc = setsockopt(config.telemetry_sock, SOL_SOCKET, SO_BINDTODEVICE, config.telemetry_interface, (socklen_t) strlen(config.telemetry_interface));
+      if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for SO_BINDTODEVICE (errno: %d).\n", config.name, t_data->log_str, errno);
+    }
 #endif
 
-  if (config.telemetry_pipe_size) {
-    int l = sizeof(config.telemetry_pipe_size);
-    int saved = 0, obtained = 0;
+    rc = setsockopt(config.telemetry_sock, SOL_SOCKET, SO_REUSEADDR, (char *) &yes, (socklen_t) sizeof(yes));
+    if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for SO_REUSEADDR (errno: %d).\n", config.name, t_data->log_str, errno);
 
-    getsockopt(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &saved, &l);
-    Setsocksize(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &config.telemetry_pipe_size, sizeof(config.telemetry_pipe_size));
-    getsockopt(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &obtained, &l);
+    if (config.telemetry_ipv6_only) {
+      int yes=1;
 
-    Setsocksize(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &saved, l);
-    getsockopt(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &obtained, &l);
-    Log(LOG_INFO, "INFO ( %s/%s ): telemetry_daemon_pipe_size: obtained=%d target=%d.\n",
-	config.name, t_data->log_str, obtained, config.telemetry_pipe_size);
-  }
+      rc = setsockopt(config.telemetry_sock, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &yes, (socklen_t) sizeof(yes));
+      if (rc < 0) Log(LOG_ERR, "WARN ( %s/%s ): setsockopt() failed for IPV6_V6ONLY (errno: %d).\n", config.name, t_data->log_str, errno);
+    }
 
-  rc = bind(config.telemetry_sock, (struct sockaddr *) &server, slen);
-  if (rc < 0) {
-    char null_ip_address[] = "0.0.0.0";
-    char *ip_address;
+    if (config.telemetry_pipe_size) {
+      socklen_t l = sizeof(config.telemetry_pipe_size);
+      int saved = 0, obtained = 0;
 
-    ip_address = config.telemetry_ip ? config.telemetry_ip : null_ip_address;
-    Log(LOG_ERR, "ERROR ( %s/%s ): bind() to ip=%s port=%u/%s failed (errno: %d).\n",
-	config.name, t_data->log_str, ip_address, port, srv_proto, errno);
-    exit_all(1);
-  }
+      getsockopt(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &saved, &l);
+      Setsocksize(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &config.telemetry_pipe_size, (socklen_t) sizeof(config.telemetry_pipe_size));
+      getsockopt(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &obtained, &l);
 
-  if (config.telemetry_port_tcp) {
-    rc = listen(config.telemetry_sock, 1);
+      Setsocksize(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &saved, l);
+      getsockopt(config.telemetry_sock, SOL_SOCKET, SO_RCVBUF, &obtained, &l);
+      Log(LOG_INFO, "INFO ( %s/%s ): telemetry_daemon_pipe_size: obtained=%d target=%d.\n",
+	  config.name, t_data->log_str, obtained, config.telemetry_pipe_size);
+    }
+
+    rc = bind(config.telemetry_sock, (struct sockaddr *) &server, slen);
     if (rc < 0) {
-      Log(LOG_ERR, "ERROR ( %s/%s ): listen() failed (errno: %d).\n", config.name, t_data->log_str, errno);
-      exit_all(1);
+      char null_ip_address[] = "0.0.0.0";
+      char *ip_address;
+
+      ip_address = config.telemetry_ip ? config.telemetry_ip : null_ip_address;
+      Log(LOG_ERR, "ERROR ( %s/%s ): bind() to ip=%s port=%u/%s failed (errno: %d).\n",
+	  config.name, t_data->log_str, ip_address, port, srv_proto, errno);
+      exit_gracefully(1);
+    }
+
+    if (config.telemetry_port_tcp) {
+      rc = listen(config.telemetry_sock, 1);
+      if (rc < 0) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): listen() failed (errno: %d).\n", config.name, t_data->log_str, errno);
+	exit_gracefully(1);
+      }
     }
   }
 
-  /* Preparing for syncronous I/O multiplexing */
-  select_fd = 0;
-  FD_ZERO(&bkp_read_descs);
-  FD_SET(config.telemetry_sock, &bkp_read_descs);
-
-  {
+  if (!zmq_input && !kafka_input && !unyte_udp_notif_input) {
     char srv_string[INET6_ADDRSTRLEN];
     struct host_addr srv_addr;
     u_int16_t srv_port;
@@ -373,6 +428,67 @@ void telemetry_daemon(void *t_data_void)
     addr_to_str(srv_string, &srv_addr);
     Log(LOG_INFO, "INFO ( %s/%s ): waiting for telemetry data on %s:%u/%s\n", config.name, t_data->log_str, srv_string, srv_port, srv_proto);
   }
+#if defined WITH_ZMQ
+  else if (zmq_input) {
+    telemetry_init_zmq_host(&telemetry_zmq_host, &config.telemetry_sock);
+    Log(LOG_INFO, "INFO ( %s/%s ): reading telemetry data from ZeroMQ %s\n", config.name, t_data->log_str, p_zmq_get_address(&telemetry_zmq_host));
+  }
+#endif
+#if defined WITH_KAFKA
+  else if (kafka_input) {
+    telemetry_init_kafka_host(&telemetry_kafka_host);
+    Log(LOG_INFO, "INFO ( %s/%s ): reading telemetry data from Kafka %s:%s\n", config.name, t_data->log_str,
+	p_kafka_get_broker(&telemetry_kafka_host), p_kafka_get_topic(&telemetry_kafka_host));
+  }
+#endif
+#if defined WITH_UNYTE_UDP_NOTIF
+  else if (unyte_udp_notif_input) {
+    unyte_udp_options_t options = {0};
+    int sockfd;
+
+    memset(udp_notif_port, 0, sizeof(udp_notif_port));
+
+    if (!config.telemetry_udp_notif_ip) {
+      config.telemetry_udp_notif_ip = udp_notif_null_ip_address;
+    }
+
+    if (config.telemetry_udp_notif_port) {
+      sprintf(udp_notif_port, "%d", config.telemetry_udp_notif_port);
+    }
+    else {
+      Log(LOG_ERR, "ERROR ( %s/core/TELE ): Unyte UDP Notif specified but no telemetry_daemon_udp_notif_port supplied. Terminating.\n", config.name);
+      exit_gracefully(1);
+    }
+
+    sockfd = create_socket_unyte_udp_notif(t_data, config.telemetry_udp_notif_ip, udp_notif_port);
+#if defined WITH_EBPF && defined HAVE_SO_REUSEPORT
+    if (config.telemetry_udp_notif_rp_ebpf_prog) {
+      attach_ebpf_reuseport_balancer(sockfd, config.telemetry_udp_notif_rp_ebpf_prog, config.cluster_name, "telemetry", config.cluster_id, FALSE);
+    }
+#endif
+    options.socket_fd = sockfd;
+
+    if (config.telemetry_udp_notif_nmsgs) {
+      options.recvmmsg_vlen = config.telemetry_udp_notif_nmsgs;
+    }
+    else {
+      options.recvmmsg_vlen = TELEMETRY_DEFAULT_UNYTE_UDP_NOTIF_NMSGS;
+    }
+
+    if (config.tmp_telemetry_udp_notif_legacy) {
+      options.legacy = TRUE;
+    }
+
+    uun_collector = unyte_udp_start_collector(&options);
+
+    Log(LOG_INFO, "INFO ( %s/%s ): reading telemetry data from Unyte UDP Notif on %s:%s\n", config.name, t_data->log_str, config.telemetry_udp_notif_ip, udp_notif_port);
+  }
+#endif
+
+  /* Preparing for syncronous I/O multiplexing */
+  select_fd = 0;
+  FD_ZERO(&bkp_read_descs);
+  FD_SET(config.telemetry_sock, &bkp_read_descs);
 
   /* Preparing ACL, if any */
   if (config.telemetry_allow_file) load_allow_file(config.telemetry_allow_file, &allow);
@@ -386,8 +502,14 @@ void telemetry_daemon(void *t_data_void)
   }
 
   if (telemetry_misc_db->dump_backend_methods) {
+    if (!config.telemetry_dump_workers) {
+      config.telemetry_dump_workers = 1;
+    }
+
 #ifdef WITH_JANSSON
-    if (!config.telemetry_dump_output) config.telemetry_dump_output = PRINT_OUTPUT_JSON;
+    if (!config.telemetry_dump_output) {
+      config.telemetry_dump_output = PRINT_OUTPUT_JSON;
+    }
 #else
     Log(LOG_WARNING, "WARN ( %s/%s ): telemetry_table_dump_output set to json but will produce no output (missing --enable-jansson).\n", config.name, t_data->log_str);
 #endif
@@ -396,6 +518,14 @@ void telemetry_daemon(void *t_data_void)
   if (telemetry_misc_db->dump_backend_methods) {
     char dump_roundoff[] = "m";
     time_t tmp_time;
+
+    if (!config.telemetry_dump_time_slots) {
+      config.telemetry_dump_time_slots = 1;
+    }
+
+    if (config.telemetry_dump_refresh_time % config.telemetry_dump_time_slots != 0) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): 'telemetry_dump_time_slots' is not a divisor of 'telemetry_dump_refresh_time', please fix.\n", config.name, t_data->log_str);
+    }
 
     if (config.telemetry_dump_refresh_time) {
       gettimeofday(&telemetry_misc_db->log_tstamp, NULL);
@@ -412,26 +542,57 @@ void telemetry_daemon(void *t_data_void)
       telemetry_misc_db->dump_backend_methods = FALSE;
       Log(LOG_WARNING, "WARN ( %s/%s ): Invalid 'telemetry_dump_refresh_time'.\n", config.name, t_data->log_str);
     }
-
-    if (config.telemetry_dump_amqp_routing_key) telemetry_dump_init_amqp_host();
-    if (config.telemetry_dump_kafka_topic) telemetry_dump_init_kafka_host();
   }
+
+  if (!config.writer_id_string) {
+    config.writer_id_string = DYNNAME_DEFAULT_WRITER_ID;
+  }
+
+  dynname_tokens_prepare(config.writer_id_string, &telemetry_misc_db->writer_id_tokens, DYN_STR_WRITER_ID);
 
   select_fd = bkp_select_fd = (config.telemetry_sock + 1);
   recalc_fds = FALSE;
 
   telemetry_link_misc_structs(telemetry_misc_db);
 
+  if (config.telemetry_tag_map) {
+    memset(&telemetry_logdump_tag, 0, sizeof(telemetry_logdump_tag));
+    memset(&telemetry_logdump_tag_table, 0, sizeof(telemetry_logdump_tag_table));
+    memset(&req, 0, sizeof(req));
+    telemetry_logdump_tag_map_allocated = FALSE;
+
+    load_pre_tag_map(ACCT_PMTELE, config.telemetry_tag_map, &telemetry_logdump_tag_table, &req,
+                     &telemetry_logdump_tag_map_allocated, config.maps_entries, config.maps_row_len);
+
+    /* making some bindings */
+    telemetry_logdump_tag.tag_table = (unsigned char *) &telemetry_logdump_tag_table;
+  }
+
+  sigemptyset(&signal_set);
+  sigaddset(&signal_set, SIGCHLD);
+  sigaddset(&signal_set, SIGHUP);
+  sigaddset(&signal_set, SIGUSR1);
+  sigaddset(&signal_set, SIGUSR2);
+  sigaddset(&signal_set, SIGTERM);
+  if (config.daemon) {
+    sigaddset(&signal_set, SIGINT);
+  }
+
   for (;;) {
     select_again:
+
+    if (!t_data->is_thread) {
+      sigprocmask(SIG_UNBLOCK, &signal_set, NULL); 
+      sigprocmask(SIG_BLOCK, &signal_set, NULL); 
+    }
 
     if (recalc_fds) {
       select_fd = config.telemetry_sock;
       max_peers_idx = -1; /* .. since valid indexes include 0 */
 
       for (peers_idx = 0, peers_num = 0; peers_idx < config.telemetry_max_peers; peers_idx++) {
-        if (select_fd < telemetry_peers[peers_idx].fd) select_fd = telemetry_peers[peers_idx].fd;
-        if (telemetry_peers[peers_idx].fd) {
+	if (select_fd < telemetry_peers[peers_idx].fd) select_fd = telemetry_peers[peers_idx].fd;
+	if (telemetry_peers[peers_idx].fd > 0) {
 	  max_peers_idx = peers_idx;
 	  peers_num++;
 	}
@@ -445,6 +606,7 @@ void telemetry_daemon(void *t_data_void)
     else select_fd = bkp_select_fd;
 
     memcpy(&read_descs, &bkp_read_descs, sizeof(bkp_read_descs));
+
     if (telemetry_misc_db->dump_backend_methods) {
       int delta;
 
@@ -455,35 +617,92 @@ void telemetry_daemon(void *t_data_void)
     }
     else drt_ptr = NULL;
 
-    select_num = select(select_fd, &read_descs, NULL, NULL, drt_ptr);
-    if (select_num < 0) goto select_again;
+    if (!zmq_input && !kafka_input && !unyte_udp_notif_input) {
+      select_num = select(select_fd, &read_descs, NULL, NULL, drt_ptr);
+      if (select_num < 0) goto select_again;
+    }
+#if defined WITH_ZMQ
+    else if (zmq_input) {
+      select_num = p_zmq_recv_poll(&telemetry_zmq_host.sock, drt_ptr ? (drt_ptr->tv_sec * 1000) : 1000);
+      if (select_num < 0) goto select_again;
+    }
+#endif
+#if defined WITH_KAFKA
+    else if (kafka_input) {
+      t_data->kafka_msg = NULL;
+
+      select_num = p_kafka_consume_poller(&telemetry_kafka_host, &t_data->kafka_msg, drt_ptr ? (drt_ptr->tv_sec * 1000) : 1000);
+
+      if (select_num < 0) {
+	/* Close */
+	p_kafka_manage_consumer(&nfacctd_kafka_host, FALSE);
+
+	/* Re-open */
+	telemetry_init_kafka_host(&telemetry_kafka_host);
+
+	goto select_again;
+      }
+    }
+#endif
+#if defined WITH_UNYTE_UDP_NOTIF
+    else if (unyte_udp_notif_input) {
+      seg_ptr = unyte_udp_queue_read(uun_collector->queue);
+      select_num = TRUE; /* anything but zero or negative */
+    }
+#endif
 
     t_data->now = time(NULL);
 
-    // XXX: UDP case: timeout handling (to be tested)
-    if (config.telemetry_port_udp) {
-      if (t_data->now > (last_udp_timeout_check + TELEMETRY_UDP_TIMEOUT_INTERVAL)) {
+    /* Logging stats */
+    if (!t_data->global_stats.last_check || ((t_data->global_stats.last_check + TELEMETRY_LOG_STATS_INTERVAL) <= t_data->now)) {
+      if (t_data->global_stats.last_check) {
+	telemetry_peer *stats_peer;
+	int peers_idx;
+
+	for (stats_peer = NULL, peers_idx = 0; peers_idx < config.telemetry_max_peers; peers_idx++) {
+	  if (telemetry_peers[peers_idx].fd) {
+	    stats_peer = &telemetry_peers[peers_idx];
+	    telemetry_log_peer_stats(stats_peer, t_data);
+	    stats_peer->stats.last_check = t_data->now;
+	  }
+	}
+
+	telemetry_log_global_stats(t_data);
+      }
+
+      t_data->global_stats.last_check = t_data->now;
+    }
+
+    /* XXX: ZeroMQ / Kafka cases: timeout handling (to be tested) */
+    if (config.telemetry_port_udp || zmq_input || kafka_input || unyte_udp_notif_input) {
+      if (t_data->now > (last_peers_timeout_check + TELEMETRY_PEER_TIMEOUT_INTERVAL)) {
 	for (peers_idx = 0; peers_idx < config.telemetry_max_peers; peers_idx++) {
-	  telemetry_peer_udp_timeout *peer_udp_timeout;
+	  telemetry_peer_timeout *peer_timeout;
 
 	  peer = &telemetry_peers[peers_idx];
-	  peer_z = &telemetry_peers_z[peers_idx];
-	  peer_udp_timeout = &telemetry_peers_udp_timeout[peers_idx];
+	  peer_timeout = &telemetry_peers_timeout[peers_idx];
 
 	  if (peer->fd) {
-	    if (t_data->now > (peer_udp_timeout->last_msg + config.telemetry_udp_timeout)) {
-	      Log(LOG_INFO, "INFO ( %s/%s ): [%s] telemetry UDP peer removed (timeout).\n", config.name, t_data->log_str, peer->addr_str);
+	    if (t_data->now > (peer_timeout->last_msg + config.telemetry_peer_timeout)) {
+	      Log(LOG_INFO, "INFO ( %s/%s ): [%s] telemetry peer removed (timeout).\n", config.name, t_data->log_str, peer->addr_str);
 	      telemetry_peer_close(peer, FUNC_TYPE_TELEMETRY);
-	      if (telemetry_is_zjson(decoder)) telemetry_peer_z_close(peer_z);
+	      peers_num--;
 	      recalc_fds = TRUE;
 	    }
 	  }
 	}
+
+	last_peers_timeout_check = t_data->now;
       }
     }
 
     if (reload_map_telemetry_thread) {
       if (config.telemetry_allow_file) load_allow_file(config.telemetry_allow_file, &allow);
+
+      if (config.telemetry_tag_map) {
+	load_pre_tag_map(ACCT_PMTELE, config.telemetry_tag_map, &telemetry_logdump_tag_table, &req,
+			 &telemetry_logdump_tag_map_allocated, config.maps_entries, config.maps_row_len);
+      }
 
       reload_map_telemetry_thread = FALSE;
     }
@@ -501,10 +720,21 @@ void telemetry_daemon(void *t_data_void)
       reload_log_telemetry_thread = FALSE;
     }
 
+    if (reload_log && !telemetry_misc_db->is_thread) {
+      reload_logs(PMTELEMETRYD_USAGE_HEADER);
+      reload_log = FALSE;
+    }
+
     if (telemetry_misc_db->msglog_backend_methods || telemetry_misc_db->dump_backend_methods) {
       gettimeofday(&telemetry_misc_db->log_tstamp, NULL);
       compose_timestamp(telemetry_misc_db->log_tstamp_str, SRVBUFLEN, &telemetry_misc_db->log_tstamp, TRUE,
 			config.timestamps_since_epoch, config.timestamps_rfc3339, config.timestamps_utc);
+
+      /* let's reset log sequence here as we do not sequence dump_init/dump_close events */
+      if (telemetry_log_seq_has_ro_bit(&telemetry_misc_db->log_seq))
+	telemetry_log_seq_init(&telemetry_misc_db->log_seq);
+
+      int refreshTimePerSlot = config.telemetry_dump_refresh_time / config.telemetry_dump_time_slots;
 
       if (telemetry_misc_db->dump_backend_methods) {
         while (telemetry_misc_db->log_tstamp.tv_sec > dump_refresh_deadline) {
@@ -512,9 +742,10 @@ void telemetry_daemon(void *t_data_void)
           telemetry_misc_db->dump.tstamp.tv_usec = 0;
           compose_timestamp(telemetry_misc_db->dump.tstamp_str, SRVBUFLEN, &telemetry_misc_db->dump.tstamp, FALSE,
 			    config.timestamps_since_epoch, config.timestamps_rfc3339, config.timestamps_utc);
-	  telemetry_misc_db->dump.period = config.telemetry_dump_refresh_time;
+	  telemetry_misc_db->dump.period = refreshTimePerSlot;
 
-          telemetry_handle_dump_event(t_data);
+          telemetry_handle_dump_event(t_data, max_peers_idx);
+
           dump_refresh_deadline += config.telemetry_dump_refresh_time;
         }
       }
@@ -540,35 +771,15 @@ void telemetry_daemon(void *t_data_void)
 #endif
     }
 
-    /* Logging stats */
-    if (!t_data->global_stats.last_check || ((t_data->global_stats.last_check + TELEMETRY_LOG_STATS_INTERVAL) <= t_data->now)) {
-      if (t_data->global_stats.last_check) {
-	telemetry_peer *stats_peer;
-	int peers_idx;
-
-	for (stats_peer = NULL, peers_idx = 0; peers_idx < config.telemetry_max_peers; peers_idx++) {
-	  if (telemetry_peers[peers_idx].fd) {
-	    stats_peer = &telemetry_peers[peers_idx];
-	    telemetry_log_peer_stats(stats_peer, t_data);
-	    stats_peer->stats.last_check = t_data->now;
-	  }
-	}
-
-	telemetry_log_global_stats(t_data);
-      }
-
-      t_data->global_stats.last_check = t_data->now;
-    }
-
     /*
-       If select_num == 0 then we got out of select() due to a timeout rather
-       than because we had a message from a peer to handle. By now we did all
-       routine checks and can happily return to select() again.
+       If select_num == 0 then we got out of polling due to a timeout
+       rather than because we had a message from a peer to handle. By
+       now we did all routine checks and can return to polling again.
     */
     if (!select_num) goto select_again;
 
     /* New connection is coming in */
-    if (FD_ISSET(config.telemetry_sock, &read_descs)) {
+    if (FD_ISSET(config.telemetry_sock, &read_descs) || kafka_input || unyte_udp_notif_input) {
       if (config.telemetry_port_tcp) {
         fd = accept(config.telemetry_sock, (struct sockaddr *) &client, &clen);
         if (fd == ERR) goto read_data;
@@ -580,10 +791,51 @@ void telemetry_daemon(void *t_data_void)
 	if (ret <= 0) goto select_again;
 	else fd = config.telemetry_sock;
       }
-
-#if defined ENABLE_IPV6
-      ipv4_mapped_to_ipv4(&client);
+#if defined WITH_ZMQ
+      else if (zmq_input) {
+	ret = telemetry_decode_producer_peer(t_data, &telemetry_zmq_host, consumer_buf, sizeof(consumer_buf), (struct sockaddr *) &client, &clen);
+	if (ret < 0) goto select_again; 
+	else fd = config.telemetry_sock;
+      }
 #endif
+#if defined WITH_KAFKA
+      else if (kafka_input) {
+	ret = telemetry_decode_producer_peer(t_data, &telemetry_kafka_host, consumer_buf, sizeof(consumer_buf), (struct sockaddr *) &client, &clen);
+	if (ret < 0) goto select_again;
+        else fd = TELEMETRY_KAFKA_FD;
+      }
+#endif
+#if defined WITH_UNYTE_UDP_NOTIF
+      else if (unyte_udp_notif_input) {
+	if (seg_ptr) {
+	  unyte_seg_met_t *seg = NULL;
+          int payload_len = 0;
+
+	  seg = (unyte_seg_met_t *)seg_ptr;
+
+	  if (unyte_udp_get_media_type(seg) == UNYTE_MEDIATYPE_YANG_JSON && config.telemetry_decoder_id == TELEMETRY_DECODER_JSON) {
+	    struct sockaddr_storage *unsa = NULL;
+
+	    unsa = unyte_udp_get_src(seg);
+	    memcpy(&client, unsa, sizeof(struct sockaddr_storage));
+
+	    payload_len = strlen(seg->payload);
+	    if (payload_len < sizeof(consumer_buf)) {
+	      strlcpy((char *)consumer_buf, seg->payload, sizeof(consumer_buf));
+	      fd = TELEMETRY_UDP_NOTIF_FD;
+	    }
+	    else {
+	      goto select_again;
+	    }
+	  }
+	  else {
+	    goto select_again;
+	  }
+	}
+      }
+#endif
+
+      ipv4_mapped_to_ipv4(&client);
 
       /* If an ACL is defined, here we check against and enforce it */
       if (allow.num) allowed = check_allow(&allow, (struct sockaddr *)&client);
@@ -594,17 +846,19 @@ void telemetry_daemon(void *t_data_void)
         goto read_data;
       }
 
-      /* XXX: UDP case may be optimized further */
-      if (config.telemetry_port_udp) {
-	telemetry_peer_udp_cache *tpuc_ret;
+      /* XXX: UDP, ZeroMQ and Kafka cases may be optimized further */
+      if (config.telemetry_port_udp || zmq_input || kafka_input || unyte_udp_notif_input) {
+	telemetry_peer_cache *tpc_ret;
 	u_int16_t client_port;
 
-        sa_to_addr((struct sockaddr *)&client, &tpuc.addr, &client_port);
-	tpuc_ret = pm_tfind(&tpuc, &telemetry_peers_udp_cache, telemetry_tpuc_addr_cmp);
+        sa_to_addr((struct sockaddr *)&client, &tpc.addr, &client_port);
+	tpc_ret = pm_tfind(&tpc, &telemetry_peers_cache, telemetry_tpc_addr_cmp);
 
-	if (tpuc_ret) {
-	  peer = &telemetry_peers[tpuc_ret->index];
-	  telemetry_peers_udp_timeout[tpuc_ret->index].last_msg = t_data->now;
+	if (tpc_ret) {
+	  telemetry_peer_cache *tpc_peer = (*(telemetry_peer_cache **) tpc_ret);
+
+	  peer = &telemetry_peers[tpc_peer->index];
+	  telemetry_peers_timeout[tpc_peer->index].last_msg = t_data->now;
 
 	  goto read_data;
 	}
@@ -616,23 +870,15 @@ void telemetry_daemon(void *t_data_void)
 
 	  if (telemetry_peer_init(peer, FUNC_TYPE_TELEMETRY)) peer = NULL;
 
-	  if (telemetry_is_zjson(decoder)) {
-	    peer_z = &telemetry_peers_z[peers_idx];
-	    if (telemetry_peer_z_init(peer_z)) {
-	      peer = NULL;
-	      peer_z = NULL;
-	    }
-	  }
-
 	  if (peer) {
-	    recalc_fds = TRUE;
+	    recalc_fds = TRUE; // XXX: do we need this for ZeroMQ / Kafka cases?
 
-	    if (config.telemetry_port_udp) {
-	      tpuc.index = peers_idx;
-	      telemetry_peers_udp_timeout[peers_idx].last_msg = t_data->now;
+	    if (config.telemetry_port_udp || zmq_input || kafka_input || unyte_udp_notif_input) {
+	      tpc.index = peers_idx;
+	      telemetry_peers_timeout[peers_idx].last_msg = t_data->now;
 
-	      if (!pm_tsearch(&tpuc, &telemetry_peers_udp_cache, telemetry_tpuc_addr_cmp, sizeof(telemetry_peer_udp_cache)))
-		Log(LOG_WARNING, "WARN ( %s/%s ): tsearch() unable to insert in UDP peers cache.\n", config.name, t_data->log_str);
+	      if (!pm_tsearch(&tpc, &telemetry_peers_cache, telemetry_tpc_addr_cmp, sizeof(telemetry_peer_cache)))
+		Log(LOG_WARNING, "WARN ( %s/%s ): tsearch() unable to insert in peers cache.\n", config.name, t_data->log_str);
 	    }
 	  }
 
@@ -642,11 +888,18 @@ void telemetry_daemon(void *t_data_void)
 
       if (!peer) {
         /* We briefly accept the new connection to be able to drop it */
-        Log(LOG_ERR, "ERROR ( %s/%s ): Insufficient number of telemetry peers has been configured by telemetry_max_peers (%d).\n",
+        Log(LOG_WARNING, "WARN ( %s/%s ): Insufficient number of telemetry peers has been configured by telemetry_max_peers (%d).\n",
                         config.name, t_data->log_str, config.telemetry_max_peers);
         if (config.telemetry_port_tcp) close(fd);
         goto read_data;
       }
+
+#if defined WITH_KAFKA
+      if (kafka_input) {
+	peer->buf.kafka_msg = t_data->kafka_msg;
+        t_data->kafka_msg = NULL;
+      }
+#endif
 
       peer->fd = fd;
       if (config.telemetry_port_tcp) FD_SET(peer->fd, &bkp_read_descs);
@@ -655,16 +908,19 @@ void telemetry_daemon(void *t_data_void)
         peer->addr.address.ipv4.s_addr = ((struct sockaddr_in *)&client)->sin_addr.s_addr;
         peer->tcp_port = ntohs(((struct sockaddr_in *)&client)->sin_port);
       }
-#if defined ENABLE_IPV6
       else if (peer->addr.family == AF_INET6) {
         memcpy(&peer->addr.address.ipv6, &((struct sockaddr_in6 *)&client)->sin6_addr, 16);
         peer->tcp_port = ntohs(((struct sockaddr_in6 *)&client)->sin6_port);
       }
-#endif
       addr_to_str(peer->addr_str, &peer->addr);
 
+      if (config.telemetry_tag_map) {
+	telemetry_tag_init_find(peer, (struct sockaddr *) &telemetry_logdump_tag_peer, &telemetry_logdump_tag);
+	telemetry_tag_find((struct id_table *)telemetry_logdump_tag.tag_table, &telemetry_logdump_tag, &telemetry_logdump_tag.tag, NULL);
+      }
+
       if (telemetry_misc_db->msglog_backend_methods)
-        telemetry_peer_log_init(peer, config.telemetry_msglog_output, FUNC_TYPE_TELEMETRY);
+        telemetry_peer_log_init(peer, &telemetry_logdump_tag, config.telemetry_msglog_output, FUNC_TYPE_TELEMETRY);
 
       if (telemetry_misc_db->dump_backend_methods)
         telemetry_dump_init_peer(peer);
@@ -687,9 +943,6 @@ void telemetry_daemon(void *t_data_void)
 
         if (telemetry_peers[loc_idx].fd && FD_ISSET(telemetry_peers[loc_idx].fd, &read_descs)) {
           peer = &telemetry_peers[loc_idx];
-
-	  if (telemetry_is_zjson(decoder)) peer_z = &telemetry_peers_z[loc_idx];
-
           peers_idx_rr = (peers_idx_rr + 1) % max_peers_idx;
           break;
         }
@@ -700,33 +953,35 @@ void telemetry_daemon(void *t_data_void)
 
     recv_flags = 0;
 
-    switch (decoder) {
+    switch (config.telemetry_decoder_id) {
     case TELEMETRY_DECODER_JSON:
-      ret = telemetry_recv_json(peer, 0, &recv_flags);
+      if (!zmq_input && !kafka_input && !unyte_udp_notif_input) {
+	ret = telemetry_recv_json(peer, 0, &recv_flags);
+      }
+      else {
+	ret = (strlen((char *) consumer_buf) + 1);
+
+	if (ret > 0) {
+	  saved_peer_buf = peer->buf.base;
+	  peer->buf.base = (char *) consumer_buf;
+	  peer->msglen = peer->buf.tot_len = ret;
+
+	  if (unyte_udp_notif_input) {
+	    peer->stats.packet_bytes += ret;
+	  }
+	}
+      }
       data_decoder = TELEMETRY_DATA_DECODER_JSON;
       break;
-    case TELEMETRY_DECODER_ZJSON:
-      ret = telemetry_recv_zjson(peer, peer_z, 0, &recv_flags);
-      data_decoder = TELEMETRY_DATA_DECODER_JSON;
-      break;
-    case TELEMETRY_DECODER_CISCO:
-      ret = telemetry_recv_cisco(peer, &recv_flags, &data_decoder);
-      break;
-    case TELEMETRY_DECODER_CISCO_JSON:
-      ret = telemetry_recv_cisco_json(peer, &recv_flags);
-      data_decoder = TELEMETRY_DATA_DECODER_JSON;
-      break;
-    case TELEMETRY_DECODER_CISCO_ZJSON:
-      ret = telemetry_recv_cisco_zjson(peer, peer_z, &recv_flags);
-      data_decoder = TELEMETRY_DATA_DECODER_JSON;
-      break;
-    case TELEMETRY_DECODER_CISCO_GPB:
-      ret = telemetry_recv_cisco_gpb(peer);
+    case TELEMETRY_DECODER_GPB:
+      ret = telemetry_recv_gpb(peer, 0);
       data_decoder = TELEMETRY_DATA_DECODER_GPB;
       break;
-    case TELEMETRY_DECODER_CISCO_GPB_KV:
-      ret = telemetry_recv_cisco_gpb_kv(peer, &recv_flags);
-      data_decoder = TELEMETRY_DATA_DECODER_GPB;
+    case TELEMETRY_DECODER_CISCO_V0:
+      ret = telemetry_recv_cisco_v0(peer, &recv_flags, &data_decoder);
+      break;
+    case TELEMETRY_DECODER_CISCO_V1:
+      ret = telemetry_recv_cisco_v1(peer, &recv_flags, &data_decoder);
       break;
     default:
       ret = TRUE; recv_flags = ERR;
@@ -738,17 +993,28 @@ void telemetry_daemon(void *t_data_void)
       Log(LOG_INFO, "INFO ( %s/%s ): [%s] connection reset by peer (%d).\n", config.name, t_data->log_str, peer->addr_str, errno);
       FD_CLR(peer->fd, &bkp_read_descs);
       telemetry_peer_close(peer, FUNC_TYPE_TELEMETRY);
-      if (telemetry_is_zjson(decoder)) telemetry_peer_z_close(peer_z);
+      peers_num--;
       recalc_fds = TRUE;
     }
     else {
       peer->stats.packets++;
       if (recv_flags != ERR) {
+	if (config.telemetry_tag_map) {
+	  telemetry_tag_init_find(peer, (struct sockaddr *) &telemetry_logdump_tag_peer, &telemetry_logdump_tag);
+	  telemetry_tag_find((struct id_table *)telemetry_logdump_tag.tag_table, &telemetry_logdump_tag, &telemetry_logdump_tag.tag, NULL);
+	}
+
         peer->stats.msg_bytes += ret;
         telemetry_process_data(peer, t_data, data_decoder);
       }
+
+      if (zmq_input || kafka_input || unyte_udp_notif_input) {
+	peer->buf.base = saved_peer_buf;
+      }
     }
   }
+
+  return SUCCESS;
 }
 
 void telemetry_prepare_thread(struct telemetry_data *t_data)
@@ -769,4 +1035,14 @@ void telemetry_prepare_daemon(struct telemetry_data *t_data)
   t_data->is_thread = FALSE;
   t_data->log_str = malloc(strlen("core") + 1);
   strcpy(t_data->log_str, "core");
+}
+
+void telemetry_tag_init_find(telemetry_peer *peer, struct sockaddr *sa, telemetry_tag_t *pptrs)
+{
+  bgp_tag_init_find(peer, sa, pptrs);
+}
+
+int telemetry_tag_find(struct id_table *t, telemetry_tag_t *pptrs, pm_id_t *tag, pm_id_t *tag2)
+{
+  return bgp_tag_find(t, pptrs, tag, tag2);
 }

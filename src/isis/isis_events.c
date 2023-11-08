@@ -20,10 +20,7 @@
  * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 
-#define __ISIS_EVENTS_C
-
 #include "pmacct.h"
-#include "linklist.h"
 #include "dict.h"
 #include "thread.h"
 #include "prefix.h"
@@ -76,7 +73,7 @@ isis_event_circuit_state_change (struct isis_circuit *circuit, int up)
 void
 isis_event_system_type_change (struct isis_area *area, int newtype)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_circuit *circuit;
 
   Log(LOG_DEBUG, "DEBUG ( %s/core/ISIS ): ISIS-Evt (%s) system type change %s -> %s\n", config.name, area->area_tag,
@@ -112,7 +109,7 @@ isis_event_system_type_change (struct isis_area *area, int newtype)
     }
 
   area->is_type = newtype;
-  for (ALL_LIST_ELEMENTS_RO (area->circuit_list, node, circuit))
+  for (PM_ALL_LIST_ELEMENTS_RO (area->circuit_list, node, circuit))
     isis_event_circuit_type_change (circuit, newtype);
 
   spftree_area_init (area);
@@ -146,8 +143,6 @@ circuit_commence_level (struct isis_circuit *circuit, int level)
 static void
 circuit_resign_level (struct isis_circuit *circuit, int level)
 {
-  int idx = level - 1;
-
 //  THREAD_TIMER_OFF (circuit->t_send_csnp[idx]);
 //  THREAD_TIMER_OFF (circuit->t_send_psnp[idx]);
 

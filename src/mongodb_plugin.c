@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,8 +19,6 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __MONGODB_PLUGIN_C
-
 /* includes */
 #include "pmacct.h"
 #include "pmacct-data.h"
@@ -30,9 +28,14 @@
 #include "ip_flow.h"
 #include "classifier.h"
 #include "crc32.h"
+#include "bgp/bgp.h"
+#include "rpki/rpki.h"
 #if defined (WITH_NDPI)
 #include "ndpi/ndpi.h"
 #endif
+
+/* Global variables */
+mongo db_conn;
 
 /* Functions */
 void mongodb_legacy_warning(int pipe_fd, struct configuration *cfgptr, void *ptr) 
@@ -46,21 +49,20 @@ void mongodb_legacy_warning(int pipe_fd, struct configuration *cfgptr, void *ptr
   Log(LOG_WARNING, "WARN ( %s/%s ): %s: %s\n", config.name, config.type, GET_IN_TOUCH_MSG, MANTAINER);
   Log(LOG_WARNING, "WARN ( %s/%s ): =======\n", config.name, config.type);
 
-  exit(0);
+  exit_gracefully(0);
 }
 
 void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr) 
 {
   struct pkt_data *data;
   struct ports_table pt;
+  struct protos_table prt, tost;
   unsigned char *pipebuf;
   struct pollfd pfd;
   struct insert_data idata;
-  time_t t;
-  int timeout, refresh_timeout, ret, num, recv_budget, poll_bypass;
+  int refresh_timeout, ret, num, recv_budget, poll_bypass;
   struct ring *rg = &((struct channels_list_entry *)ptr)->rg;
   struct ch_status *status = ((struct channels_list_entry *)ptr)->status;
-  struct plugins_list_entry *plugin_data = ((struct channels_list_entry *)ptr)->plugin;
   int datasize = ((struct channels_list_entry *)ptr)->datasize;
   u_int32_t bufsz = ((struct channels_list_entry *)ptr)->bufsize;
   pid_t core_pid = ((struct channels_list_entry *)ptr)->core_pid;
@@ -72,12 +74,16 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 
   struct extra_primitives extras;
   struct primitives_ptrs prim_ptrs;
-  char *dataptr;
+  unsigned char *dataptr;
 
 #ifdef WITH_ZMQ
   struct p_zmq_host *zmq_host = &((struct channels_list_entry *)ptr)->zmq_host;
 #else
   void *zmq_host = NULL;
+#endif
+
+#ifdef WITH_REDIS
+  struct p_redis_host redis_host;
 #endif
 
   memcpy(&config, cfgptr, sizeof(struct configuration));
@@ -94,8 +100,6 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   if (!config.mongo_insert_batch)
     config.mongo_insert_batch = DEFAULT_MONGO_INSERT_BATCH;
 
-  timeout = config.sql_refresh_time*1000;
-
   /* setting function pointers */
   if (config.what_to_count & (COUNT_SUM_HOST|COUNT_SUM_NET))
     insert_func = P_sum_host_insert;
@@ -110,11 +114,15 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   memset(&nt, 0, sizeof(nt));
   memset(&nc, 0, sizeof(nc));
   memset(&pt, 0, sizeof(pt));
+  memset(&prt, 0, sizeof(prt));
+  memset(&tost, 0, sizeof(tost));
 
   load_networks(config.networks_file, &nt, &nc);
   set_net_funcs(&nt);
 
   if (config.ports_file) load_ports(config.ports_file, &pt);
+  if (config.protos_file) load_protos(config.protos_file, &prt);
+  if (config.tos_file) load_tos(config.tos_file, &tost);
   
   memset(&idata, 0, sizeof(idata));
   memset(&prim_ptrs, 0, sizeof(prim_ptrs));
@@ -144,6 +152,15 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   mongo_set_op_timeout(&db_conn, 1000);
   bson_set_oid_fuzz(&MongoDB_oid_fuzz);
 
+#ifdef WITH_REDIS
+  if (config.redis_host) {
+    char log_id[SHORTBUFLEN];
+
+    snprintf(log_id, sizeof(log_id), "%s/%s", config.name, config.type);
+    p_redis_init(&redis_host, log_id, p_redis_thread_produce_common_plugin_handler);
+  }
+#endif
+
   /* plugin main loop */
   for(;;) {
     poll_again:
@@ -158,7 +175,7 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
     if (ret <= 0) {
       if (getppid() != core_pid) {
         Log(LOG_ERR, "ERROR ( %s/%s ): Core process *seems* gone. Exiting.\n", config.name, config.type);
-        exit_plugin(1);
+        exit_gracefully(1);
       }
 
       if (ret < 0) goto poll_again;
@@ -166,7 +183,7 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 
     poll_ops:
     P_update_time_reference(&idata);
-    if (idata.now > refresh_deadline) P_cache_handle_flush_event(&pt);
+    if (idata.now > refresh_deadline) P_cache_handle_flush_event(&pt, &prt, &tost);
 
     recv_budget = 0;
     if (poll_bypass) {
@@ -192,7 +209,7 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
         }
         else {
           if ((ret = read(pipe_fd, &rgptr, sizeof(rgptr))) == 0) 
-	    exit_plugin(1); /* we exit silently; something happened at the write end */
+	    exit_gracefully(1); /* we exit silently; something happened at the write end */
         }
 
         if ((rg->ptr + bufsz) > rg->end) rg->ptr = rg->base;
@@ -205,7 +222,7 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
           else {
             rg_err_count++;
             if (config.debug || (rg_err_count > MAX_RG_COUNT_ERR)) {
-              Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected (plugin_buffer_size=%llu plugin_pipe_size=%llu).\n",
+              Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected (plugin_buffer_size=%" PRIu64 "plugin_pipe_size=%" PRIu64 ").\n",
                         config.name, config.type, config.buffer_size, config.pipe_size);
               Log(LOG_WARNING, "WARN ( %s/%s ): Increase values or look for plugin_buffer_size, plugin_pipe_size in CONFIG-KEYS document.\n\n",
                         config.name, config.type);
@@ -222,7 +239,7 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
       }
 #ifdef WITH_ZMQ
       else if (config.pipe_zmq) {
-	ret = p_zmq_plugin_pipe_recv(zmq_host, pipebuf, config.buffer_size);
+	ret = p_zmq_topic_recv(zmq_host, pipebuf, config.buffer_size);
 	if (ret > 0) {
 	  if (seq && (((struct ch_buf_hdr *)pipebuf)->seq != ((seq + 1) % MAX_SEQNUM))) {
 	    Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected. Sequence received=%u expected=%u\n",
@@ -238,11 +255,10 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
       data = (struct pkt_data *) (pipebuf+sizeof(struct ch_buf_hdr));
 
       if (config.debug_internal_msg) 
-        Log(LOG_DEBUG, "DEBUG ( %s/%s ): buffer received cpid=%u len=%llu seq=%u num_entries=%u\n",
-                config.name, config.type, core_pid, ((struct ch_buf_hdr *)pipebuf)->len,
-                seq, ((struct ch_buf_hdr *)pipebuf)->num);
+        Log(LOG_DEBUG, "DEBUG ( %s/%s ): buffer received len=%" PRIu64 "seq=%u num_entries=%u\n",
+                config.name, config.type, ((struct ch_buf_hdr *)pipebuf)->len, seq,
+                ((struct ch_buf_hdr *)pipebuf)->num);
 
-      if (!config.pipe_check_core_pid || ((struct ch_buf_hdr *)pipebuf)->core_pid == core_pid) {
       while (((struct ch_buf_hdr *)pipebuf)->num > 0) {
         for (num = 0; primptrs_funcs[num]; num++)
           (*primptrs_funcs[num])((u_char *)data, &extras, &prim_ptrs);
@@ -251,9 +267,17 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 	  (*net_funcs[num])(&nt, &nc, &data->primitives, prim_ptrs.pbgp, &nfd);
 
 	if (config.ports_file) {
-          if (!pt.table[data->primitives.src_port]) data->primitives.src_port = 0;
-          if (!pt.table[data->primitives.dst_port]) data->primitives.dst_port = 0;
+          if (!pt.table[data->primitives.src_port]) data->primitives.src_port = PM_L4_PORT_OTHERS;
+          if (!pt.table[data->primitives.dst_port]) data->primitives.dst_port = PM_L4_PORT_OTHERS;
         }
+
+	if (config.protos_file) {
+	  if (!prt.table[data->primitives.proto]) data->primitives.proto = PM_IP_PROTO_OTHERS;
+	}
+
+	if (config.tos_file) {
+	  if (!tost.table[data->primitives.tos]) data->primitives.tos = PM_IP_TOS_OTHERS;
+	}
 
         prim_ptrs.data = data;
         (*insert_func)(&prim_ptrs, &idata);
@@ -265,7 +289,6 @@ void mongodb_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
           else dataptr += prim_ptrs.vlen_next_off;
           data = (struct pkt_data *) dataptr;
 	}
-      }
       }
 
       recv_budget++;
@@ -281,16 +304,16 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
   struct pkt_nat_primitives *pnat = NULL;
   struct pkt_mpls_primitives *pmpls = NULL;
   struct pkt_tunnel_primitives *ptun = NULL;
-  char *pcust = NULL;
+  u_char *pcust = NULL;
   struct pkt_vlen_hdr_primitives *pvlen = NULL;
   struct pkt_bgp_primitives empty_pbgp;
   struct pkt_nat_primitives empty_pnat;
   struct pkt_mpls_primitives empty_pmpls;
   struct pkt_tunnel_primitives empty_ptun;
-  char *empty_pcust = NULL;
+  u_char *empty_pcust = NULL;
   char src_mac[18], dst_mac[18], src_host[INET6_ADDRSTRLEN], dst_host[INET6_ADDRSTRLEN], ip_address[INET6_ADDRSTRLEN];
   char rd_str[SRVBUFLEN], misc_str[SRVBUFLEN], tmpbuf[SRVBUFLEN], mongo_database[SRVBUFLEN];
-  char *str_ptr, *as_path, *bgp_comm, default_table[] = "test.acct", ndpi_class[SUPERSHORTBUFLEN];
+  char *str_ptr, *as_path, *bgp_comm, default_table[] = "test.acct";
   char default_user[] = "pmacct", default_passwd[] = "arealsmartpwd";
   int qn = 0, i, j, stop, db_status, batch_idx, go_to_pending, saved_index = index;
   time_t stamp, start, duration;
@@ -299,12 +322,16 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
   struct pkt_data dummy_data;
   pid_t writer_pid = getpid();
 
+#if defined (WITH_NDPI)
+  char ndpi_class[SUPERSHORTBUFLEN];
+#endif
+
   const bson **bson_batch;
   bson *bson_elem;
 
   if (!index) {
     Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - START (PID: %u) ***\n", config.name, config.type, writer_pid);
-    Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: 0/0, ET: 0) ***\n", config.name, config.type, writer_pid);
+    Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: 0/0, ET: X) ***\n", config.name, config.type, writer_pid);
     return;
   }
 
@@ -335,7 +362,7 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
   empty_pcust = malloc(config.cpptrs.len);
   if (!empty_pcust) {
     Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() empty_pcust. Exiting.\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   memset(&empty_pbgp, 0, sizeof(struct pkt_bgp_primitives));
@@ -364,7 +391,7 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
     dyn_table_time_only = FALSE;
   }
 
-  bson_batch = (bson **) malloc(sizeof(bson *) * index);
+  bson_batch = malloc(sizeof(bson *) * index);
   if (!bson_batch) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed: bson_batch\n", config.name, config.type);
     return;
@@ -411,7 +438,7 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
 
     if (queue[j]->valid != PRINT_CACHE_COMMITTED) continue;
 
-    if (dyn_table && (!dyn_table_time_only || !config.nfacctd_time_new)) {
+    if (dyn_table && (!dyn_table_time_only || !config.nfacctd_time_new || (config.sql_refresh_time != timeslot))) {
       time_t stamp = 0;
 
       stamp = queue[j]->basetime.tv_sec;
@@ -486,7 +513,19 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         bson_append_string(bson_elem, "mac_dst", dst_mac);
       }
   
-      if (config.what_to_count & COUNT_VLAN) bson_append_int(bson_elem, "vlan_id", data->vlan_id);
+      if (config.what_to_count & COUNT_VLAN) {
+	if (config.tmp_vlan_legacy) {
+	  bson_append_int(bson_elem, "vlan", data->vlan_id);
+	}
+	else {
+	  bson_append_int(bson_elem, "vlan_in", data->vlan_id);
+	}
+      }
+
+      if (config.what_to_count_2 & COUNT_OUT_VLAN) {
+	  bson_append_int(bson_elem, "vlan_out", data->out_vlan_id);
+      }
+
       if (config.what_to_count & COUNT_COS) bson_append_int(bson_elem, "cos", data->cos);
       if (config.what_to_count & COUNT_ETHERTYPE) {
         sprintf(misc_str, "%x", data->etype); 
@@ -550,6 +589,8 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
   
       if (config.what_to_count & COUNT_LOCAL_PREF) bson_append_int(bson_elem, "local_pref", pbgp->local_pref);
       if (config.what_to_count & COUNT_MED) bson_append_int(bson_elem, "med", pbgp->med);
+      if (config.what_to_count_2 & COUNT_DST_ROA) bson_append_string(bson_elem, "roa_dst", rpki_roa_print(pbgp->dst_roa));
+
       if (config.what_to_count & COUNT_PEER_SRC_AS) bson_append_int(bson_elem, "peer_as_src", pbgp->peer_src_as);
       if (config.what_to_count & COUNT_PEER_DST_AS) bson_append_int(bson_elem, "peer_as_dst", pbgp->peer_dst_as);
   
@@ -558,7 +599,7 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         bson_append_string(bson_elem, "peer_ip_src", ip_address);
       }
       if (config.what_to_count & COUNT_PEER_DST_IP) {
-        addr_to_str(ip_address, &pbgp->peer_dst_ip);
+        addr_to_str2(ip_address, &pbgp->peer_dst_ip, ft2af(queue[j]->flow_type));
         bson_append_string(bson_elem, "peer_ip_dst", ip_address);
       }
 
@@ -614,8 +655,9 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         MongoDB_append_string(bson_elem, "src_as_path", pvlen, COUNT_INT_SRC_AS_PATH);
       }
 
-      if (config.what_to_count & COUNT_LOCAL_PREF) bson_append_int(bson_elem, "src_local_pref", pbgp->src_local_pref);
-      if (config.what_to_count & COUNT_MED) bson_append_int(bson_elem, "src_med", pbgp->src_med);
+      if (config.what_to_count & COUNT_SRC_LOCAL_PREF) bson_append_int(bson_elem, "src_local_pref", pbgp->src_local_pref);
+      if (config.what_to_count & COUNT_SRC_MED) bson_append_int(bson_elem, "src_med", pbgp->src_med);
+      if (config.what_to_count_2 & COUNT_SRC_ROA) bson_append_string(bson_elem, "roa_src", rpki_roa_print(pbgp->src_roa));
   
       if (config.what_to_count & COUNT_IN_IFACE) bson_append_int(bson_elem, "iface_in", data->ifindex_in);
       if (config.what_to_count & COUNT_OUT_IFACE) bson_append_int(bson_elem, "iface_out", data->ifindex_out);
@@ -624,7 +666,9 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         bgp_rd2str(rd_str, &pbgp->mpls_vpn_rd);
         bson_append_string(bson_elem, "mpls_vpn_rd", rd_str);
       }
-  
+
+      if (config.what_to_count_2 & COUNT_MPLS_PW_ID) bson_append_int(bson_elem, "mpls_pw_id", pbgp->mpls_pw_id);
+
       if (config.what_to_count & (COUNT_SRC_HOST|COUNT_SUM_HOST)) {
         addr_to_str(src_host, &data->src_ip);
         bson_append_string(bson_elem, "ip_src", src_host);
@@ -690,6 +734,15 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         else
           bson_append_null(bson_elem, "pocode_ip_dst");
       }
+
+      if (config.what_to_count_2 & COUNT_SRC_HOST_COORDS) {
+        bson_append_double(bson_elem, "lat_ip_src", data->src_ip_lat);
+        bson_append_double(bson_elem, "lon_ip_src", data->src_ip_lon);
+      }
+      if (config.what_to_count_2 & COUNT_DST_HOST_COORDS) {
+        bson_append_double(bson_elem, "lat_ip_dst", data->dst_ip_lat);
+        bson_append_double(bson_elem, "lon_ip_dst", data->dst_ip_lon);
+      }
   #endif
 
       if (config.what_to_count & COUNT_TCPFLAGS) {
@@ -698,16 +751,15 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
       }
   
       if (config.what_to_count & COUNT_IP_PROTO) {
-        if (!config.num_protos && (data->proto < protocols_number))
-	  bson_append_string(bson_elem, "ip_proto", _protocols[data->proto].name);
-        else {
-          sprintf(misc_str, "%u", data->proto);
-          bson_append_string(bson_elem, "ip_proto", misc_str);
-        }
+	char proto[PROTO_NUM_STRLEN];
+
+	bson_append_string(bson_elem, "ip_proto", ip_proto_print(data->proto, proto, PROTO_NUM_STRLEN));
       }
   
       if (config.what_to_count & COUNT_IP_TOS) bson_append_int(bson_elem, "tos", data->tos);
       if (config.what_to_count_2 & COUNT_SAMPLING_RATE) bson_append_int(bson_elem, "sampling_rate", data->sampling_rate);
+      if (config.what_to_count_2 & COUNT_SAMPLING_DIRECTION) bson_append_string(bson_elem, "sampling_direction",
+										sampling_direction_print(data->sampling_direction));
   
       if (config.what_to_count_2 & COUNT_POST_NAT_SRC_HOST) {
         addr_to_str(src_host, &pnat->post_nat_src_ip);
@@ -720,10 +772,34 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
       if (config.what_to_count_2 & COUNT_POST_NAT_SRC_PORT) bson_append_int(bson_elem, "post_nat_port_src", pnat->post_nat_src_port);
       if (config.what_to_count_2 & COUNT_POST_NAT_DST_PORT) bson_append_int(bson_elem, "post_nat_port_dst", pnat->post_nat_dst_port);
       if (config.what_to_count_2 & COUNT_NAT_EVENT) bson_append_int(bson_elem, "nat_event", pnat->nat_event);
+      if (config.what_to_count_2 & COUNT_FW_EVENT) bson_append_int(bson_elem, "fw_event", pnat->fw_event);
+      if (config.what_to_count_2 & COUNT_FWD_STATUS) bson_append_int(bson_elem, "fwd_status", pnat->fwd_status);
+
       if (config.what_to_count_2 & COUNT_MPLS_LABEL_TOP) bson_append_int(bson_elem, "mpls_label_top", pmpls->mpls_label_top);
       if (config.what_to_count_2 & COUNT_MPLS_LABEL_BOTTOM) bson_append_int(bson_elem, "mpls_label_bottom", pmpls->mpls_label_bottom);
-      if (config.what_to_count_2 & COUNT_MPLS_STACK_DEPTH) bson_append_int(bson_elem, "mpls_stack_depth", pmpls->mpls_stack_depth);
+      if (config.what_to_count_2 & COUNT_MPLS_LABEL_STACK) {
+	char label_stack[MAX_MPLS_LABEL_STACK];
+	char *label_stack_ptr = NULL;
+	int label_stack_len = 0;
 
+	memset(label_stack, 0, MAX_MPLS_LABEL_STACK);
+
+	label_stack_len = vlen_prims_get(pvlen, COUNT_INT_MPLS_LABEL_STACK, &label_stack_ptr);
+	if (label_stack_ptr) {
+	  mpls_label_stack_to_str(label_stack, sizeof(label_stack), (u_int32_t *)label_stack_ptr, label_stack_len);
+	}
+
+	bson_append_int(bson_elem, "mpls_label_stack", label_stack);
+      }
+
+      if (config.what_to_count_2 & COUNT_TUNNEL_SRC_MAC) {
+        etheraddr_string(ptun->tunnel_eth_shost, src_mac);
+        bson_append_string(bson_elem, "tunnel_mac_src", src_mac);
+      }
+      if (config.what_to_count_2 & COUNT_TUNNEL_DST_MAC) {
+        etheraddr_string(ptun->tunnel_eth_dhost, dst_mac);
+        bson_append_string(bson_elem, "tunnel_mac_dst", dst_mac);
+      }
       if (config.what_to_count_2 & COUNT_TUNNEL_SRC_HOST) {
         addr_to_str(src_host, &ptun->tunnel_src_ip);
         bson_append_string(bson_elem, "tunnel_ip_src", src_host);
@@ -733,14 +809,16 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         bson_append_string(bson_elem, "tunnel_ip_dst", dst_host);
       }
       if (config.what_to_count_2 & COUNT_TUNNEL_IP_PROTO) {
-        if (!config.num_protos && (ptun->tunnel_proto < protocols_number))
-	  bson_append_string(bson_elem, "tunnel_ip_proto", _protocols[ptun->tunnel_proto].name);
-        else {
-          sprintf(misc_str, "%u", ptun->tunnel_proto);
-          bson_append_string(bson_elem, "tunnel_ip_proto", misc_str);
-        }
+	char proto[PROTO_NUM_STRLEN];
+
+	bson_append_string(bson_elem, "tunnel_ip_proto", ip_proto_print(ptun->tunnel_proto, proto, PROTO_NUM_STRLEN));
       }
+
       if (config.what_to_count_2 & COUNT_TUNNEL_IP_TOS) bson_append_int(bson_elem, "tunnel_tos", ptun->tunnel_tos);
+      if (config.what_to_count_2 & COUNT_TUNNEL_SRC_PORT) bson_append_int(bson_elem, "tunnel_port_src", ptun->tunnel_src_port);
+      if (config.what_to_count_2 & COUNT_TUNNEL_DST_PORT) bson_append_int(bson_elem, "tunnel_port_dst", ptun->tunnel_dst_port);
+      if (config.what_to_count_2 & COUNT_TUNNEL_TCPFLAGS) bson_append_int(bson_elem, "tunnel_tcp_flags", data->tunnel_tcp_flags);
+      if (config.what_to_count_2 & COUNT_VXLAN) bson_append_int(bson_elem, "vxlan", ptun->tunnel_id);
   
       if (config.what_to_count_2 & COUNT_TIMESTAMP_START) {
 	if (config.timestamps_since_epoch) {
@@ -797,6 +875,25 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
         }
       }
 
+      if (config.what_to_count_2 & COUNT_EXPORT_PROTO_TIME) {
+        if (config.timestamps_since_epoch) {
+          char tstamp_str[SRVBUFLEN];
+
+          compose_timestamp(tstamp_str, SRVBUFLEN, &pnat->timestamp_export, TRUE,
+			    config.timestamps_since_epoch, config.timestamps_rfc3339,
+			    config.timestamps_utc);
+          bson_append_string(bson_elem, "timestamp_export", tstamp_str);
+        }
+        else {
+          bson_date_t bdate;
+
+          bdate = 1000*pnat->timestamp_export.tv_sec;
+          if (pnat->timestamp_export.tv_usec) bdate += (pnat->timestamp_export.tv_usec/1000);
+
+          bson_append_date(bson_elem, "timestamp_export", bdate);
+        }
+      }
+
       if (config.nfacctd_stitching && queue[j]->stitch) {
         if (config.timestamps_since_epoch) {
           char tstamp_str[SRVBUFLEN];
@@ -826,6 +923,7 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
 
       if (config.what_to_count_2 & COUNT_EXPORT_PROTO_SEQNO) bson_append_int(bson_elem, "export_proto_seqno", data->export_proto_seqno);
       if (config.what_to_count_2 & COUNT_EXPORT_PROTO_VERSION) bson_append_int(bson_elem, "export_proto_version", data->export_proto_version);
+      if (config.what_to_count_2 & COUNT_EXPORT_PROTO_SYSID) bson_append_int(bson_elem, "export_proto_sysid", data->export_proto_sysid);
   
       /* all custom primitives printed here */
       {
@@ -854,15 +952,9 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
       }
   
       if (queue[j]->flow_type != NF9_FTYPE_EVENT && queue[j]->flow_type != NF9_FTYPE_OPTION) {
-  #if defined HAVE_64BIT_COUNTERS
         bson_append_long(bson_elem, "packets", queue[j]->packet_counter);
         if (config.what_to_count & COUNT_FLOWS) bson_append_long(bson_elem, "flows", queue[j]->flow_counter);
         bson_append_long(bson_elem, "bytes", queue[j]->bytes_counter);
-  #else
-        bson_append_int(bson_elem, "packets", queue[j]->packet_counter);
-        if (config.what_to_count & COUNT_FLOWS) bson_append_int(bson_elem, "flows", queue[j]->flow_counter);
-        bson_append_int(bson_elem, "bytes", queue[j]->bytes_counter);
-  #endif
       }
   
       bson_finish(bson_elem);
@@ -913,7 +1005,7 @@ void MongoDB_cache_purge(struct chained_cache *queue[], int index, int safe_acti
   if (pqq_ptr) goto start;
 
   duration = time(NULL)-start;
-  Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: %u/%u, ET: %u) ***\n",
+  Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: %u/%u, ET: %lu) ***\n",
 		config.name, config.type, writer_pid, qn, saved_index, duration);
 
   if (config.sql_trigger_exec && !safe_action) P_trigger_exec(config.sql_trigger_exec); 
@@ -940,11 +1032,10 @@ int MongoDB_get_database(char *db, int dblen, char *db_table)
 
 void MongoDB_create_indexes(mongo *db_conn, const char *table)
 {
-  bson idx_key[1], *out;
+  bson idx_key[1];
   FILE *f;
   char buf[LARGEBUFLEN];
   char *token, *bufptr;
-  int ret;
 
   f = fopen(config.sql_table_schema, "r");
   if (f) {
@@ -954,7 +1045,7 @@ void MongoDB_create_indexes(mongo *db_conn, const char *table)
 	  trim_all_spaces(buf);
 	  bufptr = buf;
 	  bson_init(idx_key);
-	  while (token = extract_token(&bufptr, ',')) {
+	  while ((token = extract_token(&bufptr, ','))) {
 	    bson_append_int(idx_key, token, 1);
 	  }
 	  bson_finish(idx_key);

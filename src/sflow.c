@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -24,16 +24,14 @@
     is Copyright (C) InMon Corporation 2001 ALL RIGHTS RESERVED
 */
 
-/* defines */
-#define __SFLOW_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
 #include "sflow.h"
 #include "bgp/bgp.h"
 #include "sfacctd.h"
 #include "sfv5_module.h"
+#include "ip_flow.h"
+#include "ip_frag.h"
 #include "pmacct-data.h"
 #include "crc32.h"
 
@@ -42,7 +40,7 @@
   -----------------___________________________------------------
 */
 
-int lengthCheck(SFSample *sample, u_char *start, int len)
+int lengthCheck(SFSample *sample, u_char *start, u_int32_t len)
 {
   u_int32_t actualLen = (u_char *)sample->datap - start;
   if (actualLen != len) {
@@ -83,10 +81,11 @@ void decodeLinkLayer(SFSample *sample)
 
   memcpy(sample->eth_src, ptr, 6);
   ptr += 6;
+
   sample->eth_type = (ptr[0] << 8) + ptr[1];
   ptr += 2;
 
-  if (sample->eth_type == ETHERTYPE_8021Q) {
+  if (sample->eth_type == ETHERTYPE_8021Q || sample->eth_type == ETHERTYPE_8021AD) {
     /* VLAN  - next two bytes */
     u_int32_t vlanData = (ptr[0] << 8) + ptr[1];
     u_int32_t vlan = vlanData & 0x0fff;
@@ -105,6 +104,27 @@ void decodeLinkLayer(SFSample *sample)
 
     ptr += 2;
     caplen -= 2;
+
+    /* QinQ / 802.1AD */
+    if (sample->eth_type == ETHERTYPE_8021Q) {
+      u_int32_t cvlanData, cvlan, cpriority;
+
+      if (caplen < 4) {
+	return;
+      }
+
+      cvlanData = (ptr[0] << 8) + ptr[1];
+      cvlan = cvlanData & 0x0fff;
+      cpriority = cvlanData >> 13;
+      sample->cvlan = cvlan;
+      sample->cvlan_priority = cpriority;
+
+      ptr += 2;
+      sample->eth_type = (ptr[0] << 8) + ptr[1];
+
+      ptr += 2;
+      caplen -= 4;
+    }
   }
 
   if (sample->eth_type <= NFT_MAX_8023_LEN) {
@@ -151,12 +171,10 @@ void decodeLinkLayer(SFSample *sample)
     sample->offsetToIPV4 = (ptr - start);
   }
 
-#if defined ENABLE_IPV6
   if (sample->eth_type == ETHERTYPE_IPV6) {
     sample->gotIPV6 = TRUE;
     sample->offsetToIPV6 = (ptr - start);
   }
-#endif
 }
 
 
@@ -165,7 +183,8 @@ void decodeLinkLayer(SFSample *sample)
   -----------------___________________________------------------
 */
 
-void decodeIPLayer4(SFSample *sample, u_char *ptr, u_int32_t ipProtocol) {
+void decodeIPLayer4(SFSample *sample, u_char *ptr, u_int32_t ipProtocol)
+{
   u_char *end = sample->header + sample->headerLen;
   if(ptr > (end - 8)) return; // not enough header bytes left
   switch(ipProtocol) {
@@ -185,10 +204,8 @@ void decodeIPLayer4(SFSample *sample, u_char *ptr, u_int32_t ipProtocol) {
       sample->dcd_dport = ntohs(tcp.th_dport);
       sample->dcd_tcpFlags = tcp.th_flags;
       if(sample->dcd_dport == 80) {
-	int bytesLeft;
 	int headerBytes = (tcp.th_off_and_unused >> 4) * 4;
 	ptr += headerBytes;
-	bytesLeft = sample->header + sample->headerLen - ptr;
       }
     }
     break;
@@ -199,6 +216,11 @@ void decodeIPLayer4(SFSample *sample, u_char *ptr, u_int32_t ipProtocol) {
       sample->dcd_sport = ntohs(udp.uh_sport);
       sample->dcd_dport = ntohs(udp.uh_dport);
       sample->udp_pduLen = ntohs(udp.uh_ulen);
+
+      if (sample->dcd_dport == UDP_PORT_VXLAN) {
+	ptr += sizeof(udp);
+	decodeVXLAN(sample, ptr);
+      }
     }
     break;
   default: /* some other protcol */
@@ -206,30 +228,42 @@ void decodeIPLayer4(SFSample *sample, u_char *ptr, u_int32_t ipProtocol) {
   }
 }
 
-/*_________________---------------------------__________________
-  _________________     decodeIPV4_inner      __________________
-  -----------------___________________________------------------
-*/
-
-void decodeIPV4_inner(SFSample *sample, u_char *ptr)
+void decodeVXLAN(SFSample *sample, u_char *ptr)
 {
-  if (sample->got_inner_IPV4) {
-    u_char *end = sample->header + sample->headerLen;
-    u_int16_t caplen = end - ptr;
-    struct SF_iphdr ip;
+  struct vxlan_hdr *hdr = NULL;
+  u_char *vni_ptr = NULL;
+  u_int32_t vni;
+  u_char *end = sample->header + sample->headerLen;
 
-    if (caplen < IP4HdrSz) return;
-    memcpy(&ip, ptr, sizeof(ip));
+  if (ptr > (end - 8)) return;
 
-    sample->dcd_inner_srcIP.s_addr = ip.saddr;
-    sample->dcd_inner_dstIP.s_addr = ip.daddr;
-    sample->dcd_inner_ipProtocol = ip.protocol;
-    sample->dcd_inner_ipTos = ip.tos;
+  hdr = (struct vxlan_hdr *) ptr;
 
-    sample->ip_inner_fragmentOffset = ntohs(ip.frag_off) & 0x1FFF;
-    if (sample->ip_inner_fragmentOffset == 0) {
-      ptr += (ip.version_and_headerLen & 0x0f) * 4;
-      decodeIPLayer4(sample, ptr, ip.protocol);
+  if (hdr->flags & VXLAN_FLAG_I) {
+    vni_ptr = hdr->vni;
+
+    /* decode 24-bit label */
+    vni = *vni_ptr++;
+    vni <<= 8;
+    vni += *vni_ptr++;
+    vni <<= 8;
+    vni += *vni_ptr++;
+
+    sample->vni = vni;
+    ptr += sizeof(struct vxlan_hdr);
+
+    if (sample->sppi) {
+      SFSample *sppi = (SFSample *) sample->sppi;
+
+      /* preps */
+      sppi->datap = (u_int32_t *) ptr;
+      sppi->header = ptr;
+      sppi->headerLen = (end - ptr);
+
+      /* decoding inner packet */
+      decodeLinkLayer(sppi);
+      if (sppi->gotIPV4) decodeIPV4(sppi);
+      else if (sppi->gotIPV6) decodeIPV6(sppi);
     }
   }
 }
@@ -267,8 +301,18 @@ void decodeIPV4(SFSample *sample)
       ptr += (ip.version_and_headerLen & 0x0f) * 4;
 
       if (ip.protocol == 4 /* ipencap */ || ip.protocol == 94 /* ipip */) {
-	sample->got_inner_IPV4 = TRUE;
-	decodeIPV4_inner(sample, ptr);
+	if (sample->sppi) {
+	  SFSample *sppi = (SFSample *) sample->sppi;
+
+	  /* preps */
+	  sppi->datap = (u_int32_t *) ptr;
+	  sppi->header = ptr;
+	  sppi->headerLen = (end - ptr);
+	  sppi->offsetToIPV4 = 0;
+	  sppi->gotIPV4 = TRUE;
+
+	  decodeIPV4(sppi);
+	}
       }
       else decodeIPLayer4(sample, ptr, ip.protocol);
     }
@@ -280,10 +324,8 @@ void decodeIPV4(SFSample *sample)
   -----------------___________________________------------------
 */
 
-#if defined ENABLE_IPV6
 void decodeIPV6(SFSample *sample)
 {
-  u_int16_t payloadLen;
   u_int32_t label;
   u_int32_t nextHeader;
   u_char *end = sample->header + sample->headerLen;
@@ -309,7 +351,6 @@ void decodeIPV6(SFSample *sample)
     label <<= 8;
     label += *ptr++;
     // payload
-    payloadLen = (ptr[0] << 8) + ptr[1];
     ptr += 2;
     // if payload is zero, that implies a jumbo payload
 
@@ -349,13 +390,22 @@ void decodeIPV6(SFSample *sample)
     sample->dcd_ipProtocol = nextHeader;
 
     if (sample->dcd_ipProtocol == 4 /* ipencap */ || sample->dcd_ipProtocol == 94 /* ipip */) {
-      sample->got_inner_IPV4 = TRUE;
-      decodeIPV4_inner(sample, ptr); 
+      if (sample->sppi) {
+	SFSample *sppi = (SFSample *) sample->sppi;
+
+	/* preps */
+	sppi->datap = (u_int32_t *) ptr;
+	sppi->header = ptr;
+	sppi->headerLen = (end - ptr);
+	sppi->offsetToIPV4 = 0;
+	sppi->gotIPV4 = TRUE;
+
+	decodeIPV4(sppi);
+      }
     }
     else decodeIPLayer4(sample, ptr, sample->dcd_ipProtocol);
   }
 }
-#endif
 
 /*_________________---------------------------__________________
   _________________   read data fns           __________________
@@ -407,7 +457,7 @@ int skipBytesAndCheck(SFSample *sample, int skip)
   else return ERR;
 }
 
-u_int32_t getString(SFSample *sample, char *buf, int bufLen)
+u_int32_t getString(SFSample *sample, char *buf, u_int32_t bufLen)
 {
   u_int32_t len, read_len;
   len = getData32(sample);
@@ -425,9 +475,7 @@ u_int32_t getAddress(SFSample *sample, SFLAddress *address)
   if(address->type == SFLADDRESSTYPE_IP_V4)
     address->address.ip_v4.s_addr = getData32_nobswap(sample);
   else {
-#if defined ENABLE_IPV6
     memcpy(address->address.ip_v6.s6_addr, sample->datap, 16);
-#endif
     skipBytes(sample, 16);
   }
   return address->type;
@@ -435,7 +483,7 @@ u_int32_t getAddress(SFSample *sample, SFLAddress *address)
 
 char *printTag(u_int32_t tag, char *buf, int bufLen) {
   // should really be: snprintf(buf, buflen,...) but snprintf() is not always available
-  sprintf(buf, "%lu:%lu", (tag >> 12), (tag & 0x00000FFF));
+  sprintf(buf, "%lu:%lu", (unsigned long)(tag >> 12), (unsigned long)(tag & 0x00000FFF));
   return buf;
 }
 
@@ -461,9 +509,6 @@ void readExtendedSwitch(SFSample *sample)
 
 void readExtendedRouter(SFSample *sample)
 {
-  u_int32_t addrType;
-  char buf[51];
-
   getAddress(sample, &sample->nextHop);
   sample->srcMask = getData32(sample);
   sample->dstMask = getData32(sample);
@@ -502,9 +547,8 @@ void readExtendedGateway_v2(SFSample *sample)
 
 void readExtendedGateway(SFSample *sample)
 {
-  int len_tot, len_asn, len_comm, idx;
+  u_int32_t len_tot, len_asn, len_comm, idx;
   char asn_str[MAX_BGP_ASPATH], comm_str[MAX_BGP_STD_COMMS], space[] = " ";
-  char buf[51];
 
   if(sample->datagramVersion >= 5) getAddress(sample, &sample->bgp_nextHop);
 
@@ -514,11 +558,9 @@ void readExtendedGateway(SFSample *sample)
   sample->dst_as_path_len = getData32(sample);
   if (sample->dst_as_path_len > 0) {
     for (idx = 0, len_tot = 0; idx < sample->dst_as_path_len; idx++) {
-      u_int32_t seg_type;
-      u_int32_t seg_len;
-      int i;
+      u_int32_t seg_len, i;
 
-      seg_type = getData32(sample);
+      getData32(sample); /* seg_type */
       seg_len = getData32(sample);
 
       for (i = 0; i < seg_len; i++) {
@@ -530,7 +572,7 @@ void readExtendedGateway(SFSample *sample)
 	len_tot = strlen(sample->dst_as_path);
 
         if ((len_tot+len_asn) < LARGEBUFLEN) {
-          strncat(sample->dst_as_path, asn_str, len_asn);
+          strncat(sample->dst_as_path, asn_str, (sizeof(sample->dst_as_path) - len_tot));
         }
         else {
           sample->dst_as_path[LARGEBUFLEN-2] = '+';
@@ -581,7 +623,7 @@ void readExtendedGateway(SFSample *sample)
       len_tot = strlen(sample->comms);
 
       if ((len_tot+len_comm) < LARGEBUFLEN) {
-        strncat(sample->comms, comm_str, len_comm);
+        strncat(sample->comms, comm_str, (sizeof(sample->comms) - len_tot));
       }
       else {
         sample->comms[LARGEBUFLEN-2] = '+';
@@ -635,15 +677,20 @@ void readExtendedUrl(SFSample *sample)
   -----------------___________________________------------------
 */
 
-void mplsLabelStack(SFSample *sample, char *fieldName)
+void mplsLabelStack(SFSample *sample, u_int8_t direction)
 {
-  u_int32_t lab;
-
-  sample->lstk.depth = getData32(sample);
-  /* just point at the lablelstack array */
-  if (sample->lstk.depth > 0) sample->lstk.stack = (u_int32_t *)sample->datap;
-  /* and skip over it in the input */
-  skipBytes(sample, sample->lstk.depth * 4);
+  if (direction == DIRECTION_IN) {
+    sample->lstk.depth = getData32(sample);
+    /* just point at the lablelstack array */
+    if (sample->lstk.depth > 0) sample->lstk.stack = (u_int32_t *)sample->datap;
+    /* and skip over it in the input */
+    skipBytes(sample, sample->lstk.depth * 4);
+  }
+  else if (direction == DIRECTION_OUT) {
+    sample->lstk_out.depth = getData32(sample);
+    if (sample->lstk_out.depth > 0) sample->lstk_out.stack = (u_int32_t *)sample->datap;
+    skipBytes(sample, sample->lstk_out.depth * 4);
+  }
 }
 
 /*_________________---------------------------__________________
@@ -653,12 +700,10 @@ void mplsLabelStack(SFSample *sample, char *fieldName)
 
 void readExtendedMpls(SFSample *sample)
 {
-  char buf[51];
-
   getAddress(sample, &sample->mpls_nextHop);
 
-  mplsLabelStack(sample, "mpls_input_stack");
-  mplsLabelStack(sample, "mpls_output_stack");
+  mplsLabelStack(sample, DIRECTION_IN);
+  mplsLabelStack(sample, DIRECTION_OUT);
   
   sample->extended_data_tag |= SASAMPLE_EXTENDED_DATA_MPLS;
 }
@@ -670,8 +715,6 @@ void readExtendedMpls(SFSample *sample)
 
 void readExtendedNat(SFSample *sample)
 {
-  char buf[51];
-
   getAddress(sample, &sample->nat_src);
   getAddress(sample, &sample->nat_dst);
 
@@ -688,11 +731,10 @@ void readExtendedMplsTunnel(SFSample *sample)
 {
 #define SA_MAX_TUNNELNAME_LEN 100
   char tunnel_name[SA_MAX_TUNNELNAME_LEN+1];
-  u_int32_t tunnel_id, tunnel_cos;
   
   getString(sample, tunnel_name, SA_MAX_TUNNELNAME_LEN); 
-  tunnel_id = getData32(sample);
-  tunnel_cos = getData32(sample);
+  sample->mpls_tunnel_id = getData32(sample);
+  getData32(sample); /* tunnel_cos */
 
   sample->extended_data_tag |= SASAMPLE_EXTENDED_DATA_MPLS_TUNNEL;
 }
@@ -706,11 +748,10 @@ void readExtendedMplsVC(SFSample *sample)
 {
 #define SA_MAX_VCNAME_LEN 100
   char vc_name[SA_MAX_VCNAME_LEN+1];
-  u_int32_t vc_cos;
 
   getString(sample, vc_name, SA_MAX_VCNAME_LEN); 
   sample->mpls_vll_vc_id = getData32(sample);
-  vc_cos = getData32(sample);
+  getData32(sample); /* vc_cos */
 
   sample->extended_data_tag |= SASAMPLE_EXTENDED_DATA_MPLS_VC;
 }
@@ -724,10 +765,9 @@ void readExtendedMplsFTN(SFSample *sample)
 {
 #define SA_MAX_FTN_LEN 100
   char ftn_descr[SA_MAX_FTN_LEN+1];
-  u_int32_t ftn_mask;
 
   getString(sample, ftn_descr, SA_MAX_FTN_LEN);
-  ftn_mask = getData32(sample);
+  getData32(sample); /* ftn_mask */
 
   sample->extended_data_tag |= SASAMPLE_EXTENDED_DATA_MPLS_FTN;
 }
@@ -739,8 +779,7 @@ void readExtendedMplsFTN(SFSample *sample)
 
 void readExtendedMplsLDP_FEC(SFSample *sample)
 {
-  u_int32_t fec_addr_prefix_len = getData32(sample);
-
+  getData32(sample); /* fec_addr_prefix_len */
   sample->extended_data_tag |= SASAMPLE_EXTENDED_DATA_MPLS_LDP_FEC;
 }
 
@@ -773,30 +812,6 @@ void readExtendedProcess(SFSample *sample)
 
   num_processes = getData32(sample);
   for (i = 0; i < num_processes; i++) skipBytes(sample, 4);
-}
-
-void readExtendedClass(SFSample *sample)
-{
-  u_int32_t ret;
-  u_char buf[MAX_PROTOCOL_LEN+1], *bufptr = buf;
-
-  if (config.classifiers_path) {
-    ret = getData32_nobswap(sample);
-    memcpy(bufptr, &ret, 4);
-    bufptr += 4;
-    ret = getData32_nobswap(sample);
-    memcpy(bufptr, &ret, 4);
-    bufptr += 4;
-    ret = getData32_nobswap(sample);
-    memcpy(bufptr, &ret, 4);
-    bufptr += 4;
-    ret = getData32_nobswap(sample);
-    memcpy(bufptr, &ret, 4);
-    bufptr += 4;
-
-    sample->class = SF_evaluate_classifiers(buf);
-  }
-  else skipBytes(sample, MAX_PROTOCOL_LEN);
 }
 
 void readExtendedClass2(SFSample *sample)
@@ -833,12 +848,10 @@ void decodeMpls(SFSample *sample, u_char **bp)
     sample->gotIPV4 = TRUE;
     sample->offsetToIPV4 = nl+(ptr-sample->header);
   } 
-#if defined ENABLE_IPV6
   else if (sample->eth_type == ETHERTYPE_IPV6) {
     sample->gotIPV6 = TRUE;
     sample->offsetToIPV6 = nl+(ptr-sample->header);
   }
-#endif
 
   if (nl) {
     sample->lstk.depth = nl / 4; 
@@ -871,12 +884,10 @@ void decodePPP(SFSample *sample)
     sample->gotIPV4 = TRUE;
     sample->offsetToIPV4 = dummy_pptrs.iph_ptr - sample->header;
   }
-#if defined ENABLE_IPV6
   else if (sample->eth_type == ETHERTYPE_IPV6) {
     sample->gotIPV6 = TRUE;
     sample->offsetToIPV6 = dummy_pptrs.iph_ptr - sample->header;
   }
-#endif
 }
 
 /*_________________---------------------------__________________
@@ -902,12 +913,10 @@ void readFlowSample_header(SFSample *sample)
     sample->gotIPV4 = TRUE;
     sample->offsetToIPV4 = 0;
     break;
-#if defined ENABLE_IPV6
   case SFLHEADER_IPv6:
     sample->gotIPV6 = TRUE;
     sample->offsetToIPV6 = 0;
     break;
-#endif
   case SFLHEADER_MPLS:
     decodeMpls(sample, NULL);
     break;
@@ -928,9 +937,7 @@ void readFlowSample_header(SFSample *sample)
   }
   
   if (sample->gotIPV4) decodeIPV4(sample);
-#if defined ENABLE_IPV6
   else if (sample->gotIPV6) decodeIPV6(sample);
-#endif
 
   skipBytes(sample, sample->headerLen);
 }
@@ -950,9 +957,7 @@ void readFlowSample_ethernet(SFSample *sample)
   sample->eth_type = getData32(sample);
 
   if (sample->eth_type == ETHERTYPE_IP) sample->gotIPV4 = TRUE;
-#if defined ENABLE_IPV6
   else if (sample->eth_type == ETHERTYPE_IPV6) sample->gotIPV6 = TRUE;
-#endif
 
   /* Commit eth_len to packet length: will be overwritten if we get
      SFLFLOW_IPV4 or SFLFLOW_IPV6; otherwise will get along as the
@@ -998,7 +1003,6 @@ void readFlowSample_IPv6(SFSample *sample)
   sample->headerLen = sizeof(SFLSampled_ipv6);
   skipBytes(sample, sample->headerLen);
 
-#if defined ENABLE_IPV6
   {
     SFLSampled_ipv6 nfKey6;
 
@@ -1015,7 +1019,6 @@ void readFlowSample_IPv6(SFSample *sample)
   }
 
   sample->gotIPV6 = TRUE;
-#endif
 }
 
 /*_________________---------------------------__________________
@@ -1045,8 +1048,8 @@ void readv2v4FlowSample(SFSample *sample, struct packet_ptrs_vector *pptrsv, str
   case INMPACKETTYPE_IPV4: readFlowSample_IPv4(sample); break;
   case INMPACKETTYPE_IPV6: readFlowSample_IPv6(sample); break;
   default: 
-    SF_notify_malf_packet(LOG_INFO, "INFO: Discarding unknown v2/v4 Data Tag", (struct sockaddr *) pptrsv->v4.f_agent);
-    xflow_tot_bad_datagrams++;
+    SF_notify_malf_packet(LOG_INFO, "INFO", "discarding unknown v2/v4 Data Tag", (struct sockaddr *) pptrsv->v4.f_agent);
+    xflow_status_table.tot_bad_datagrams++;
     break;
   }
 
@@ -1067,8 +1070,8 @@ void readv2v4FlowSample(SFSample *sample, struct packet_ptrs_vector *pptrsv, str
       case INMEXTENDED_USER: readExtendedUser(sample); break;
       case INMEXTENDED_URL: readExtendedUrl(sample); break;
       default: 
-	SF_notify_malf_packet(LOG_INFO, "INFO: Discarding unknown v2/v4 Extended Data Tag", (struct sockaddr *) pptrsv->v4.f_agent);
-	xflow_tot_bad_datagrams++;
+	SF_notify_malf_packet(LOG_INFO, "INFO", "discarding unknown v2/v4 Extended Data Tag", (struct sockaddr *) pptrsv->v4.f_agent);
+	xflow_status_table.tot_bad_datagrams++;
 	break;
       }
     }
@@ -1085,7 +1088,7 @@ void readv2v4FlowSample(SFSample *sample, struct packet_ptrs_vector *pptrsv, str
 void readv5FlowSample(SFSample *sample, int expanded, struct packet_ptrs_vector *pptrsv, struct plugin_requests *req, int finalize)
 {
   struct sfv5_modules_db_field *db_field = NULL;
-  u_int32_t num_elements, sampleLength, actualSampleLength;
+  u_int32_t num_elements, sampleLength;
   u_char *sampleStart;
 
   sampleLength = getData32(sample);
@@ -1121,8 +1124,10 @@ void readv5FlowSample(SFSample *sample, int expanded, struct packet_ptrs_vector 
   }
 
   num_elements = getData32(sample);
+
   {
-    int el;
+    u_int32_t el;
+
     for (el = 0; el < num_elements; el++) {
       u_int32_t tag, length;
       u_char *start;
@@ -1147,8 +1152,7 @@ void readv5FlowSample(SFSample *sample, int expanded, struct packet_ptrs_vector 
       case SFLFLOW_EX_MPLS_FTN:     readExtendedMplsFTN(sample); break;
       case SFLFLOW_EX_MPLS_LDP_FEC: readExtendedMplsLDP_FEC(sample); break;
       case SFLFLOW_EX_VLAN_TUNNEL:  readExtendedVlanTunnel(sample); break;
-      case SFLFLOW_EX_PROCESS:      readExtendedProcess(sample); break;
-      case SFLFLOW_EX_CLASS:	    readExtendedClass(sample); break;
+/*    case SFLFLOW_EX_PROCESS:      readExtendedProcess(sample); break; */
       case SFLFLOW_EX_CLASS2:	    readExtendedClass2(sample); break;
       case SFLFLOW_EX_TAG:	    readExtendedTag(sample); break;
       default:
@@ -1178,7 +1182,7 @@ void readv5CountersSample(SFSample *sample, int expanded, struct packet_ptrs_vec
   struct sfv5_modules_db_field *db_field = NULL;
   struct xflow_status_entry *xse = NULL;
   struct bgp_peer *peer = NULL;
-  u_int32_t sampleLength, num_elements, idx, drain;
+  u_int32_t sampleLength, num_elements, idx;
   u_char *sampleStart;
 
   if (sfacctd_counter_backend_methods) {
@@ -1204,7 +1208,8 @@ void readv5CountersSample(SFSample *sample, int expanded, struct packet_ptrs_vec
 
   for (idx = 0; idx < num_elements; idx++) {
     u_int32_t tag, length;
-    u_char *start, buf[51];
+    u_char *start;
+    char buf[51];
 
     tag = getData32(sample);
     length = getData32(sample);

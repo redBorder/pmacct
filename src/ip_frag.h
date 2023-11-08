@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -18,6 +18,9 @@
     along with this program; if not, write to the Free Software
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
+
+#ifndef IP_FRAG_H
+#define IP_FRAG_H
 
 /* defines */
 #define IPFT_HASHSZ 256 
@@ -50,7 +53,6 @@ struct lru_l {
   struct ip_fragment *last;
 };
 
-#if defined ENABLE_IPV6
 struct ip6_fragment {
   unsigned char tlhdr[8];       /* upper level info */
   u_int8_t got_first;           /* got first packet ? */
@@ -71,45 +73,31 @@ struct lru_l6 {
   struct ip6_fragment *root;
   struct ip6_fragment *last;
 };
-#endif
 
 /* global vars */
-#if (!defined __IP_FRAG_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT struct ip_fragment *ipft[IPFT_HASHSZ];
-EXT struct lru_l lru_list;
+extern struct ip_fragment *ipft[IPFT_HASHSZ];
+extern struct lru_l lru_list;
 
-#if defined ENABLE_IPV6
-EXT struct ip6_fragment *ipft6[IPFT_HASHSZ];
-EXT struct lru_l6 lru_list6;
-#endif
-#undef EXT
+extern struct ip6_fragment *ipft6[IPFT_HASHSZ];
+extern struct lru_l6 lru_list6;
 
 /* prototypes */
-#if (!defined __IP_FRAG_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void init_ip_fragment_handler(); /* wrapper */ 
-EXT void init_ip4_fragment_handler(); 
-EXT int ip_fragment_handler(struct packet_ptrs *); 
-EXT int find_fragment(u_int32_t, struct packet_ptrs *); 
-EXT int create_fragment(u_int32_t, struct ip_fragment *, u_int8_t, unsigned int, struct packet_ptrs *); 
-EXT unsigned int hash_fragment(u_int16_t, u_int32_t, u_int32_t, u_int8_t);
-EXT void prune_old_fragments(u_int32_t, u_int32_t); 
-EXT void notify_orphan_fragment(struct ip_fragment *);
+extern void enable_ip_fragment_handler();
+extern void init_ip_fragment_handler(); /* wrapper */ 
+extern void init_ip4_fragment_handler(); 
+extern int ip_fragment_handler(struct packet_ptrs *); 
+extern int find_fragment(u_int32_t, struct packet_ptrs *); 
+extern int create_fragment(u_int32_t, struct ip_fragment *, u_int8_t, unsigned int, struct packet_ptrs *); 
+extern unsigned int hash_fragment(u_int16_t, u_int32_t, u_int32_t, u_int8_t);
+extern void prune_old_fragments(u_int32_t, u_int32_t); 
+extern void notify_orphan_fragment(struct ip_fragment *);
 
-#if defined ENABLE_IPV6
-EXT void init_ip6_fragment_handler();
-EXT int ip6_fragment_handler6(struct packet_ptrs *, struct ip6_frag *);
-EXT unsigned int hash_fragment6(u_int32_t, struct in6_addr *, struct in6_addr *);
-EXT int find_fragment6(u_int32_t, struct packet_ptrs *, struct ip6_frag *);
-EXT int create_fragment6(u_int32_t, struct ip6_fragment *, u_int8_t, unsigned int, struct packet_ptrs *, struct ip6_frag *);
-EXT void prune_old_fragments6(u_int32_t, u_int32_t); 
-EXT void notify_orphan_fragment6(struct ip6_fragment *);
-#endif
-#undef EXT
+extern void init_ip6_fragment_handler();
+extern int ip6_fragment_handler(struct packet_ptrs *, struct ip6_frag *);
+extern unsigned int hash_fragment6(u_int32_t, struct in6_addr *, struct in6_addr *);
+extern int find_fragment6(u_int32_t, struct packet_ptrs *, struct ip6_frag *);
+extern int create_fragment6(u_int32_t, struct ip6_fragment *, u_int8_t, unsigned int, struct packet_ptrs *, struct ip6_frag *);
+extern void prune_old_fragments6(u_int32_t, u_int32_t); 
+extern void notify_orphan_fragment6(struct ip6_fragment *);
+
+#endif //IP_FRAG_H

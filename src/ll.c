@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,9 +19,6 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-/* defines */
-#define __LL_C
-
 /* includes */
 #include "pmacct.h"
 #include "pmacct-data.h"
@@ -31,7 +28,7 @@
    protocol header and fills a pointer structure */ 
 void eth_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs) 
 {
-  u_int16_t e8021Q, ppp;
+  u_int16_t e8021Q, ppp, cfp, cvnt;
   struct eth_header *eth_pk;
   u_int16_t etype, caplen = h->caplen, nl;
   u_int8_t cursor = 0;
@@ -56,26 +53,65 @@ void eth_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
     pptrs->iph_ptr = pptrs->packet_ptr + nl;
     return;
   }
-#if defined ENABLE_IPV6
   if (etype == ETHERTYPE_IPV6) {
     pptrs->l3_proto = ETHERTYPE_IPV6;
     pptrs->l3_handler = ip6_handler;
     pptrs->iph_ptr = pptrs->packet_ptr + nl;
     return;
   }
-#endif
 
   /* originally contributed by Rich Gade */
-  if (etype == ETHERTYPE_8021Q) {
+  if (etype == ETHERTYPE_8021Q || etype == ETHERTYPE_8021AD) {
     if (caplen < IEEE8021Q_TAGLEN) {
       pptrs->iph_ptr = NULL;
       return;
     }
-    memcpy(&e8021Q, pptrs->packet_ptr+nl+2, 2);
-    if (!cursor) pptrs->vlan_ptr = pptrs->packet_ptr + nl; 
+
+    memcpy(&e8021Q, (pptrs->packet_ptr + nl + 2), 2);
+
+    if (!cursor) {
+      pptrs->vlan_ptr = (pptrs->packet_ptr + nl); 
+    }
+    else {
+      if (pptrs->vlan_ptr) {
+	pptrs->cvlan_ptr = (pptrs->packet_ptr + nl);
+      }
+    }
+
     etype = ntohs(e8021Q);
     nl += IEEE8021Q_TAGLEN;
     caplen -= IEEE8021Q_TAGLEN;
+    cursor++;
+
+    goto recurse;
+  }
+
+  /* Process Cisco Fabric Path Header */
+  if (etype == ETHERTYPE_CFP) {
+    if (caplen < CFP_TAGLEN) {
+      pptrs->iph_ptr = NULL;
+      return;
+    }
+
+    memcpy(&cfp, pptrs->packet_ptr+nl+CFP_TAGLEN-2, 2);
+    etype = ntohs(cfp);
+    nl += CFP_TAGLEN;
+    caplen -= CFP_TAGLEN;
+    cursor++;
+    goto recurse;
+  }
+
+  /* Process Cisco Virtual Network TAG Header */
+  if (etype == ETHERTYPE_CVNT) {
+    if (caplen < CVNT_TAGLEN) {
+      pptrs->iph_ptr = NULL;
+      return;
+    }
+
+    memcpy(&cvnt, pptrs->packet_ptr+nl+CVNT_TAGLEN-2, 2);
+    etype = ntohs(cvnt);
+    nl += CVNT_TAGLEN;
+    caplen -= CVNT_TAGLEN;
     cursor++;
     goto recurse;
   }
@@ -88,10 +124,10 @@ void eth_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
     }
     memcpy(&ppp, pptrs->packet_ptr+nl+PPPOE_HDRLEN, 2);
     etype = ntohs(ppp);
+
     if (etype == PPP_IP) etype = ETHERTYPE_IP; 
-#if defined ENABLE_IPV6
     if (etype == PPP_IPV6) etype = ETHERTYPE_IPV6;
-#endif 
+
     nl += PPPOE_HDRLEN+PPP_TAGLEN;
     caplen -= PPPOE_HDRLEN+PPP_TAGLEN;
     cursor = 1;
@@ -104,6 +140,13 @@ void eth_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
     goto recurse;
   }
 
+  if (config.aggregate_unknown_etype) {
+    pptrs->l3_proto = etype;
+    pptrs->l3_handler = unknown_etype_handler;
+    pptrs->iph_ptr = pptrs->packet_ptr + nl;
+    return;
+  }
+
   pptrs->l3_proto = 0;
   pptrs->l3_handler = NULL;
   pptrs->iph_ptr = NULL;
@@ -112,7 +155,7 @@ void eth_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
 u_int16_t mpls_handler(u_char *bp, u_int16_t *caplen, u_int16_t *nl, register struct packet_ptrs *pptrs)
 {
   u_int32_t *p = (u_int32_t *) bp;
-  char *next = bp;
+  u_char *next = bp;
   u_int32_t label=0;
 
   pptrs->mpls_ptr = bp;
@@ -131,10 +174,8 @@ u_int16_t mpls_handler(u_char *bp, u_int16_t *caplen, u_int16_t *nl, register st
   case 0: /* IPv4 explicit NULL label */
   case 3: /* IPv4 implicit NULL label */
     return ETHERTYPE_IP;
-#if defined ENABLE_IPV6
   case 2: /* IPv6 explicit NULL label */
     return ETHERTYPE_IPV6;
-#endif
   default:
     /* 
        support for what is sometimes referred as null-encapsulation:
@@ -158,7 +199,6 @@ u_int16_t mpls_handler(u_char *bp, u_int16_t *caplen, u_int16_t *nl, register st
       case 0x4e:
       case 0x4f:
 	return ETHERTYPE_IP;
-#if defined ENABLE_IPV6 
       case 0x60:
       case 0x61:
       case 0x62:
@@ -176,7 +216,6 @@ u_int16_t mpls_handler(u_char *bp, u_int16_t *caplen, u_int16_t *nl, register st
       case 0x6e:
       case 0x6f:
 	return ETHERTYPE_IPV6;
-#endif
       default:
         break;
       }
@@ -223,14 +262,13 @@ void ppp_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
     pptrs->iph_ptr = p;
     return;
   }
-#if defined ENABLE_IPV6
+
   if ((proto == PPP_IPV6) || (proto == ETHERTYPE_IPV6)) {
     pptrs->l3_proto = ETHERTYPE_IPV6;
     pptrs->l3_handler = ip6_handler;
     pptrs->iph_ptr = p;
     return;
   }
-#endif
 
   if (proto == PPP_MPLS_UCAST || proto == PPP_MPLS_MCAST) {
     proto = mpls_handler(p, &caplen, &nl, pptrs);
@@ -304,13 +342,11 @@ void raw_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
     pptrs->l3_proto = ETHERTYPE_IP;
     pptrs->l3_handler = ip_handler;
     return;
-#if defined ENABLE_IPV6
   case 6:
     pptrs->iph_ptr = pptrs->packet_ptr;
     pptrs->l3_proto = ETHERTYPE_IPV6;
     pptrs->l3_handler = ip6_handler;
     return;
-#endif
   default:
     pptrs->iph_ptr = NULL;
     pptrs->l3_proto = 0;
@@ -323,7 +359,6 @@ void null_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptr
 {
   register u_int32_t *family;
   u_int caplen = h->caplen;
-  u_char *p;
 
   if (caplen < 4) {
     pptrs->iph_ptr = NULL;
@@ -331,7 +366,6 @@ void null_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptr
   }
 
   family = (u_int32_t *) pptrs->packet_ptr;
-  p = pptrs->packet_ptr;
 
   if (*family == AF_INET || ntohl(*family) == AF_INET ) {
     pptrs->l3_proto = ETHERTYPE_IP;
@@ -340,14 +374,12 @@ void null_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptr
     return;
   }
 
-#if defined ENABLE_IPV6
   if (*family == AF_INET6 || ntohl(*family) == AF_INET6 ) {
     pptrs->l3_proto = ETHERTYPE_IPV6;
     pptrs->l3_handler = ip6_handler;
     pptrs->iph_ptr = (u_char *)(pptrs->packet_ptr + 4);
     return;
   }
-#endif
 
   pptrs->l3_proto = 0;
   pptrs->l3_handler = NULL;
@@ -380,7 +412,7 @@ void sll_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
 
   if (EXTRACT_16BITS(&sllp->sll_halen) == ETH_ADDR_LEN) {
     memcpy(sll_mac[1], sllp->sll_addr, ETH_ADDR_LEN);
-    pptrs->mac_ptr = (char *) sll_mac;
+    pptrs->mac_ptr = (u_char *) sll_mac;
   }
 
   recurse:
@@ -391,14 +423,12 @@ void sll_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
     return;
   }
   
-#if defined ENABLE_IPV6
   if (etype == ETHERTYPE_IPV6) {
     pptrs->l3_proto = ETHERTYPE_IPV6;
     pptrs->l3_handler = ip6_handler;
     pptrs->iph_ptr = pptrs->packet_ptr + nl;
     return;
   }
-#endif
 
   if (etype == LINUX_SLL_P_802_2) {
     /* going up to LLC/SNAP layer header */
@@ -411,17 +441,28 @@ void sll_handler(const struct pcap_pkthdr *h, register struct packet_ptrs *pptrs
   }
 
   /* originally contributed by Rich Gade for eth_handler() */
-  if (etype == ETHERTYPE_8021Q) {
+  if (etype == ETHERTYPE_8021Q || etype == ETHERTYPE_8021AD) {
     if (caplen < IEEE8021Q_TAGLEN) {
       pptrs->iph_ptr = NULL;
       return;
     }
-    memcpy(&e8021Q, pptrs->packet_ptr+nl+2, 2);
-    if (!cursor) pptrs->vlan_ptr = pptrs->packet_ptr + nl;
+
+    memcpy(&e8021Q, (pptrs->packet_ptr + nl + 2), 2);
+
+    if (!cursor) {
+      pptrs->vlan_ptr = (pptrs->packet_ptr + nl);
+    }
+    else {
+      if (pptrs->vlan_ptr) {
+	pptrs->cvlan_ptr = (pptrs->packet_ptr + nl);
+      }
+    }
+
     etype = ntohs(e8021Q);
     nl += IEEE8021Q_TAGLEN;
     caplen -= IEEE8021Q_TAGLEN;
     cursor++;
+
     goto recurse;
   }
 
@@ -443,23 +484,24 @@ u_char *llc_handler(const struct pcap_pkthdr *h, u_int caplen, register u_char *
 
   if (caplen < 3) return NULL;
 
-  memcpy((char *)&llc, (char *) buf, min(caplen, sizeof(llc)));
+  memcpy((char *)&llc, (char *) buf, MIN(caplen, sizeof(llc)));
   if (llc.ssap == LLCSAP_SNAP && llc.dsap == LLCSAP_SNAP
       && llc.ctl.snap.snap_ui == LLC_UI) {
     etype = EXTRACT_16BITS(&llc.ctl.snap_ether.snap_ethertype[0]);
+
     if (etype == ETHERTYPE_IP) {
       pptrs->l3_proto = ETHERTYPE_IP;
       pptrs->l3_handler = ip_handler;
-      return (u_char *)(buf + min(caplen, sizeof(llc)));
+      return (u_char *)(buf + MIN(caplen, sizeof(llc)));
     }
-#if defined ENABLE_IPV6
+
     if (etype == ETHERTYPE_IPV6) {
       pptrs->l3_proto = ETHERTYPE_IPV6;
       pptrs->l3_handler = ip6_handler;
-      return (u_char *)(buf + min(caplen, sizeof(llc)));
+      return (u_char *)(buf + MIN(caplen, sizeof(llc)));
     }
-#endif
-    else return 0; 
+
+    return NULL; 
   }
-  else return 0;
+  else return NULL;
 }

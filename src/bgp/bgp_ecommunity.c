@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2020 by Paolo Lucente
 */
 
 /*
@@ -24,8 +24,6 @@ along with GNU Zebra; see the file COPYING.  If not, write to the Free
 Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 02111-1307, USA.  */
 
-#define __BGP_ECOMMUNITY_C
-
 #include "pmacct.h"
 #include "bgp_prefix.h"
 #include "bgp.h"
@@ -46,7 +44,7 @@ ecommunity_new (struct bgp_peer *peer)
   tmp = malloc(sizeof (struct ecommunity));
   if (!tmp) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (ecommunity_new). Exiting ..\n", config.name, bms->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(tmp, 0, sizeof (struct ecommunity));
 
@@ -88,7 +86,7 @@ ecommunity_add_val (struct bgp_peer *peer, struct ecommunity *ecom, struct ecomm
       ecom->val = malloc(ecom_length (ecom));
       if (!ecom->val) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (ecommunity_add_val). Exiting ..\n", config.name, bms->log_str);
-	exit_all(1);
+	exit_gracefully(1);
       }
       memcpy (ecom->val, eval->val, ECOMMUNITY_SIZE);
       return 1;
@@ -195,7 +193,8 @@ void
 ecommunity_unintern (struct bgp_peer *peer, struct ecommunity *ecom)
 {
   struct bgp_rt_structs *inter_domain_routing_db;
-  struct ecommunity *ret;
+  struct ecommunity *ret = NULL;
+  (void) ret;
 
   if (!peer) return;
 
@@ -313,7 +312,7 @@ ecommunity_ecom2str (struct bgp_peer *peer, struct ecommunity *ecom, int format)
       str_buf = malloc(1);
       if (!str_buf) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (ecommunity_ecom2str). Exiting ..\n", config.name, bms->log_str);
-	exit_all(1);
+	exit_gracefully(1);
       }
       str_buf[0] = '\0';
       return str_buf;
@@ -323,13 +322,20 @@ ecommunity_ecom2str (struct bgp_peer *peer, struct ecommunity *ecom, int format)
   str_buf = malloc(ECOMMUNITY_STR_DEFAULT_LEN + 1);
   if (!str_buf) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (ecommunity_ecom2str). Exiting ..\n", config.name, bms->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   str_size = ECOMMUNITY_STR_DEFAULT_LEN + 1;
   str_pnt = 0;
 
   for (i = 0; i < ecom->size; i++)
     {
+      /* Make it sure size is enough.  */
+      while (str_pnt + ECOMMUNITY_STR_DEFAULT_LEN >= str_size)
+        {
+          str_size *= 2;
+          str_buf = realloc(str_buf, str_size);
+        }
+
       /* Space between each value.  */
       if (! first)
 	str_buf[str_pnt++] = ' ';
@@ -371,13 +377,6 @@ ecommunity_ecom2str (struct bgp_peer *peer, struct ecommunity *ecom, int format)
 	default:
 	  prefix = "";
 	  break;
-	}
-
-      /* Make it sure size is enough.  */
-      while (str_pnt + ECOMMUNITY_STR_DEFAULT_LEN >= str_size)
-	{
-	  str_size *= 2;
-	  str_buf = realloc(str_buf, str_size);
 	}
 
       /* Put string into buffer.  */
@@ -425,4 +424,21 @@ ecommunity_ecom2str (struct bgp_peer *peer, struct ecommunity *ecom, int format)
 	}
     }
   return str_buf;
+}
+
+struct ecommunity *ecommunity_dup(struct ecommunity *ecom)
+{
+  struct ecommunity *new;
+
+  new = malloc(sizeof(struct ecommunity));
+
+  new->size = ecom->size;
+
+  if (new->size) {
+    new->val = malloc(ecom->size * ECOMMUNITY_SIZE);
+    memcpy (new->val, ecom->val, ecom->size * ECOMMUNITY_SIZE);
+  }
+  else new->val = NULL;
+
+  return new;
 }

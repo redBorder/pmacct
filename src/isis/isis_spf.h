@@ -33,12 +33,9 @@ enum vertextype
   VTYPE_ES,
   VTYPE_IPREACH_INTERNAL,
   VTYPE_IPREACH_EXTERNAL,
-  VTYPE_IPREACH_TE
-#ifdef ENABLE_IPV6
-    ,
+  VTYPE_IPREACH_TE,
   VTYPE_IP6REACH_INTERNAL,
   VTYPE_IP6REACH_EXTERNAL
-#endif /* ENABLE_IPV6 */
 };
 
 /*
@@ -58,7 +55,7 @@ struct isis_vertex
   u_int32_t d_N;		/* d(N) Distance from this IS      */
   u_int16_t depth;		/* The depth in the imaginary tree */
 
-  struct list *Adj_N;		/* {Adj(N)}  */
+  struct pm_list *Adj_N;		/* {Adj(N)}  */
 };
 
 struct isis_spftree
@@ -66,23 +63,15 @@ struct isis_spftree
   struct thread *t_spf;		/* spf threads */
   time_t lastrun;		/* for scheduling */
   int pending;			/* already scheduled */
-  struct list *paths;		/* the SPT */
-  struct list *tents;		/* TENT */
+  struct pm_list *paths;		/* the SPT */
+  struct pm_list *tents;		/* TENT */
 
   u_int32_t timerun;		/* statistics */
 };
 
-#if (!defined __ISIS_SPF_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void spftree_area_init (struct isis_area *);
-EXT int isis_spf_schedule (struct isis_area *, int);
-EXT int isis_run_spf (struct isis_area *, int, int);
-#ifdef ENABLE_IPV6
-EXT int isis_spf_schedule6 (struct isis_area *, int);
-#endif
-#undef EXT
+extern void spftree_area_init (struct isis_area *);
+extern int isis_spf_schedule (struct isis_area *, int);
+extern int isis_run_spf (struct isis_area *, int, int);
+extern int isis_spf_schedule6 (struct isis_area *, int);
 
 #endif /* _ISIS_SPF_H_ */

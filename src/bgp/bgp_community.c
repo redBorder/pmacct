@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /* 
@@ -24,14 +24,11 @@ along with GNU Zebra; see the file COPYING.  If not, write to the Free
 Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 02111-1307, USA.  */
 
-#define __BGP_COMMUNITY_C
-
 #include "pmacct.h"
 #include "bgp.h"
 
 /* Allocate a new communities value.  */
-static struct community *
-community_new (struct bgp_peer *peer)
+struct community *community_new (struct bgp_peer *peer)
 {
   struct bgp_misc_structs *bms;
   void *tmp;
@@ -45,7 +42,7 @@ community_new (struct bgp_peer *peer)
   tmp = malloc(sizeof (struct community));
   if (!tmp) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (community_new). Exiting ..\n", config.name, bms->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   memset(tmp, 0, sizeof (struct community));
 
@@ -62,8 +59,7 @@ community_free (struct community *com)
 }
 
 /* Add one community value to the community. */
-static void
-community_add_val (struct bgp_peer *peer, struct community *com, u_int32_t val)
+void community_add_val (struct bgp_peer *peer, struct community *com, u_int32_t val)
 {
   struct bgp_misc_structs *bms;
 
@@ -80,7 +76,7 @@ community_add_val (struct bgp_peer *peer, struct community *com, u_int32_t val)
     com->val = malloc(com_length (com));
     if (!com->val) {
       Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (community_add_val). Exiting ..\n", config.name, bms->log_str);
-      exit_all(1);
+      exit_gracefully(1);
     }
   }
 
@@ -138,8 +134,7 @@ community_delete (struct community *com1, struct community *com2)
 }
 
 /* Callback function from qsort(). */
-static int
-community_compare (const void *a1, const void *a2)
+int community_compare (const void *a1, const void *a2)
 {
   u_int32_t v1;
   u_int32_t v2;
@@ -170,8 +165,7 @@ community_include (struct community *com, u_int32_t val)
   return 0;
 }
 
-static u_int32_t
-community_val_get (struct community *com, int i)
+u_int32_t community_val_get(struct community *com, int i)
 {
   u_char *p;
   u_int32_t val;
@@ -245,7 +239,7 @@ community_com2str  (struct bgp_peer *peer, struct community *com)
       str = malloc(1);
       if (!str) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (community_com2str). Exiting ..\n", config.name, bms->log_str);
-	exit_all(1);
+	exit_gracefully(1);
       }
       str[0] = '\0';
       return str;
@@ -284,7 +278,7 @@ community_com2str  (struct bgp_peer *peer, struct community *com)
   str = pnt = malloc(len);
   if (!str) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (community_com2str). Exiting ..\n", config.name, bms->log_str);
-    exit_all(1);
+    exit_gracefully(1);
   }
   first = 1;
 
@@ -369,7 +363,8 @@ void
 community_unintern (struct bgp_peer *peer, struct community *com)
 {
   struct bgp_rt_structs *inter_domain_routing_db;
-  struct community *ret;
+  struct community *ret = NULL;
+  (void) ret;
 
   if (!peer) return;
   
@@ -450,4 +445,68 @@ community_init (int buckets, struct hash **loc_comhash)
 {
   (*loc_comhash) = hash_create (buckets, (unsigned int (*) (void *))community_hash_make,
 			 (int (*) (const void *, const void *))community_cmp);
+}
+
+
+int community_str2com_simple(const char *buf, u_int32_t *val)
+{
+  const char *p = buf;
+
+  /* Skip white space. */
+  while (isspace ((int) (*p))) p++;
+
+  /* Check the end of the line. */
+  if (*p == '\0') return ERR;
+
+  /* Community value. */
+  if (isdigit ((int) (*p))) {
+    int separator = 0;
+    int digit = 0;
+    u_int32_t community_low = 0;
+    u_int32_t community_high = 0;
+
+    while (isdigit ((int) (*p)) || (*p) == ':') {
+      if ((*p) == ':') {
+	if (separator) return ERR;
+	else {
+	  separator = TRUE;
+	  digit = FALSE;
+	  community_high = community_low << 16;
+	  community_low = 0;
+	}
+      }
+      else {
+        digit = TRUE;
+        community_low *= 10;
+        community_low += (*p - '0');
+      }
+
+      p++;
+    }
+
+    if (!digit) return ERR;
+
+    (*val) = community_high + community_low;
+
+    return FALSE;
+  }
+
+  return ERR;
+}
+
+struct community *community_dup(struct community *com)
+{
+  struct community *new;
+
+  new = malloc(sizeof(struct community));
+
+  new->size = com->size;
+
+  if (new->size) {
+    new->val = malloc(com->size * 4);
+    memcpy(new->val, com->val, com->size * 4);
+  }
+  else new->val = NULL;
+
+  return new;
 }

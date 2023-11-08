@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
 */
 
 /* 
@@ -28,6 +28,7 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 
 #define DEFAULT_BGP_INFO_HASH 13
 #define DEFAULT_BGP_INFO_PER_PEER_HASH 1
+#define BGP_NODE_VECTOR_MAX_DEPTH 128
 
 struct bgp_table
 {
@@ -64,12 +65,14 @@ struct bgp_msg_extra_data {
   void *data;
 };
 
-struct bgp_info_extra
+struct bgp_attr_extra
 {
+  u_int8_t bitmap;
   rd_t rd;
   u_char label[3];
   path_id_t path_id;
-  struct bgp_msg_extra_data bmed;
+  u_int64_t aigp;
+  u_int32_t psid_li;
 };
 
 struct bgp_info
@@ -78,45 +81,55 @@ struct bgp_info
   struct bgp_info *prev;
   struct bgp_peer *peer;
   struct bgp_attr *attr;
-  struct bgp_info_extra *extra;
+  struct bgp_attr_extra *attr_extra;
+  struct bgp_msg_extra_data bmed;
 };
 
 struct node_match_cmp_term2 {
   struct bgp_peer *peer;
+  afi_t afi;
   safi_t safi;
   rd_t *rd;
   struct host_addr *peer_dst_ip;
+
+  /* mainly used for RPKI purposes */
+  struct prefix *p;
+  as_t last_as;
+  int ret_code;
 };
 
+struct bgp_node_vector_entry {
+  struct prefix *p;
+  struct bgp_info *info;
+};
+
+struct bgp_node_vector {
+  u_int8_t entries;
+  struct bgp_node_vector_entry v[BGP_NODE_VECTOR_MAX_DEPTH];
+}; 
+
 /* Prototypes */
-#if (!defined __BGP_TABLE_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT struct bgp_table *bgp_table_init (afi_t, safi_t);
-EXT void bgp_unlock_node (struct bgp_peer *, struct bgp_node *node);
-EXT struct bgp_node *bgp_table_top (struct bgp_peer *, const struct bgp_table *const);
-EXT struct bgp_node *bgp_route_next (struct bgp_peer *, struct bgp_node *);
-EXT struct bgp_node *bgp_route_next_until (struct bgp_peer *, struct bgp_node *, struct bgp_node *);
-EXT struct bgp_node *bgp_node_get (struct bgp_peer *, struct bgp_table *const, struct prefix *);
-EXT struct bgp_node *bgp_lock_node (struct bgp_peer *, struct bgp_node *node);
-EXT void bgp_node_match (const struct bgp_table *, struct prefix *, struct bgp_peer *,
+extern struct bgp_table *bgp_table_init (afi_t, safi_t);
+extern void bgp_unlock_node (struct bgp_peer *, struct bgp_node *node);
+extern struct bgp_node *bgp_table_top (struct bgp_peer *, const struct bgp_table *const);
+extern struct bgp_node *bgp_route_next (struct bgp_peer *, struct bgp_node *);
+extern struct bgp_node *bgp_node_get (struct bgp_peer *, struct bgp_table *const, struct prefix *);
+extern struct bgp_node *bgp_lock_node (struct bgp_peer *, struct bgp_node *node);
+extern void bgp_node_vector_debug(struct bgp_node_vector *, struct prefix *);
+extern void bgp_node_match (const struct bgp_table *, struct prefix *, struct bgp_peer *,
 			 u_int32_t (*modulo_func)(struct bgp_peer *, path_id_t *, int),
 			 int (*cmp_func)(struct bgp_info *, struct node_match_cmp_term2 *),
-			 struct node_match_cmp_term2 *,
+			 struct node_match_cmp_term2 *, struct bgp_node_vector *,
 			 struct bgp_node **result_node, struct bgp_info **result_info);
-EXT void bgp_node_match_ipv4 (const struct bgp_table *, struct in_addr *, struct bgp_peer *,
+extern void bgp_node_match_ipv4 (const struct bgp_table *, struct in_addr *, struct bgp_peer *,
 			      u_int32_t (*modulo_func)(struct bgp_peer *, path_id_t *, int),
 			      int (*cmp_func)(struct bgp_info *, struct node_match_cmp_term2 *),
-			      struct node_match_cmp_term2 *,
+			      struct node_match_cmp_term2 *, struct bgp_node_vector *,
 			      struct bgp_node **result_node, struct bgp_info **result_info);
-#ifdef ENABLE_IPV6
-EXT void bgp_node_match_ipv6 (const struct bgp_table *, struct in6_addr *, struct bgp_peer *,
+extern void bgp_node_match_ipv6 (const struct bgp_table *, struct in6_addr *, struct bgp_peer *,
 			      u_int32_t (*modulo_func)(struct bgp_peer *, path_id_t *, int),
 			      int (*cmp_func)(struct bgp_info *, struct node_match_cmp_term2 *),
-			      struct node_match_cmp_term2 *,
+			      struct node_match_cmp_term2 *, struct bgp_node_vector *,
 			      struct bgp_node **result_node, struct bgp_info **result_info);
-#endif /* ENABLE_IPV6 */
-#undef EXT
+extern void bgp_table_free (struct bgp_table *);
 #endif 

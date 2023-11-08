@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -57,22 +57,21 @@ struct community
 #define com_nthval(X,n)  ((X)->val + (n))
 
 /* Prototypes of communities attribute functions.  */
-#if (!defined __BGP_COMMUNITY_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void community_init (int, struct hash **);
-EXT void community_free (struct community *);
-EXT struct community *community_uniq_sort (struct bgp_peer *, struct community *);
-EXT struct community *community_intern (struct bgp_peer *, struct community *);
-EXT void community_unintern (struct bgp_peer *, struct community *);
-EXT unsigned int community_hash_make (struct community *);
-EXT int community_cmp (const struct community *, const struct community *);
-EXT struct community *community_delete (struct community *, struct community *);
-EXT struct community *community_parse (struct bgp_peer *, u_int32_t *, u_short);
-EXT int community_include (struct community *, u_int32_t);
-EXT void community_del_val (struct community *, u_int32_t *);
-
-#undef EXT
+extern struct community *community_new (struct bgp_peer *);
+extern void community_init (int, struct hash **);
+extern void community_free (struct community *);
+extern struct community *community_uniq_sort (struct bgp_peer *, struct community *);
+extern struct community *community_intern (struct bgp_peer *, struct community *);
+extern void community_unintern (struct bgp_peer *, struct community *);
+extern unsigned int community_hash_make (struct community *);
+extern int community_cmp (const struct community *, const struct community *);
+extern struct community *community_delete (struct community *, struct community *);
+extern struct community *community_parse (struct bgp_peer *, u_int32_t *, u_short);
+extern int community_include (struct community *, u_int32_t);
+extern void community_del_val (struct community *, u_int32_t *);
+extern int community_str2com_simple(const char *, u_int32_t *);
+extern void community_add_val(struct bgp_peer *, struct community *, u_int32_t);
+extern u_int32_t community_val_get(struct community *, int);
+extern int community_compare(const void *, const void *);
+extern struct community *community_dup(struct community *);
 #endif

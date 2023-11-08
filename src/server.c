@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,8 +19,6 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __SERVER_C
-
 /* includes */
 #include "pmacct.h"
 #include "imt_plugin.h"
@@ -38,7 +36,7 @@ int build_query_server(char *path_ptr)
   sd=socket(AF_UNIX, SOCK_STREAM, 0);
   if (sd < 0) {
     Log(LOG_ERR, "ERROR ( %s/%s ): cannot open socket.\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   sAddr.sun_family = AF_UNIX;
@@ -48,7 +46,7 @@ int build_query_server(char *path_ptr)
   rc = bind(sd, (struct sockaddr *) &sAddr,sizeof(sAddr));
   if (rc < 0) { 
     Log(LOG_ERR, "ERROR ( %s/%s ): cannot bind to file %s .\n", config.name, config.type, path_ptr);
-    exit_plugin(1);
+    exit_gracefully(1);
   } 
 
   chmod(path_ptr, S_IRUSR|S_IWUSR|S_IXUSR|
@@ -65,7 +63,7 @@ int build_query_server(char *path_ptr)
 
 void process_query_data(int sd, unsigned char *buf, int len, struct extra_primitives *extras, int datasize, int forked)
 {
-  struct acc *acc_elem = 0, tmpbuf;
+  struct acc *acc_elem = 0;
   struct bucket_desc bd;
   struct query_header *q, *uq;
   struct query_entry request;
@@ -88,7 +86,7 @@ void process_query_data(int sd, unsigned char *buf, int len, struct extra_primit
   custbuf = malloc(config.cpptrs.len);
   if (!dummy_pcust || !custbuf) {
     Log(LOG_ERR, "ERROR ( %s/%s ): Unable to malloc() dummy_pcust. Exiting.\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   memset(&dummy, 0, sizeof(struct pkt_data));
@@ -247,7 +245,7 @@ void process_query_data(int sd, unsigned char *buf, int len, struct extra_primit
     for (j = 0; j < uq->num; j++, bufptr += sizeof(struct query_entry)) {
       memcpy(&request, bufptr, sizeof(struct query_entry));
       Log(LOG_DEBUG, "DEBUG ( %s/%s ): Searching into accounting structure ...\n", config.name, config.type); 
-      if (request.what_to_count == config.what_to_count && request.what_to_count_2 == config.what_to_count_2) { 
+      if (request.what_to_count == config.what_to_count && request.what_to_count_2 == config.what_to_count_2) {
         struct pkt_data pd_dummy;
 	struct primitives_ptrs prim_ptrs;
 
@@ -438,8 +436,7 @@ void process_query_data(int sd, unsigned char *buf, int len, struct extra_primit
     struct stripped_class dummy;
     u_int32_t idx = 0, max = 0;
 
-    /* XXX: we should try using pmct_get_max_entries() */
-    max = q->num = config.classifier_table_num;
+    max = q->num = pmct_find_first_free();
     if (!q->num && class) max = q->num = MAX_CLASSIFIERS;
 
     while (idx < max) {
@@ -513,6 +510,7 @@ void mask_elem(struct pkt_primitives *d1, struct pkt_bgp_primitives *d2, struct 
   if (w & COUNT_SRC_MAC) memcpy(d1->eth_shost, s1->eth_shost, ETH_ADDR_LEN); 
   if (w & COUNT_DST_MAC) memcpy(d1->eth_dhost, s1->eth_dhost, ETH_ADDR_LEN); 
   if (w & COUNT_VLAN) d1->vlan_id = s1->vlan_id; 
+  if (w2 & COUNT_OUT_VLAN) d1->out_vlan_id = s1->out_vlan_id;
   if (w & COUNT_COS) d1->cos = s1->cos; 
   if (w & COUNT_ETHERTYPE) d1->etype = s1->etype; 
 #endif
@@ -535,30 +533,43 @@ void mask_elem(struct pkt_primitives *d1, struct pkt_bgp_primitives *d2, struct 
   if (w & COUNT_CLASS) d1->class = s1->class; 
   if (w2 & COUNT_EXPORT_PROTO_SEQNO) memcpy(&d1->export_proto_seqno, &s1->export_proto_seqno, sizeof(d1->export_proto_seqno));
   if (w2 & COUNT_EXPORT_PROTO_VERSION) memcpy(&d1->export_proto_version, &s1->export_proto_version, sizeof(d1->export_proto_version));
+  if (w2 & COUNT_EXPORT_PROTO_SYSID) memcpy(&d1->export_proto_sysid, &s1->export_proto_sysid, sizeof(d1->export_proto_sysid));
 
 #if defined (WITH_GEOIP) || defined (WITH_GEOIPV2)
   if (w2 & COUNT_SRC_HOST_COUNTRY) memcpy(&d1->src_ip_country, &s1->src_ip_country, sizeof(d1->src_ip_country)); 
   if (w2 & COUNT_DST_HOST_COUNTRY) memcpy(&d1->dst_ip_country, &s1->dst_ip_country, sizeof(d1->dst_ip_country)); 
   if (w2 & COUNT_SRC_HOST_POCODE) memcpy(&d1->src_ip_pocode, &s1->src_ip_pocode, sizeof(d1->src_ip_pocode)); 
-  if (w2 & COUNT_DST_HOST_POCODE) memcpy(&d1->dst_ip_pocode, &s1->dst_ip_pocode, sizeof(d1->dst_ip_pocode)); 
+  if (w2 & COUNT_DST_HOST_POCODE) memcpy(&d1->dst_ip_pocode, &s1->dst_ip_pocode, sizeof(d1->dst_ip_pocode));
+  if (w2 & COUNT_SRC_HOST_COORDS) {
+    memcpy(&d1->src_ip_lat, &s1->src_ip_lat, sizeof(d1->src_ip_lat));
+    memcpy(&d1->src_ip_lon, &s1->src_ip_lon, sizeof(d1->src_ip_lon));
+  }
+  if (w2 & COUNT_DST_HOST_COORDS) {
+    memcpy(&d1->dst_ip_lat, &s1->dst_ip_lat, sizeof(d1->dst_ip_lat));
+    memcpy(&d1->dst_ip_lon, &s1->dst_ip_lon, sizeof(d1->dst_ip_lon));
+  } 
 #endif
 
 #if defined (WITH_NDPI)
-  if (w2 & COUNT_NDPI_CLASS) memcpy(&d1->ndpi_class, &s1->class, sizeof(d1->ndpi_class)); 
+  if (w2 & COUNT_NDPI_CLASS) memcpy(&d1->ndpi_class, &s1->ndpi_class, sizeof(d1->ndpi_class));
 #endif
 
   if (w2 & COUNT_SAMPLING_RATE) d1->sampling_rate = s1->sampling_rate; 
+  if (w2 & COUNT_SAMPLING_DIRECTION) memcpy(&d1->sampling_direction, &s1->sampling_direction, sizeof(d1->sampling_direction)); 
 
   if (extras->off_pkt_bgp_primitives && s2) {
     if (w & COUNT_LOCAL_PREF) d2->local_pref = s2->local_pref;
     if (w & COUNT_SRC_LOCAL_PREF) d2->src_local_pref = s2->src_local_pref;
     if (w & COUNT_MED) d2->med = s2->med;
     if (w & COUNT_SRC_MED) d2->src_med = s2->src_med;
+    if (w2 & COUNT_DST_ROA) d2->dst_roa = s2->dst_roa;
+    if (w2 & COUNT_SRC_ROA) d2->src_roa = s2->src_roa;
     if (w & COUNT_PEER_SRC_AS) d2->peer_src_as = s2->peer_src_as;
     if (w & COUNT_PEER_DST_AS) d2->peer_dst_as = s2->peer_dst_as;
     if (w & COUNT_PEER_SRC_IP) memcpy(&d2->peer_src_ip, &s2->peer_src_ip, sizeof(d2->peer_src_ip));
     if (w & COUNT_PEER_DST_IP) memcpy(&d2->peer_dst_ip, &s2->peer_dst_ip, sizeof(d2->peer_dst_ip));
     if (w & COUNT_MPLS_VPN_RD) memcpy(&d2->mpls_vpn_rd, &s2->mpls_vpn_rd, sizeof(rd_t)); 
+    if (w2 & COUNT_MPLS_PW_ID) memcpy(&d2->mpls_pw_id, &s2->mpls_pw_id, sizeof(d2->mpls_pw_id)); 
   }
 
   if (extras->off_pkt_lbgp_primitives && s5) {
@@ -578,22 +589,29 @@ void mask_elem(struct pkt_primitives *d1, struct pkt_bgp_primitives *d2, struct 
     if (w2 & COUNT_POST_NAT_SRC_PORT) d3->post_nat_src_port = s3->post_nat_src_port;
     if (w2 & COUNT_POST_NAT_DST_PORT) d3->post_nat_dst_port = s3->post_nat_dst_port;
     if (w2 & COUNT_NAT_EVENT) d3->nat_event = s3->nat_event;
+    if (w2 & COUNT_FW_EVENT) d3->fw_event = s3->fw_event;
+    if (w2 & COUNT_FWD_STATUS) d3->fwd_status = s3->fwd_status;
     if (w2 & COUNT_TIMESTAMP_START) memcpy(&d3->timestamp_start, &s3->timestamp_start, sizeof(struct timeval));
     if (w2 & COUNT_TIMESTAMP_END) memcpy(&d3->timestamp_end, &s3->timestamp_end, sizeof(struct timeval));
     if (w2 & COUNT_TIMESTAMP_ARRIVAL) memcpy(&d3->timestamp_arrival, &s3->timestamp_arrival, sizeof(struct timeval));
+    if (w2 & COUNT_EXPORT_PROTO_TIME) memcpy(&d3->timestamp_export, &s3->timestamp_export, sizeof(struct timeval));
   }
 
   if (extras->off_pkt_mpls_primitives && s4) {
     if (w2 & COUNT_MPLS_LABEL_TOP) d4->mpls_label_top = s4->mpls_label_top;
     if (w2 & COUNT_MPLS_LABEL_BOTTOM) d4->mpls_label_bottom = s4->mpls_label_bottom;
-    if (w2 & COUNT_MPLS_STACK_DEPTH) d4->mpls_stack_depth = s4->mpls_stack_depth;
   }
 
   if (extras->off_pkt_tun_primitives && s6) {
+    if (w2 & COUNT_TUNNEL_SRC_MAC) memcpy(&d6->tunnel_eth_shost, &s6->tunnel_eth_shost, sizeof(d6->tunnel_eth_shost));
+    if (w2 & COUNT_TUNNEL_DST_MAC) memcpy(&d6->tunnel_eth_dhost, &s6->tunnel_eth_dhost, sizeof(d6->tunnel_eth_dhost));
     if (w2 & COUNT_TUNNEL_SRC_HOST) memcpy(&d6->tunnel_src_ip, &s6->tunnel_src_ip, sizeof(d6->tunnel_src_ip));
     if (w2 & COUNT_TUNNEL_DST_HOST) memcpy(&d6->tunnel_src_ip, &s6->tunnel_dst_ip, sizeof(d6->tunnel_dst_ip));
     if (w2 & COUNT_TUNNEL_IP_PROTO) memcpy(&d6->tunnel_proto, &s6->tunnel_proto, sizeof(d6->tunnel_proto));
     if (w2 & COUNT_TUNNEL_IP_TOS) memcpy(&d6->tunnel_tos, &s6->tunnel_tos, sizeof(d6->tunnel_tos));
+    if (w2 & COUNT_TUNNEL_SRC_PORT) memcpy(&d6->tunnel_src_port, &s6->tunnel_src_port, sizeof(d6->tunnel_src_port));
+    if (w2 & COUNT_TUNNEL_DST_PORT) memcpy(&d6->tunnel_dst_port, &s6->tunnel_dst_port, sizeof(d6->tunnel_dst_port));
+    if (w2 & COUNT_VXLAN) memcpy(&d6->tunnel_id, &s6->tunnel_id, sizeof(d6->tunnel_id));
   }
 }
 
@@ -627,19 +645,6 @@ void Accumulate_Counters(struct pkt_data *abuf, struct acc *elem)
 int test_zero_elem(struct acc *elem)
 {
   if (elem && elem->flow_type && !elem->reset_flag) return FALSE;
-
-/*
-  if (elem) {
-    if (elem->flow_type == NF9_FTYPE_NAT_EVENT) {
-      if (elem->pnat && elem->pnat->nat_event) return FALSE;
-      else return TRUE;
-    }
-    else {
-      if (elem->bytes_counter && !elem->reset_flag) return FALSE;
-      else return TRUE;
-    }
-  }
-*/
 
   return TRUE;
 }

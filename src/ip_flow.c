@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,15 +19,19 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __IP_FLOW_C
-
 /* includes */
 #include "pmacct.h"
 #include "pmacct-data.h"
 #include "plugin_hooks.h"
 #include "ip_flow.h"
-#include "classifier.h"
 #include "jhash.h"
+
+/* Global variables */
+struct ip_flow **ip_flow_table;
+struct flow_lru_l flow_lru_list;
+
+struct ip_flow6 **ip_flow_table6;
+struct flow_lru_l6 flow_lru_list6;
 
 u_int32_t flt_total_nodes;  
 time_t flt_prune_deadline;
@@ -36,18 +40,14 @@ time_t flow_generic_lifetime;
 time_t flow_tcpest_lifetime;
 u_int32_t flt_trivial_hash_rnd = 140281; /* ummmh */
 
-#if defined ENABLE_IPV6
 u_int32_t flt6_total_nodes;
 time_t flt6_prune_deadline;
 time_t flt6_emergency_prune;
-#endif
 
 void init_ip_flow_handler()
 {
   init_ip4_flow_handler();
-#if defined ENABLE_IPV6
   init_ip6_flow_handler();
-#endif
 }
 
 void init_ip4_flow_handler()
@@ -74,8 +74,7 @@ void init_ip4_flow_handler()
 
   if (config.flow_tcp_lifetime) flow_tcpest_lifetime = config.flow_tcp_lifetime;
   else {
-    if (config.classifiers_path) flow_tcpest_lifetime = FLOW_TCPEST_LIFETIME;
-    else flow_tcpest_lifetime = flow_generic_lifetime;
+    flow_tcpest_lifetime = flow_generic_lifetime;
   }
 }
 
@@ -132,7 +131,6 @@ void clear_tcp_flow_cmn(struct ip_flow_common *fp, unsigned int idx)
   fp->last[idx].tv_usec = 0;
   fp->tcp_flags[idx] = 0;
   fp->class[idx] = 0;
-  memset(&fp->cst[idx], 0, CSSz);
 } 
 
 void find_flow(struct timeval *now, struct packet_ptrs *pptrs)
@@ -160,7 +158,7 @@ void find_flow(struct timeval *now, struct packet_ptrs *pptrs)
 	fp->cmn.last[idx].tv_sec = now->tv_sec;
 	fp->cmn.last[idx].tv_usec = now->tv_usec;
 	pptrs->new_flow = FALSE; 
-	if (config.classifiers_path) evaluate_classifiers(pptrs, &fp->cmn, idx);
+
 	return;
       }
       else {
@@ -170,7 +168,7 @@ void find_flow(struct timeval *now, struct packet_ptrs *pptrs)
 	fp->cmn.last[idx].tv_sec = now->tv_sec;
 	fp->cmn.last[idx].tv_usec = now->tv_usec;
 	pptrs->new_flow = TRUE;
-	if (config.classifiers_path) evaluate_classifiers(pptrs, &fp->cmn, idx);
+
 	return;
       } 
     }
@@ -189,7 +187,7 @@ void create_flow(struct timeval *now, struct ip_flow *fp, u_int8_t is_candidate,
 
   if (!flt_total_nodes) {
     if (now->tv_sec > flt_emergency_prune+FLOW_TABLE_EMER_PRUNE_INTERVAL) {
-      Log(LOG_INFO, "INFO ( %s/core ): Flow/4 buffer full. Skipping flows.\n", config.name); 
+      Log(LOG_INFO, "INFO ( %s/core ): Flow/4 buffer full. Skipping flows. Increase %s_flow_buffer_size\n", config.name, config.progname); 
       flt_emergency_prune = now->tv_sec;
       prune_old_flows(now);
     }
@@ -204,7 +202,7 @@ void create_flow(struct timeval *now, struct ip_flow *fp, u_int8_t is_candidate,
       newf = (struct ip_flow *) malloc(sizeof(struct ip_flow));
       if (!newf) { 
 	if (now->tv_sec > flt_emergency_prune+FLOW_TABLE_EMER_PRUNE_INTERVAL) {
-	  Log(LOG_INFO, "INFO ( %s/core ): Flow/4 buffer finished memory. Skipping flows.\n", config.name);
+	  Log(LOG_INFO, "INFO ( %s/core ): Flow/4 buffer finished memory. Skipping flows. Increase %s_flow_buffer_size\n", config.name, config.progname);
 	  flt_emergency_prune = now->tv_sec;
 	  prune_old_flows(now);
 	}
@@ -229,8 +227,7 @@ void create_flow(struct timeval *now, struct ip_flow *fp, u_int8_t is_candidate,
 	fp->lru_next = NULL;
 	flow_lru_list.last = fp;
       }
-      clear_context_chain(&fp->cmn, 0);
-      clear_context_chain(&fp->cmn, 1);
+
       memset(&fp->cmn, 0, sizeof(struct ip_flow_common));
     }
   }
@@ -241,7 +238,7 @@ void create_flow(struct timeval *now, struct ip_flow *fp, u_int8_t is_candidate,
     fp = (struct ip_flow *) malloc(sizeof(struct ip_flow));  
     if (!fp) {
       if (now->tv_sec > flt_emergency_prune+FLOW_TABLE_EMER_PRUNE_INTERVAL) {
-        Log(LOG_INFO, "INFO ( %s/core ): Flow/4 buffer finished memory. Skipping flows.\n", config.name);
+        Log(LOG_INFO, "INFO ( %s/core ): Flow/4 buffer finished memory. Skipping flows. Increase %s_flow_buffer_size\n", config.name, config.progname);
         flt_emergency_prune = now->tv_sec;
         prune_old_flows(now);
       }
@@ -267,7 +264,6 @@ void create_flow(struct timeval *now, struct ip_flow *fp, u_int8_t is_candidate,
   fp->cmn.last[idx].tv_usec = now->tv_usec; 
 
   pptrs->new_flow = TRUE;
-  if (config.classifiers_path) evaluate_classifiers(pptrs, &fp->cmn, idx); 
 }
 
 void prune_old_flows(struct timeval *now)
@@ -300,8 +296,6 @@ void prune_old_flows(struct timeval *now)
       }
       else fp->lru_prev->lru_next = NULL;
 
-      clear_context_chain(&fp->cmn, 0);
-      clear_context_chain(&fp->cmn, 1);
       free(fp);
       flt_total_nodes++;
 
@@ -393,7 +387,6 @@ unsigned int is_expired_uni(struct timeval *now, struct ip_flow_common *fp, unsi
   return FALSE;
 }
 
-#if defined ENABLE_IPV6
 void init_ip6_flow_handler()
 {
   int size;
@@ -417,8 +410,7 @@ void init_ip6_flow_handler()
 
   if (config.flow_tcp_lifetime) flow_tcpest_lifetime = config.flow_tcp_lifetime;
   else {
-    if (config.classifiers_path) flow_tcpest_lifetime = FLOW_TCPEST_LIFETIME;
-    else flow_tcpest_lifetime = flow_generic_lifetime;
+    flow_tcpest_lifetime = flow_generic_lifetime;
   }
 }
 
@@ -519,7 +511,7 @@ void find_flow6(struct timeval *now, struct packet_ptrs *pptrs)
 	fp->cmn.last[idx].tv_sec = now->tv_sec;
 	fp->cmn.last[idx].tv_usec = now->tv_usec;
 	pptrs->new_flow = FALSE;
-	if (config.classifiers_path) evaluate_classifiers(pptrs, &fp->cmn, idx);
+
 	return;
       }
       else {
@@ -529,7 +521,7 @@ void find_flow6(struct timeval *now, struct packet_ptrs *pptrs)
 	fp->cmn.last[idx].tv_sec = now->tv_sec;
 	fp->cmn.last[idx].tv_usec = now->tv_usec;
 	pptrs->new_flow = TRUE;
-	if (config.classifiers_path) evaluate_classifiers(pptrs, &fp->cmn, idx);
+
 	return;
       }
     }
@@ -537,7 +529,6 @@ void find_flow6(struct timeval *now, struct packet_ptrs *pptrs)
     last_seen = fp;
   }
 
-  create:
   if (candidate) create_flow6(now, candidate, TRUE, bucket, pptrs, iphp, tlhp, idx);
   else create_flow6(now, last_seen, FALSE, bucket, pptrs, iphp, tlhp, idx);
 }
@@ -549,7 +540,7 @@ void create_flow6(struct timeval *now, struct ip_flow6 *fp, u_int8_t is_candidat
 
   if (!flt6_total_nodes) {
     if (now->tv_sec > flt6_emergency_prune+FLOW_TABLE_EMER_PRUNE_INTERVAL) {
-      Log(LOG_INFO, "INFO ( %s/core ): Flow/6 buffer full. Skipping flows.\n", config.name);
+      Log(LOG_INFO, "INFO ( %s/core ): Flow/6 buffer full. Skipping flows. Increase %s_flow_buffer_size\n", config.name, config.progname);
       flt6_emergency_prune = now->tv_sec;
       prune_old_flows6(now);
     }
@@ -564,7 +555,7 @@ void create_flow6(struct timeval *now, struct ip_flow6 *fp, u_int8_t is_candidat
       newf = (struct ip_flow6 *) malloc(sizeof(struct ip_flow6));
       if (!newf) {
 	if (now->tv_sec > flt6_emergency_prune+FLOW_TABLE_EMER_PRUNE_INTERVAL) {
-	  Log(LOG_INFO, "INFO ( %s/core ): Flow/6 buffer full. Skipping flows.\n", config.name);
+	  Log(LOG_INFO, "INFO ( %s/core ): Flow/6 buffer full. Skipping flows. Increase %s_flow_buffer_size\n", config.name, config.progname);
 	  flt6_emergency_prune = now->tv_sec;
 	  prune_old_flows6(now);
 	}
@@ -589,8 +580,7 @@ void create_flow6(struct timeval *now, struct ip_flow6 *fp, u_int8_t is_candidat
         fp->lru_next = NULL;
         flow_lru_list6.last = fp;
       }
-      clear_context_chain(&fp->cmn, 0);
-      clear_context_chain(&fp->cmn, 1);
+
       memset(&fp->cmn, 0, sizeof(struct ip_flow_common));
     }
   }
@@ -600,7 +590,7 @@ void create_flow6(struct timeval *now, struct ip_flow6 *fp, u_int8_t is_candidat
     fp = (struct ip_flow6 *) malloc(sizeof(struct ip_flow6));
     if (!fp) {
       if (now->tv_sec > flt6_emergency_prune+FLOW_TABLE_EMER_PRUNE_INTERVAL) {
-        Log(LOG_INFO, "INFO ( %s/core ): Flow/6 buffer full. Skipping flows.\n", config.name);
+        Log(LOG_INFO, "INFO ( %s/core ): Flow/6 buffer full. Skipping flows. Increase %s_flow_buffer_size\n", config.name, config.progname);
         flt6_emergency_prune = now->tv_sec;
         prune_old_flows6(now);
       }
@@ -626,7 +616,6 @@ void create_flow6(struct timeval *now, struct ip_flow6 *fp, u_int8_t is_candidat
   fp->cmn.last[idx].tv_usec = now->tv_usec;
 
   pptrs->new_flow = TRUE;
-  if (config.classifiers_path) evaluate_classifiers(pptrs, &fp->cmn, idx); 
 }
 
 void prune_old_flows6(struct timeval *now)
@@ -659,8 +648,6 @@ void prune_old_flows6(struct timeval *now)
       }
       else fp->lru_prev->lru_next = NULL;
 
-      clear_context_chain(&fp->cmn, 0);
-      clear_context_chain(&fp->cmn, 1);
       free(fp);
       flt6_total_nodes++;
 
@@ -675,4 +662,3 @@ void prune_old_flows6(struct timeval *now)
 
   flow_lru_list6.last = last_seen;
 }
-#endif

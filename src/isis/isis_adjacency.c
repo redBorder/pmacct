@@ -21,13 +21,10 @@
  * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 
-#define __ISIS_ADJACENCY_C
-
 #include "pmacct.h"
 #include "isis.h"
 
 #include "hash.h"
-#include "linklist.h"
 
 #include "dict.h"
 #include "thread.h"
@@ -58,7 +55,6 @@ isis_new_adj (u_char * id, u_char * snpa, int level,
 	      struct isis_circuit *circuit)
 {
   struct isis_adjacency *adj;
-  int i;
 
   adj = adj_alloc (id);		/* P2P kludge */
 
@@ -83,12 +79,12 @@ isis_new_adj (u_char * id, u_char * snpa, int level,
 }
 
 struct isis_adjacency *
-isis_adj_lookup (u_char * sysid, struct list *adjdb)
+isis_adj_lookup (u_char * sysid, struct pm_list *adjdb)
 {
   struct isis_adjacency *adj;
-  struct listnode *node;
+  struct pm_listnode *node;
 
-  for (ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
+  for (PM_ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
     if (memcmp (adj->sysid, sysid, ISIS_SYS_ID_LEN) == 0)
       return adj;
 
@@ -96,12 +92,12 @@ isis_adj_lookup (u_char * sysid, struct list *adjdb)
 }
 
 struct isis_adjacency *
-isis_adj_lookup_snpa (u_char * ssnpa, struct list *adjdb)
+isis_adj_lookup_snpa (u_char * ssnpa, struct pm_list *adjdb)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_adjacency *adj;
 
-  for (ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
+  for (PM_ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
     if (memcmp (adj->snpa, ssnpa, ETH_ALEN) == 0)
       return adj;
 
@@ -109,22 +105,20 @@ isis_adj_lookup_snpa (u_char * ssnpa, struct list *adjdb)
 }
 
 void
-isis_delete_adj (struct isis_adjacency *adj, struct list *adjdb)
+isis_delete_adj (struct isis_adjacency *adj, struct pm_list *adjdb)
 {
   if (!adj)
     return;
   /* When we recieve a NULL list, we will know its p2p. */
   if (adjdb)
-    isis_listnode_delete (adjdb, adj);
+    pm_listnode_delete (adjdb, adj);
 
   memset(&adj->expire, 0, sizeof(struct timeval));
 
   if (adj->ipv4_addrs)
-    isis_list_delete (adj->ipv4_addrs);
-#ifdef ENABLE_IPV6
+    pm_list_delete (adj->ipv4_addrs);
   if (adj->ipv6_addrs)
-    isis_list_delete (adj->ipv6_addrs);
-#endif
+    pm_list_delete (adj->ipv6_addrs);
   
   free(adj);
   return;
@@ -135,7 +129,6 @@ isis_adj_state_change (struct isis_adjacency *adj, enum isis_adj_state state,
 		       const char *reason)
 {
   int old_state;
-  int level = adj->level;
   struct isis_circuit *circuit;
 
   old_state = adj->adj_state;
@@ -167,13 +160,11 @@ isis_adj_state_change (struct isis_adjacency *adj, enum isis_adj_state state,
 int
 isis_adj_expire (struct isis_adjacency *adj)
 {
-  int level;
 
   /*
    * Get the adjacency
    */
   assert (adj);
-  level = adj->level;
   memset(&adj->expire, 0, sizeof(struct timeval));
 
   /* trigger the adj expire event */
@@ -182,41 +173,22 @@ isis_adj_expire (struct isis_adjacency *adj)
   return 0;
 }
 
-static const char *
-adj_state2string (int state)
-{
-
-  switch (state)
-    {
-    case ISIS_ADJ_INITIALIZING:
-      return "Initializing";
-    case ISIS_ADJ_UP:
-      return "Up";
-    case ISIS_ADJ_DOWN:
-      return "Down";
-    default:
-      return "Unknown";
-    }
-
-  return NULL;			/* not reached */
-}
-
 void
-isis_adjdb_iterate (struct list *adjdb, void (*func) (struct isis_adjacency *,
+isis_adjdb_iterate (struct pm_list *adjdb, void (*func) (struct isis_adjacency *,
 						      void *), void *arg)
 {
-  struct listnode *node, *nnode;
+  struct pm_listnode *node, *nnode;
   struct isis_adjacency *adj;
 
-  for (ALL_LIST_ELEMENTS (adjdb, node, nnode, adj))
+  for (PM_ALL_LIST_ELEMENTS (adjdb, node, nnode, adj))
     (*func) (adj, arg);
 }
 
 void
-isis_adj_build_neigh_list (struct list *adjdb, struct list *list)
+isis_adj_build_neigh_list (struct pm_list *adjdb, struct pm_list *list)
 {
   struct isis_adjacency *adj;
-  struct listnode *node;
+  struct pm_listnode *node;
 
   if (!list)
     {
@@ -224,7 +196,7 @@ isis_adj_build_neigh_list (struct list *adjdb, struct list *list)
       return;
     }
 
-  for (ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
+  for (PM_ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
     {
       if (!adj)
 	{
@@ -234,16 +206,16 @@ isis_adj_build_neigh_list (struct list *adjdb, struct list *list)
 
       if ((adj->adj_state == ISIS_ADJ_UP ||
 	   adj->adj_state == ISIS_ADJ_INITIALIZING))
-	isis_listnode_add (list, adj->snpa);
+	pm_listnode_add (list, adj->snpa);
     }
   return;
 }
 
 void
-isis_adj_build_up_list (struct list *adjdb, struct list *list)
+isis_adj_build_up_list (struct pm_list *adjdb, struct pm_list *list)
 {
   struct isis_adjacency *adj;
-  struct listnode *node;
+  struct pm_listnode *node;
 
   if (!list)
     {
@@ -251,7 +223,7 @@ isis_adj_build_up_list (struct list *adjdb, struct list *list)
       return;
     }
 
-  for (ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
+  for (PM_ALL_LIST_ELEMENTS_RO (adjdb, node, adj))
     {
       if (!adj)
 	{
@@ -260,7 +232,7 @@ isis_adj_build_up_list (struct list *adjdb, struct list *list)
 	}
 
       if (adj->adj_state == ISIS_ADJ_UP)
-	isis_listnode_add (list, adj);
+	pm_listnode_add (list, adj);
     }
 
   return;

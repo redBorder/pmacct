@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,8 +19,6 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __ACCT_C
-
 /* includes */
 #include "pmacct.h"
 #include "imt_plugin.h"
@@ -37,8 +35,8 @@ struct acc *search_accounting_structure(struct primitives_ptrs *prim_ptrs)
   struct pkt_nat_primitives *pnat = prim_ptrs->pnat;
   struct pkt_mpls_primitives *pmpls = prim_ptrs->pmpls;
   struct pkt_tunnel_primitives *ptun = prim_ptrs->ptun;
-  char *pcust = prim_ptrs->pcust;
-  struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
+  u_char *pcust = prim_ptrs->pcust;
+  //struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
   struct acc *elem_acc;
   unsigned int hash, pos;
   unsigned int pp_size = sizeof(struct pkt_primitives); 
@@ -83,7 +81,7 @@ int compare_accounting_structure(struct acc *elem, struct primitives_ptrs *prim_
   struct pkt_nat_primitives *pnat = prim_ptrs->pnat;
   struct pkt_mpls_primitives *pmpls = prim_ptrs->pmpls;
   struct pkt_tunnel_primitives *ptun = prim_ptrs->ptun;
-  char *pcust = prim_ptrs->pcust;
+  u_char *pcust = prim_ptrs->pcust;
   struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
   int res_data = TRUE, res_bgp = TRUE, res_nat = TRUE, res_mpls = TRUE, res_tun = TRUE;
   int res_cust = TRUE, res_vlen = TRUE, res_lbgp = TRUE;
@@ -118,7 +116,7 @@ int compare_accounting_structure(struct acc *elem, struct primitives_ptrs *prim_
   if (pvlen && elem->pvlen) res_vlen = vlen_prims_cmp(elem->pvlen, pvlen);
   else res_vlen = FALSE;
 
-  return res_data | res_bgp | res_lbgp | res_nat | res_mpls | res_cust | res_vlen;
+  return res_data | res_bgp | res_lbgp | res_nat | res_mpls | res_tun | res_cust | res_vlen;
 }
 
 void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
@@ -130,7 +128,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
   struct pkt_nat_primitives *pnat = prim_ptrs->pnat;
   struct pkt_mpls_primitives *pmpls = prim_ptrs->pmpls;
   struct pkt_tunnel_primitives *ptun = prim_ptrs->ptun;
-  char *pcust = prim_ptrs->pcust;
+  u_char *pcust = prim_ptrs->pcust;
   struct pkt_vlen_hdr_primitives *pvlen = prim_ptrs->pvlen;
   struct acc *elem_acc;
   unsigned char *elem, *new_elem;
@@ -144,33 +142,6 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
   unsigned int pt_size = sizeof(struct pkt_tunnel_primitives);
   unsigned int pc_size = config.cpptrs.len;
   unsigned int clb_size = sizeof(struct cache_legacy_bgp_primitives);
-
-  /* We are classifing packets. We have a non-zero bytes accumulator (ba)
-     and a non-zero class. Before accounting ba to this class, we have to
-     remove ba from class zero. */ 
-  if (config.what_to_count & COUNT_CLASS && data->cst.ba && data->primitives.class) {
-    pm_class_t lclass = data->primitives.class;
-
-    data->primitives.class = 0;
-    elem_acc = search_accounting_structure(prim_ptrs);
-    data->primitives.class = lclass;
-
-    /* We can assign the flow to a new class only if we are able to subtract
-       the accumulator from the zero-class. If this is not the case, we will
-       discard the accumulators. The assumption is that accumulators are not
-       retroactive */
-    if (elem_acc) {
-      if (timeval_cmp(&data->cst.stamp, &elem_acc->rstamp) >= 0 && 
-	  timeval_cmp(&data->cst.stamp, &table_reset_stamp) >= 0) {
-	/* MIN(): ToS issue */
-        elem_acc->bytes_counter -= MIN(elem_acc->bytes_counter, data->cst.ba);
-        elem_acc->packet_counter -= MIN(elem_acc->packet_counter, data->cst.pa);
-        elem_acc->flow_counter -= MIN(elem_acc->flow_counter, data->cst.fa);
-      } 
-      else memset(&data->cst, 0, CSSz);
-    }
-    else memset(&data->cst, 0, CSSz);
-  } 
 
   elem = a;
 
@@ -198,12 +169,9 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->flow_counter += data->flo_num;
         elem_acc->bytes_counter += data->pkt_len;
 	elem_acc->tcp_flags |= data->tcp_flags;
+	elem_acc->tunnel_tcp_flags |= data->tunnel_tcp_flags;
         elem_acc->flow_type = data->flow_type; 
-        if (config.what_to_count & COUNT_CLASS) {
-          elem_acc->packet_counter += data->cst.pa;
-          elem_acc->bytes_counter += data->cst.ba;
-          elem_acc->flow_counter += data->cst.fa;
-        }
+
         return;
       }
     }
@@ -220,13 +188,10 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->flow_counter += data->flo_num;
         elem_acc->bytes_counter += data->pkt_len;
 	elem_acc->tcp_flags |= data->tcp_flags;
+	elem_acc->tunnel_tcp_flags |= data->tunnel_tcp_flags;
         elem_acc->flow_type = data->flow_type;
-	if (config.what_to_count & COUNT_CLASS) {
-	  elem_acc->packet_counter += data->cst.pa;
-	  elem_acc->bytes_counter += data->cst.ba;
-          elem_acc->flow_counter += data->cst.fa;
-	}
         lru_elem_ptr[pos] = elem_acc;
+
         return;
       }
     }
@@ -239,7 +204,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
           elem_acc->pbgp = (struct pkt_bgp_primitives *) malloc(pb_size);
           if (!elem_acc->pbgp) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
           }
         }
         memcpy(elem_acc->pbgp, pbgp, pb_size);
@@ -254,7 +219,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
           elem_acc->clbgp = (struct cache_legacy_bgp_primitives *) malloc(clb_size);
           if (!elem_acc->clbgp) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
           }
         }
 
@@ -268,7 +233,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
 	  elem_acc->pnat = (struct pkt_nat_primitives *) malloc(pn_size);
 	  if (!elem_acc->pnat) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
 	  }
 	}
 	memcpy(elem_acc->pnat, pnat, pn_size);
@@ -283,7 +248,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
 	  elem_acc->pmpls = (struct pkt_mpls_primitives *) malloc(pm_size);
 	  if (!elem_acc->pmpls) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
 	  }
 	}
         memcpy(elem_acc->pmpls, pmpls, pm_size);
@@ -298,7 +263,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
 	  elem_acc->ptun = (struct pkt_tunnel_primitives *) malloc(pt_size);
 	  if (!elem_acc->ptun) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
 	  }
 	}
 	memcpy(elem_acc->ptun, ptun, pt_size);
@@ -310,10 +275,10 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
 
       if (pcust) {
 	if (!elem_acc->pcust) {
-	  elem_acc->pcust = (char *) malloc(pc_size);
+	  elem_acc->pcust = malloc(pc_size);
 	  if (!elem_acc->pcust) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
 	  }
 	}
         memcpy(elem_acc->pcust, pcust, pc_size);
@@ -334,7 +299,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
           elem_acc->pvlen = (struct pkt_vlen_hdr_primitives *) vlen_prims_copy(pvlen);
           if (!elem_acc->pvlen) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
           }
         }
       }
@@ -343,14 +308,11 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
       elem_acc->flow_counter += data->flo_num;
       elem_acc->bytes_counter += data->pkt_len;
       elem_acc->tcp_flags |= data->tcp_flags;
+      elem_acc->tunnel_tcp_flags |= data->tunnel_tcp_flags;
       elem_acc->flow_type = data->flow_type;
       elem_acc->signature = hash;
-      if (config.what_to_count & COUNT_CLASS) {
-        elem_acc->packet_counter += data->cst.pa;
-        elem_acc->bytes_counter += data->cst.ba;
-        elem_acc->flow_counter += data->cst.fa;
-      }
       lru_elem_ptr[pos] = elem_acc;
+
       return;
     }
 
@@ -395,7 +357,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->pbgp = (struct pkt_bgp_primitives *) malloc(pb_size);
         if (!elem_acc->pbgp) {
           Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-          exit_plugin(1);
+          exit_gracefully(1);
         }
         memcpy(elem_acc->pbgp, pbgp, pb_size);
       }
@@ -405,7 +367,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->clbgp = (struct cache_legacy_bgp_primitives *) malloc(clb_size);
         if (!elem_acc->clbgp) {
           Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-          exit_plugin(1);
+          exit_gracefully(1);
         }
         memset(elem_acc->clbgp, 0, clb_size);
         pkt_to_cache_legacy_bgp_primitives(elem_acc->clbgp, plbgp, config.what_to_count, config.what_to_count_2);
@@ -416,7 +378,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->pnat = (struct pkt_nat_primitives *) malloc(pn_size);
 	if (!elem_acc->pnat) {
           Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-          exit_plugin(1);
+          exit_gracefully(1);
 	}
         memcpy(elem_acc->pnat, pnat, pn_size);
       }
@@ -426,7 +388,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->pmpls = (struct pkt_mpls_primitives *) malloc(pm_size);
 	if (!elem_acc->pmpls) {
           Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-          exit_plugin(1);
+          exit_gracefully(1);
 	}
         memcpy(elem_acc->pmpls, pmpls, pm_size);
       }
@@ -436,17 +398,17 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
         elem_acc->ptun = (struct pkt_tunnel_primitives *) malloc(pt_size);
 	if (!elem_acc->ptun) {
           Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-          exit_plugin(1);
+          exit_gracefully(1);
 	}
         memcpy(elem_acc->ptun, ptun, pt_size);
       }
       else elem_acc->ptun = NULL;
 
       if (pcust) {
-        elem_acc->pcust = (char *) malloc(pc_size);
+        elem_acc->pcust = malloc(pc_size);
 	if (!elem_acc->pcust) {
           Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-          exit_plugin(1);
+          exit_gracefully(1);
 	}
         memcpy(elem_acc->pcust, pcust, pc_size);
       }
@@ -463,7 +425,7 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
           elem_acc->pvlen = (struct pkt_vlen_hdr_primitives *) vlen_prims_copy(pvlen);
           if (!elem_acc->pvlen) {
             Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (insert_accounting_structure). Exiting ..\n", config.name, config.type);
-            exit_plugin(1);
+            exit_gracefully(1);
           }
         }
       }
@@ -472,15 +434,12 @@ void insert_accounting_structure(struct primitives_ptrs *prim_ptrs)
       elem_acc->flow_counter += data->flo_num;
       elem_acc->bytes_counter += data->pkt_len;
       elem_acc->tcp_flags = data->tcp_flags;
+      elem_acc->tunnel_tcp_flags = data->tunnel_tcp_flags;
       elem_acc->flow_type = data->flow_type;
       elem_acc->signature = hash; 
-      if (config.what_to_count & COUNT_CLASS) {
-        elem_acc->packet_counter += data->cst.pa;
-        elem_acc->bytes_counter += data->cst.ba;
-        elem_acc->flow_counter += data->cst.fa;
-      }
       elem_acc->next = NULL;
       lru_elem_ptr[pos] = elem_acc;
+
       return;
     }
   }
@@ -497,6 +456,7 @@ void reset_counters(struct acc *elem)
   elem->packet_counter = 0;
   elem->bytes_counter = 0;
   elem->tcp_flags = 0;
+  elem->tunnel_tcp_flags = 0;
   elem->flow_type = 0;
   memcpy(&elem->rstamp, &cycle_stamp, sizeof(struct timeval));
 }

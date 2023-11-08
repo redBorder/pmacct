@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2020 by Paolo Lucente
 */
 
 /*
@@ -18,6 +18,9 @@
     along with this program; if not, write to the Free Software
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
+
+#ifndef LOG_H
+#define LOG_H
 
 /* includes */
 #include <stdarg.h>
@@ -55,31 +58,34 @@ struct log_notification {
 };
 
 struct _log_notifications {
+  struct log_notification snaplen_issue;
   struct log_notification max_classifiers;
   struct log_notification bgp_peers_throttling;
+  struct log_notification bgp_peers_limit;
   struct log_notification bmp_peers_throttling;
+  struct log_notification bmp_peers_limit;
   struct log_notification geoip_ipv4_file_null;
   struct log_notification geoip_ipv6_file_null;
 #if defined (WITH_NDPI)
   struct log_notification ndpi_cache_full;
   struct log_notification ndpi_tmp_frag_warn;
 #endif
+  struct log_notification tee_plugin_cant_bridge_af;
 };
 
 /* prototypes */
-#if (!defined __LOG_C)
-#define EXT extern
-#else
-#define EXT
+extern void Log(short int, char *, ...)
+#ifdef __GNUC__
+  __attribute__((format(printf, 2, 3)))
 #endif
-EXT void Log(short int, char *, ...);
-EXT int parse_log_facility(const char *);
-EXT void log_notification_init(struct log_notification *);
-EXT void log_notifications_init(struct _log_notifications *);
-EXT int log_notification_set(struct log_notification *, time_t, int);
-EXT int log_notification_unset(struct log_notification *);
-EXT int log_notification_isset(struct log_notification *, time_t);
+  ;
+extern int parse_log_facility(const char *);
+extern void log_notification_init(struct log_notification *);
+extern void log_notifications_init(struct _log_notifications *);
+extern int log_notification_set(struct log_notification *, time_t, int);
+extern int log_notification_unset(struct log_notification *);
+extern int log_notification_isset(struct log_notification *, time_t);
 
 /* global vars */
-EXT struct _log_notifications log_notifications;
-#undef EXT
+extern struct _log_notifications log_notifications;
+#endif //LOG_H

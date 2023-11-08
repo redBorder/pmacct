@@ -21,12 +21,8 @@
  * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 
-#define __ISIS_FLAGS_C
-
 #include "pmacct.h"
 #include "isis.h"
-
-#include "linklist.h"
 
 #include "isis_constants.h"
 #include "isis_common.h"
@@ -39,11 +35,11 @@ flags_initialize (struct flags *flags)
   flags->free_idcs = NULL;
 }
 
-int
+long int
 flags_get_index (struct flags *flags)
 {
-  struct listnode *node;
-  int index;
+  struct pm_listnode *node;
+  long int index;
 
   if (flags->free_idcs == NULL || flags->free_idcs->count == 0)
     {
@@ -51,9 +47,9 @@ flags_get_index (struct flags *flags)
     }
   else
     {
-      node = listhead (flags->free_idcs);
-      index = (int) listgetdata (node);
-      isis_listnode_delete (flags->free_idcs, (void *) index);
+      node = pm_listhead (flags->free_idcs);
+      index = (long int) pm_listgetdata (node);
+      pm_listnode_delete (flags->free_idcs, (void *) index);
       index--;
     }
 
@@ -61,7 +57,7 @@ flags_get_index (struct flags *flags)
 }
 
 void
-flags_free_index (struct flags *flags, int index)
+flags_free_index (struct flags *flags, long int index)
 {
   if (index + 1 == flags->maxindex)
     {
@@ -71,10 +67,10 @@ flags_free_index (struct flags *flags, int index)
 
   if (flags->free_idcs == NULL)
     {
-      flags->free_idcs = isis_list_new ();
+      flags->free_idcs = pm_list_new ();
     }
 
-  isis_listnode_add (flags->free_idcs, (void *) (index + 1));
+  pm_listnode_add (flags->free_idcs, (void *) (index + 1));
 
   return;
 }

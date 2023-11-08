@@ -40,6 +40,7 @@ BGP msglog format:
 BGP dump format:
 - dump_init message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "peer_ip_src": <IP address>,
@@ -49,6 +50,7 @@ BGP dump format:
 
 - dump message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "peer_ip_src": <IP address>,
@@ -60,10 +62,13 @@ BGP dump format:
 
 - dump_close message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "peer_ip_src": <IP address>,
-    "event_type": "dump_close"
+    "event_type": "dump_close",
+    "tables": <number of RIBs>,
+    "entries": <number of NLRIs>
   }
 
 
@@ -116,6 +121,7 @@ BMP msglog format:
 BMP dump format:
 - dump_init message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "bmp_router": <IP address>,
@@ -125,6 +131,7 @@ BMP dump format:
 
 - dump routes message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "bmp_router": <IP address>,
@@ -138,7 +145,7 @@ BMP dump format:
 
 - dump events message:
   {
-    "seq": <seq>,
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "bmp_router": <IP address>,
@@ -151,10 +158,13 @@ BMP dump format:
 
 - dump_close message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "bmp_router": <IP address>,
     "event_type": "dump_close"
+    "tables": <number of BGP peers>,
+    "entries": <number of NLRIs>
   }
 
 
@@ -192,6 +202,7 @@ Streaming Telemetry msglog format:
 Streaming Telemetry dump format:
 - dump_init message:
   {
+    "seq": <dump event seq>,
     "timestamp": <dump event timestamp>,
     "telemetry_node": <IP address>,
     "event_type": "dump_init",
@@ -200,7 +211,7 @@ Streaming Telemetry dump format:
 
 - dump message:
   {
-    "seq": <seq>,
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "telemetry_node": <IP address>,
@@ -212,6 +223,7 @@ Streaming Telemetry dump format:
 
 - dump_close message:
   {
+    "seq": <dump event seq>,
     "writer_id": <core_proc_name>"/"<writer_pid> (*),
     "timestamp": <dump event timestamp>,
     "telemetry_node": <IP address>,

@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,10 +19,7 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __PRETAG_HANDLERS_C
-
 #include "pmacct.h"
-#include "addr.h"
 #include "bgp/bgp_packet.h"
 #include "bgp/bgp.h"
 #include "nfacctd.h"
@@ -31,17 +28,17 @@
 #include "pretag_handlers.h"
 #include "net_aggr.h"
 #include "bgp/bgp.h"
+#include "rpki/rpki.h"
 #include "pmacct-data.h"
 #include "plugin_hooks.h"
 #include "pkt_handlers.h"
-#include "util.h"
 
 int PT_map_id_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   struct host_addr a;
   char *endptr = NULL, *incptr;
   pm_id_t j = 0, z = 0;
-  int x, inc = 0;
+  int x, inc = 0, len = 0;
 
   e->id = 0;
   e->flags = FALSE;
@@ -59,7 +56,6 @@ int PT_map_id_handler(char *filename, struct id_entry *e, char *value, struct pl
   }
   /* If we parse a bgp_agent_map and spot a ':' within the string let's
      check if we are given a valid IPv6 address */
-#if defined ENABLE_IPV6
   else if (acct_type == MAP_BGP_TO_XFLOW_AGENT && strchr(value, ':')) {
     memset(&a, 0, sizeof(a));
     str_to_addr(value, &a);
@@ -74,7 +70,6 @@ int PT_map_id_handler(char *filename, struct id_entry *e, char *value, struct pl
       return TRUE;
     }
   }
-#endif
   else if (acct_type == MAP_FLOW_TO_RD && strchr(value, ':')) {
     rd_t rd;
 
@@ -87,23 +82,32 @@ int PT_map_id_handler(char *filename, struct id_entry *e, char *value, struct pl
     e->flags = BPAS_MAP_RCODE_BGP;
   }
   else {
-    if (incptr = strstr(value, "++")) {
+    if ((incptr = strstr(value, "++"))) {
       inc = TRUE;
       *incptr = '\0';
     }
 
+    len = strlen(value);
+    for (x = 0; x < len; x++) {
+      if (!isdigit(value[x])) {
+	Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_tag/id specified (non-digit chars).\n", config.name, config.type, filename);
+	return TRUE;
+      }
+    }
+
     j = strtoull(value, &endptr, 10);
     if (j > UINT64_MAX) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_tag/id specified.\n", config.name, config.type, filename);
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_tag/id specified (too big).\n", config.name, config.type, filename);
       return TRUE;
-    } 
+    }
   }
 
   e->id = j; 
   if (z) e->id2 = z;
   if (inc) e->id_inc = TRUE;
 
-  if (acct_type == ACCT_NF || acct_type == ACCT_SF || acct_type == ACCT_PM) {
+  if (acct_type == ACCT_NF || acct_type == ACCT_SF || acct_type == ACCT_PM || acct_type == ACCT_PMBGP ||
+      acct_type == ACCT_PMBMP || acct_type == ACCT_PMTELE) {
     for (x = 0; e->set_func[x]; x++) {
       if (e->set_func_type[x] == PRETAG_SET_TAG) {
         Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'set_tag' (id) clauses part of the same statement.\n", config.name, config.type, filename);
@@ -122,16 +126,24 @@ int PT_map_id2_handler(char *filename, struct id_entry *e, char *value, struct p
 {
   char *endptr = NULL, *incptr;
   pm_id_t j;
-  int x, inc = 0;
+  int x, inc = 0, len = 0;
 
-  if (incptr = strstr(value, "++")) {
+  if ((incptr = strstr(value, "++"))) {
     inc = TRUE;
     *incptr = '\0';
   }
 
+  len = strlen(value);
+  for (x = 0; x < len; x++) {
+    if (!isdigit(value[x])) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_tag2/id2 specified (non-digit chars).\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
   j = strtoull(value, &endptr, 10);
   if (j > UINT64_MAX) {
-    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_tag2/id2 specified.\n", config.name, config.type, filename);
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_tag2/id2 specified (too big).\n", config.name, config.type, filename);
     return TRUE;
   }
   e->id2 = j;
@@ -154,26 +166,53 @@ int PT_map_id2_handler(char *filename, struct id_entry *e, char *value, struct p
 
 int PT_map_label_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  char default_sep = ',';
   int x, len;
 
   // XXX: isprint check?
 
   len = strlen(value);
-  if (!strchr(value, default_sep)) {
-    if (pretag_malloc_label(&e->label, len + 1 /* null */)) return TRUE;
-    strcpy(e->label.val, value);
-    e->label.val[e->label.len] = '\0';
-  }
-  else {
-    e->label.val = NULL;
-    e->label.len = 0;
 
-    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid set_label specified.\n", config.name, config.type, filename);
-    return TRUE;
+  /* light validation for this case */
+  if (config.pretag_label_encode_as_map) {
+    char *value_copy, *token;
+    char *map_key, *map_value;
+
+    value_copy = strdup(value);
+    if (value_copy) {
+      for (token = strtok(value_copy, DEFAULT_SEP); token; token = strtok(NULL, DEFAULT_SEP)) {
+	map_key = token;
+	map_value = strchr(token, PRETAG_LABEL_KV_SEP_INT);
+	if (map_value) {
+	  (*map_value) = '\0';
+	  map_value++;
+
+	  if (!strlen(map_key) || !strlen(map_value)) {
+	    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Missing pretag_label_encode_as_map key or value.\n", config.name, config.type, filename);
+	    free(value_copy);
+	    return TRUE;
+	  }
+	}
+	else {
+	  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Missing pretag_label_encode_as_map separator.\n", config.name, config.type, filename);
+	  free(value_copy);
+	  return TRUE;
+	}
+      }
+      free(value_copy);
+    }
+    else {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] PT_map_label_handler() failed strdup()\n", config.name, config.type, filename);
+      return TRUE;
+    }
   }
 
-  if (acct_type == ACCT_NF || acct_type == ACCT_SF || acct_type == ACCT_PM) {
+  if (pretag_malloc_label(&e->label, len + 1 /* null */)) return TRUE;
+  strcpy(e->label.val, value);
+  e->label.len = len;
+  e->label.val[e->label.len] = '\0';
+
+  if (acct_type == ACCT_NF || acct_type == ACCT_SF || acct_type == ACCT_PM || acct_type == ACCT_PMBGP ||
+      acct_type == ACCT_PMBMP || acct_type == ACCT_PMTELE) {
     for (x = 0; e->set_func[x]; x++) {
       if (e->set_func_type[x] == PRETAG_SET_LABEL) {
         Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'set_label' clauses part of the same statement.\n", config.name, config.type, filename);
@@ -308,6 +347,8 @@ int PT_map_bgp_nexthop_handler(char *filename, struct id_entry *e, char *value, 
 {
   int x = 0, have_bgp = 0;
 
+  if (req->ptm_c.load_ptm_plugin == PLUGIN_ID_TEE) req->ptm_c.load_ptm_res = TRUE;
+
   e->key.bgp_nexthop.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
 
   if (!str_to_addr(value, &e->key.bgp_nexthop.a)) {
@@ -361,7 +402,7 @@ int BPAS_map_bgp_nexthop_handler(char *filename, struct id_entry *e, char *value
   }
 
   for (x = 0; e->func[x]; x++);
-  if (config.nfacctd_bgp) {
+  if (config.bgp_daemon) {
     e->func[x] = BPAS_bgp_nexthop_handler;
     e->func_type[x] = PRETAG_BGP_NEXTHOP;
   }
@@ -381,7 +422,7 @@ int BPAS_map_bgp_peer_dst_as_handler(char *filename, struct id_entry *e, char *v
   e->key.peer_dst_as.n = tmp;
 
   for (x = 0; e->func[x]; x++);
-  if (config.nfacctd_bgp) {
+  if (config.bgp_daemon) {
     e->func[x] = BPAS_bgp_peer_dst_as_handler; 
     e->func_type[x] = PRETAG_BGP_NEXTHOP;
   }
@@ -411,7 +452,6 @@ int BITR_map_mpls_label_bottom_handler(char *filename, struct id_entry *e, char 
 
 int BITR_map_mpls_vpn_id_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  u_int32_t tmp;
   int x = 0;
   char *endptr;
 
@@ -503,10 +543,10 @@ int PT_map_engine_id_handler(char *filename, struct id_entry *e, char *value, st
 
 int PT_map_filter_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  struct pcap_device dev;
+  struct pm_pcap_device dev;
   bpf_u_int32 localnet, netmask;  /* pcap library stuff */
   char errbuf[PCAP_ERRBUF_SIZE];
-  int x, link_type;
+  int x;
 
   if (acct_type == MAP_BGP_TO_XFLOW_AGENT) {
     if (strncmp(value, "ip", 2) && strncmp(value, "ip6", 3) && strncmp(value, "vlan and ip", 11) && strncmp(value, "vlan and ip6", 12)) {
@@ -516,9 +556,9 @@ int PT_map_filter_handler(char *filename, struct id_entry *e, char *value, struc
     }
   }
 
-  memset(&dev, 0, sizeof(struct pcap_device));
+  memset(&dev, 0, sizeof(struct pm_pcap_device));
   // XXX: fix if multiple interfaces
-  if (device.list[0].dev_desc) dev.link_type = pcap_datalink(device.list[0].dev_desc);
+  if (devices.list[0].dev_desc) dev.link_type = pcap_datalink(devices.list[0].dev_desc);
   else if (config.uacctd_group) dev.link_type = DLT_RAW;
   else dev.link_type = 1;
   dev.dev_desc = pcap_open_dead(dev.link_type, 128); /* snaplen=eth_header+pm_iphdr+pm_tlhdr */
@@ -541,41 +581,6 @@ int PT_map_filter_handler(char *filename, struct id_entry *e, char *value, struc
   e->func[x] = pretag_filter_handler;
   if (e->func[x]) e->func_type[x] = PRETAG_FILTER;
   req->bpf_filter = TRUE;
-  return FALSE;
-}
-
-int PT_map_v8agg_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
-{
-  int tmp, x = 0, len;
-
-  e->key.v8agg.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
-  len = strlen(value);
-
-  while (x < len) {
-    if (!isdigit(value[x])) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] bad 'v8agg' value: '%s'.\n", config.name, config.type, filename, value);
-      return TRUE;
-    }
-    x++;
-  }
-
-  tmp = atoi(value);
-  if (tmp < 1 || tmp > 14) {
-    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'v8agg' need to be in the following range: 0 > value > 15.\n", config.name, config.type, filename);
-    return TRUE;
-  }
-  e->key.v8agg.n = tmp; 
-
-  for (x = 0; e->func[x]; x++) {
-    if (e->func_type[x] == PRETAG_NFV8_AGG) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'v8agg' clauses part of the same statement.\n", config.name, config.type, filename);
-      return TRUE;
-    }
-  }
-
-  if (config.acct_type == ACCT_NF) e->func[x] = pretag_v8agg_handler;
-  if (e->func[x]) e->func_type[x] = PRETAG_NFV8_AGG;
-
   return FALSE;
 }
 
@@ -615,25 +620,6 @@ int PT_map_flowset_id_handler(char *filename, struct id_entry *e, char *value, s
   return FALSE;
 }
 
-int PT_map_sampling_rate_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
-{
-  int x = 0;
-
-  e->key.sampling_rate.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
-  e->key.sampling_rate.n = atoi(value);
-  for (x = 0; e->func[x]; x++) {
-    if (e->func_type[x] == PRETAG_SAMPLING_RATE) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'sampling_rate' clauses part of the same statement.\n", config.name, config.type, filename);
-      return TRUE;
-    }
-  }
-  if (config.acct_type == ACCT_NF) e->func[x] = pretag_sampling_rate_handler;
-  else if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_sampling_rate_handler;
-  if (e->func[x]) e->func_type[x] = PRETAG_SAMPLING_RATE;
-
-  return FALSE;
-}
-
 int PT_map_sample_type_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   char *token = NULL;
@@ -643,12 +629,12 @@ int PT_map_sample_type_handler(char *filename, struct id_entry *e, char *value, 
   e->key.sample_type.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
 
   if (acct_type == ACCT_SF && strchr(value, ':')) {
-    while (token = extract_token(&value, ':')) {
+    while ((token = extract_token(&value, ':'))) {
       switch (x) {
       case 0:
         tmp = atoi(token);
         if (tmp > 1048575) { // 2^20-1: 20 bit Enterprise value
-          Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid 'sample_type' value.\n", config.name, config.type, filename);
+          Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid sFlow 'sample_type' value.\n", config.name, config.type, filename);
           return TRUE;
         }
         e->key.sample_type.n = tmp;
@@ -657,13 +643,13 @@ int PT_map_sample_type_handler(char *filename, struct id_entry *e, char *value, 
       case 1:
         tmp = atoi(token);
         if (tmp > 4095) { // 2^12-1: 12 bit Format value
-          Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid 'sample_type' value.\n", config.name, config.type, filename);
+          Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid sFlow 'sample_type' value.\n", config.name, config.type, filename);
           return TRUE;
         }
         e->key.sample_type.n |= tmp;
         break;
       default:
-        Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid 'sample_type' value.\n", config.name, config.type, filename);
+        Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid sFlow 'sample_type' value.\n", config.name, config.type, filename);
         return TRUE;
       }
 
@@ -671,18 +657,36 @@ int PT_map_sample_type_handler(char *filename, struct id_entry *e, char *value, 
     }
   }
   else if (acct_type == ACCT_NF) {
-    if (!strncmp(value, "flow", strlen("flow")))
-      e->key.sample_type.n = NF9_FTYPE_TRAFFIC;
-    else if (!strncmp(value, "event", strlen("event")))
+    if (!strncmp(value, "flow-ipv4", strlen("flow-ipv4"))) {
+      e->key.sample_type.n = PM_FTYPE_IPV4;
+    }
+    else if (!strncmp(value, "flow-ipv6", strlen("flow-ipv6"))) {
+      e->key.sample_type.n = PM_FTYPE_IPV6;
+    }
+    else if (!strncmp(value, "flow", strlen("flow"))) {
+      e->key.sample_type.n = PM_FTYPE_TRAFFIC;
+    }
+    else if (!strncmp(value, "flow-mpls-ipv4", strlen("flow-mpls-ipv4"))) {
+      e->key.sample_type.n = PM_FTYPE_MPLS_IPV4;
+    }
+    else if (!strncmp(value, "flow-mpls-ipv6", strlen("flow-mpls-ipv6"))) {
+      e->key.sample_type.n = PM_FTYPE_MPLS_IPV6;
+    }
+    else if (!strncmp(value, "event", strlen("event"))) {
       e->key.sample_type.n = NF9_FTYPE_EVENT;
-    else if (!strncmp(value, "option", strlen("option")))
+    }
+    else if (!strncmp(value, "option", strlen("option"))) {
       e->key.sample_type.n = NF9_FTYPE_OPTION;
+    }
     else {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid 'sample_type' value.\n", config.name, config.type, filename);
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid NetFlow/IPFIX 'sample_type' value.\n", config.name, config.type, filename);
       return TRUE;
     }
   }
-  else return FALSE; /* silently ignore */
+  else {
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid 'sample_type' value.\n", config.name, config.type, filename);
+    return TRUE;
+  }
 
   for (x = 0; e->func[x]; x++) {
     if (e->func_type[x] == PRETAG_SAMPLE_TYPE) {
@@ -694,6 +698,81 @@ int PT_map_sample_type_handler(char *filename, struct id_entry *e, char *value, 
   if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_sample_type_handler;
   else if (config.acct_type == ACCT_NF) e->func[x] = pretag_sample_type_handler;
   if (e->func[x]) e->func_type[x] = PRETAG_SAMPLE_TYPE;
+
+  return FALSE;
+}
+
+int PT_map_is_bi_flow_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int value_tf, x = 0;
+
+  e->key.is_bi_flow.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+
+  value_tf = parse_truefalse(value);
+  if (value_tf < 0) {
+    return ERR;
+  }
+
+  e->key.is_bi_flow.n = value_tf;
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_IS_BI_FLOW) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'is_bi_flow' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_is_bi_flow_handler;
+
+  return FALSE;
+}
+
+int PT_map_is_nsel_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int value_tf, x = 0;
+
+  e->key.is_nsel.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+
+  value_tf = parse_truefalse(value);
+  if (value_tf < 0) {
+    return ERR;
+  }
+
+  e->key.is_nsel.n = value_tf;
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_IS_NSEL) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'is_nsel' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_is_nsel_handler;
+
+  return FALSE;
+}
+
+int PT_map_is_nel_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int value_tf, x = 0;
+
+  e->key.is_nel.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+
+  value_tf = parse_truefalse(value);
+  if (value_tf < 0) {
+    return ERR;
+  }
+
+  e->key.is_nel.n = value_tf;
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_IS_NEL) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'is_nel' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_is_nel_handler;
 
   return FALSE;
 }
@@ -713,7 +792,27 @@ int PT_map_direction_handler(char *filename, struct id_entry *e, char *value, st
 
   if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_direction_handler;
   else if (config.acct_type == ACCT_NF) e->func[x] = pretag_direction_handler;
+  else if (config.acct_type == ACCT_PM) e->func[x] = PM_pretag_direction_handler;
   if (e->func[x]) e->func_type[x] = PRETAG_DIRECTION;
+
+  return FALSE;
+}
+
+int PT_map_nat_event_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int x = 0;
+
+  e->key.nat_event.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+  e->key.nat_event.n = atoi(value);
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_NAT_EVENT) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'nat_event' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_nat_event_handler;
+  if (e->func[x]) e->func_type[x] = PRETAG_NAT_EVENT;
 
   return FALSE;
 }
@@ -762,7 +861,8 @@ int PT_map_src_as_handler(char *filename, struct id_entry *e, char *value, struc
 
   if (have_bgp) return FALSE;
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_as' requires either 'networks_file' or 'nf|sfacctd_as: false' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_as' requires either 'networks_file' or '%s_as: false' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -811,7 +911,8 @@ int PT_map_dst_as_handler(char *filename, struct id_entry *e, char *value, struc
 
   if (have_bgp) return FALSE;
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'dst_as' requires either 'networks_file' or 'nf|sfacctd_as: false' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'dst_as' requires either 'networks_file' or '%s_as: false' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -840,7 +941,8 @@ int PT_map_peer_src_as_handler(char *filename, struct id_entry *e, char *value, 
     return FALSE;
   }
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'peer_src_as' requires '[nf|sf]acctd_as_new: [ bgp | longest ]' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'peer_src_as' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -869,7 +971,8 @@ int PT_map_peer_dst_as_handler(char *filename, struct id_entry *e, char *value, 
     return FALSE;
   } 
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'peer_dst_as' requires '[nf|sf]acctd_as_new: [ bgp | longest ]' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'peer_dst_as' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -898,7 +1001,8 @@ int PT_map_src_local_pref_handler(char *filename, struct id_entry *e, char *valu
     return FALSE;
   }
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_local_pref' requires '[nf|sf]acctd_as_new: [ bgp | longest ]' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_local_pref' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -927,7 +1031,60 @@ int PT_map_local_pref_handler(char *filename, struct id_entry *e, char *value, s
     return FALSE;
   }
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'local_pref' requires '[nf|sf]acctd_as_new: [ bgp | longest ]' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'local_pref' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
+
+  return TRUE;
+}
+
+int PT_map_src_roa_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int x = 0;
+
+  e->key.src_roa.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+  e->key.src_roa.n = rpki_str2roa(value);
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_SRC_ROA) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'src_roa' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.nfacctd_as & NF_AS_BGP) {
+    e->func[x] = pretag_src_roa_handler;
+    e->func_type[x] = PRETAG_SRC_ROA;
+    return FALSE;
+  }
+
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_roa' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
+
+  return TRUE;
+}
+
+int PT_map_dst_roa_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int x = 0;
+
+  e->key.dst_roa.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+  e->key.dst_roa.n = rpki_str2roa(value);
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_DST_ROA) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'dst_roa' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.nfacctd_as & NF_AS_BGP) {
+    e->func[x] = pretag_dst_roa_handler;
+    e->func_type[x] = PRETAG_DST_ROA;
+    return FALSE;
+  }
+
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'dst_roa' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -935,7 +1092,7 @@ int PT_map_local_pref_handler(char *filename, struct id_entry *e, char *value, s
 int PT_map_src_comms_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   int x = 0, idx = 0;
-  char *endptr, *token;
+  char *token;
 
   memset(e->key.src_comms, 0, sizeof(e->key.src_comms));
 
@@ -945,7 +1102,7 @@ int PT_map_src_comms_handler(char *filename, struct id_entry *e, char *value, st
     e->key.src_comms[idx] = malloc(MAX_BGP_STD_COMMS);
     if (!e->key.src_comms[idx]) {
       Log(LOG_ERR, "ERROR ( %s/%s ): [%s] malloc() failed (PT_map_src_comms_handler). Exiting.\n", config.name, config.type, filename);
-      exit_all(1);
+      exit_gracefully(1);
     }
     strlcpy(e->key.src_comms[idx], token, MAX_BGP_STD_COMMS);
     trim_spaces(e->key.src_comms[idx]);
@@ -965,7 +1122,8 @@ int PT_map_src_comms_handler(char *filename, struct id_entry *e, char *value, st
     return FALSE;
   }
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_comms' requires '[nf|sf]acctd_as_new: [ bgp | longest ]' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'src_comms' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -973,7 +1131,7 @@ int PT_map_src_comms_handler(char *filename, struct id_entry *e, char *value, st
 int PT_map_comms_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   int x = 0, idx = 0;
-  char *endptr, *token;
+  char *token;
 
   memset(e->key.comms, 0, sizeof(e->key.comms));
 
@@ -983,7 +1141,7 @@ int PT_map_comms_handler(char *filename, struct id_entry *e, char *value, struct
     e->key.comms[idx] = malloc(MAX_BGP_STD_COMMS);
     if (!e->key.comms[idx]) {
       Log(LOG_ERR, "ERROR ( %s/%s ): [%s] malloc() failed (PT_map_comms_handler). Exiting.\n", config.name, config.type, filename);
-      exit_all(1);
+      exit_gracefully(1);
     }
     strlcpy(e->key.comms[idx], token, MAX_BGP_STD_COMMS);
     trim_spaces(e->key.comms[idx]);
@@ -1003,7 +1161,8 @@ int PT_map_comms_handler(char *filename, struct id_entry *e, char *value, struct
     return FALSE;
   }
 
-  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'comms' requires '[nf|sf]acctd_as_new: [ bgp | longest ]' to be specified.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'comms' requires '%s_as_new: [ bgp | longest ]' to be specified.\n",
+      config.name, config.type, filename, config.progname);
 
   return TRUE;
 }
@@ -1011,7 +1170,6 @@ int PT_map_comms_handler(char *filename, struct id_entry *e, char *value, struct
 int PT_map_mpls_vpn_rd_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   int x = 0, ret;
-  char *endptr, *token;
 
   memset(&e->key.mpls_vpn_rd, 0, sizeof(e->key.mpls_vpn_rd));
 
@@ -1031,6 +1189,28 @@ int PT_map_mpls_vpn_rd_handler(char *filename, struct id_entry *e, char *value, 
     return FALSE;
   }
   else return TRUE; 
+}
+
+int PT_map_mpls_pw_id_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int x = 0;
+  char *endptr;
+
+  e->key.mpls_pw_id.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+  e->key.mpls_pw_id.n = strtoul(value, &endptr, 10);
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_MPLS_PW_ID) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'mpls_pw_id' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_mpls_pw_id_handler;
+  else if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_mpls_pw_id_handler;
+  if (e->func[x]) e->func_type[x] = PRETAG_MPLS_PW_ID;
+
+  return FALSE;
 }
 
 int PT_map_src_mac_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
@@ -1143,6 +1323,87 @@ int PT_map_cvlan_id_handler(char *filename, struct id_entry *e, char *value, str
   return FALSE;
 }
 
+int PT_map_src_net_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int x = 0;
+
+  if (req->ptm_c.load_ptm_plugin == PLUGIN_ID_TEE) req->ptm_c.load_ptm_res = TRUE;
+
+  e->key.src_net.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+
+  if (!str_to_addr_mask(value, &e->key.src_net.a, &e->key.src_net.m)) {
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Bad source network address '%s'.\n", config.name, config.type, filename, value);
+    return TRUE;
+  }
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_SRC_NET) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'src_net' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_src_net_handler;
+  else if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_src_net_handler;
+  if (e->func[x]) e->func_type[x] = PRETAG_SRC_NET;
+
+  return FALSE;
+}
+
+int PT_map_dst_net_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int x = 0;
+
+  if (req->ptm_c.load_ptm_plugin == PLUGIN_ID_TEE) req->ptm_c.load_ptm_res = TRUE;
+
+  e->key.dst_net.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+
+  if (!str_to_addr_mask(value, &e->key.dst_net.a, &e->key.dst_net.m)) {
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Bad destination network address '%s'.\n", config.name, config.type, filename, value);
+    return TRUE;
+  }
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_DST_NET) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'dst_net' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_dst_net_handler;
+  else if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_dst_net_handler;
+  if (e->func[x]) e->func_type[x] = PRETAG_DST_NET;
+
+  return FALSE;
+}
+
+int PT_map_is_multicast_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+{
+  int value_tf, x = 0;
+
+  e->key.is_multicast.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+
+  value_tf = parse_truefalse(value);
+  if (value_tf < 0) {
+    return ERR;
+  }
+
+  e->key.is_multicast.n = value_tf;
+
+  for (x = 0; e->func[x]; x++) {
+    if (e->func_type[x] == PRETAG_IS_MULTICAST) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'is_multicast' clauses part of the same statement.\n", config.name, config.type, filename);
+      return TRUE;
+    }
+  }
+
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_is_multicast_handler;
+  else if (config.acct_type == ACCT_SF) e->func[x] = SF_pretag_is_multicast_handler;
+  if (e->func[x]) e->func_type[x] = PRETAG_IS_MULTICAST;
+
+  return FALSE;
+}
+
 int PT_map_set_tos_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   int x = 0, len;
@@ -1209,19 +1470,46 @@ int BTA_map_lookup_bgp_port_handler(char *filename, struct id_entry *e, char *va
 
 int PT_map_entry_label_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  strlcpy(e->entry_label, value, MAX_LABEL_LEN); 
+  int len;
+
+  len = MIN((strlen(value) + 1), MAX_LABEL_LEN);
+
+  e->entry_label = malloc(len);
+  if (!e->entry_label) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): [%s] malloc() failed (PT_map_entry_label_handler). Exiting.\n", config.name, config.type, filename);
+    exit_gracefully(1);
+  }
+  else memset(e->entry_label, 0, len);
+
+  if (strlen(value) >= MAX_LABEL_LEN) {
+    strncpy(e->entry_label, value, (MAX_LABEL_LEN - 1));
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] entry label '%s' cut to '%s'.\n", config.name, config.type, filename, value, e->entry_label);
+  }
+  else strcpy(e->entry_label, value);
 
   return FALSE;
 }
 
 int PT_map_jeq_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  e->jeq.label = malloc(MAX_LABEL_LEN);
+  int len;
+
+  len = MIN((strlen(value) + 1), MAX_LABEL_LEN);
+
+  e->jeq.label = malloc(len);
   if (!e->jeq.label) {
     Log(LOG_ERR, "ERROR ( %s/%s ): [%s] malloc() failed (PT_map_jeq_handler). Exiting.\n", config.name, config.type, filename);
-    exit_all(1);
+    exit_gracefully(1);
   }
-  else strlcpy(e->jeq.label, value, MAX_LABEL_LEN);
+  else memset(e->jeq.label, 0, len);
+
+  if (strlen(value) >= MAX_LABEL_LEN) {
+    strncpy(e->jeq.label, value, (MAX_LABEL_LEN - 1));
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] JEQ label '%s' cut to '%s'.\n", config.name, config.type, filename, value, e->jeq.label);
+  }
+  else strcpy(e->jeq.label, value);
+
+  pt_set_jeq(&((struct id_table *) req->key_value_table)->flags);
 
   return FALSE;
 }
@@ -1229,6 +1517,10 @@ int PT_map_jeq_handler(char *filename, struct id_entry *e, char *value, struct p
 int PT_map_return_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   int res = parse_truefalse(value);
+
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] RETURN is in the process of being discontinued.\n", config.name, config.type, filename);
+  Log(LOG_WARNING, "WARN ( %s/%s ): [%s] %s: %s\n", config.name, config.type, filename, GET_IN_TOUCH_MSG, MANTAINER);
+
   if (res < 0) Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Unknown RETURN value: '%s'. Ignoring.\n", config.name, config.type, filename, value);
   else e->ret = res;
 
@@ -1241,41 +1533,38 @@ int PT_map_stack_handler(char *filename, struct id_entry *e, char *value, struct
 
   if (*value == '+' || !strncmp(value, "sum", 3)) e->stack.func = PT_stack_sum;
   else if (!strncmp(value, "or", 2)) e->stack.func = PT_stack_logical_or;
-  else Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Unknown STACK operator: '%c'. Ignoring.\n", config.name, config.type, filename, value);
+  else Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Unknown STACK operator: '%s'. Ignoring.\n", config.name, config.type, filename, value);
 
   return FALSE;
 }
-int PT_map_fwdstatus_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+int PT_map_fwd_status_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
   int tmp, x = 0;
 
   if (req->ptm_c.load_ptm_plugin == PLUGIN_ID_TEE) req->ptm_c.load_ptm_res = TRUE;
 
-  e->key.fwdstatus.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
+  e->key.fwd_status.neg = pt_check_neg(&value, &((struct id_table *) req->key_value_table)->flags);
 
   tmp = atoi(value);
   if (tmp < 0 || tmp > 256) {
-    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'fwdstatus' need to be in the following range: 0 > value > 256.\n", config.name, config.type, filename);
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] 'fwd_status' need to be in the following range: 0 > value > 256.\n", config.name, config.type, filename);
     return TRUE;
   }
-  e->key.fwdstatus.n = tmp;
+  e->key.fwd_status.n = tmp;
 
 
   for (x = 0; e->func[x]; x++) {
     if (e->func_type[x] == PRETAG_FWDSTATUS_ID) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'fwdstatus' clauses part of the same statement.\n", config.name, config.type, filename);
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Multiple 'fwd_status' clauses part of the same statement.\n", config.name, config.type, filename);
       return TRUE;
     }
   }
 
-  if (config.acct_type == ACCT_NF) e->func[x] = pretag_forwarding_status_handler;
+  if (config.acct_type == ACCT_NF) e->func[x] = pretag_fwd_status_handler;
   if (e->func[x]) e->func_type[x] = PRETAG_FWDSTATUS_ID;
 
   return FALSE;
 }
-
-
-
 
 int pretag_dummy_ip_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
@@ -1285,11 +1574,13 @@ int pretag_dummy_ip_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_input_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t input16 = htons(entry->key.input.n);
   u_int32_t input32 = htonl(entry->key.input.n);
   u_int8_t neg = entry->key.input.neg;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch(hdr->version) {
   case 10:
@@ -1306,56 +1597,25 @@ int pretag_input_handler(struct packet_ptrs *pptrs, void *unused, void *e)
       if (!memcmp(&input32, pptrs->f_data+tpl->tpl[NF9_INPUT_PHYSINT].off, tpl->tpl[NF9_INPUT_PHYSINT].len))
         return (FALSE | neg);
     }
-    else return (TRUE ^ neg);
-  case 8: 
-    switch(hdr->aggregation) {
-      case 1:
-	if (input16 == ((struct struct_export_v8_1 *)pptrs->f_data)->input) return (FALSE | neg);
-	else return (TRUE ^ neg);
-      case 3:
-	if (input16 == ((struct struct_export_v8_3 *)pptrs->f_data)->input) return (FALSE | neg);
-	else return (TRUE ^ neg);
-      case 5:
-        if (input16 == ((struct struct_export_v8_5 *)pptrs->f_data)->input) return (FALSE | neg);
-	else return (TRUE ^ neg);
-      case 7:
-	if (input16 == ((struct struct_export_v8_7 *)pptrs->f_data)->input) return (FALSE | neg);
-	else return (TRUE ^ neg);
-      case 8:
-        if (input16 == ((struct struct_export_v8_8 *)pptrs->f_data)->input) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 9:
-        if (input16 == ((struct struct_export_v8_9 *)pptrs->f_data)->input) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 10:
-        if (input16 == ((struct struct_export_v8_10 *)pptrs->f_data)->input) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 11: 
-        if (input16 == ((struct struct_export_v8_11 *)pptrs->f_data)->input) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 13:
-        if (input16 == ((struct struct_export_v8_13 *)pptrs->f_data)->input) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 14:
-        if (input16 == ((struct struct_export_v8_14 *)pptrs->f_data)->input) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      default:
-	return (TRUE ^ neg);
-    }
-  default:
+    return (TRUE ^ neg);
+  case 5:
     if (input16 == ((struct struct_export_v5 *)pptrs->f_data)->input) return (FALSE | neg);
     else return (TRUE ^ neg); 
+  default:
+    return TRUE;
   }
 }
 
 int pretag_output_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t output16 = htons(entry->key.output.n);
   u_int32_t output32 = htonl(entry->key.output.n);
   u_int8_t neg = entry->key.output.neg;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch(hdr->version) {
   case 10:
@@ -1372,56 +1632,22 @@ int pretag_output_handler(struct packet_ptrs *pptrs, void *unused, void *e)
       if (!memcmp(&output32, pptrs->f_data+tpl->tpl[NF9_OUTPUT_PHYSINT].off, tpl->tpl[NF9_OUTPUT_PHYSINT].len))
         return (FALSE | neg);
     }
-    else return (TRUE ^ neg);
-  case 8:
-    switch(hdr->aggregation) {
-      case 1:
-        if (output16 == ((struct struct_export_v8_1 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 4:
-        if (output16 == ((struct struct_export_v8_4 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 5:
-        if (output16 == ((struct struct_export_v8_5 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 6:
-        if (output16 == ((struct struct_export_v8_6 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 7:
-        if (output16 == ((struct struct_export_v8_7 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 8:
-        if (output16 == ((struct struct_export_v8_8 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 9:
-        if (output16 == ((struct struct_export_v8_9 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 10:
-        if (output16 == ((struct struct_export_v8_10 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 12:
-        if (output16 == ((struct struct_export_v8_12 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 13:
-        if (output16 == ((struct struct_export_v8_13 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      case 14:
-        if (output16 == ((struct struct_export_v8_14 *)pptrs->f_data)->output) return (FALSE | neg);
-        else return (TRUE ^ neg);
-      default:
-        return (TRUE ^ neg);
-    }
-  default:
+    return (TRUE ^ neg);
+  case 5:
     if (output16 == ((struct struct_export_v5 *)pptrs->f_data)->output) return (FALSE | neg);
     else return (TRUE ^ neg);
+  default:
+    return TRUE;
   }
 }
 
 int pretag_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch(hdr->version) {
   case 10:
@@ -1430,26 +1656,23 @@ int pretag_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void *e)
       if (!memcmp(&entry->key.nexthop.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_NEXT_HOP].off, tpl->tpl[NF9_IPV4_NEXT_HOP].len))
 	return (FALSE | entry->key.nexthop.neg);
     }
-#if defined ENABLE_IPV6
     else if (entry->key.nexthop.a.family == AF_INET6) {
       if (!memcmp(&entry->key.nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_NEXT_HOP].off, tpl->tpl[NF9_IPV6_NEXT_HOP].len))
 	return (FALSE | entry->key.nexthop.neg);
     }
-#endif
-    else return (TRUE ^ entry->key.nexthop.neg);
-  case 8:
-    /* NetFlow v8 does not seem to contain any nexthop field */
-    return TRUE;
-  default:
+    return (TRUE ^ entry->key.nexthop.neg);
+  case 5:
     if (entry->key.nexthop.a.address.ipv4.s_addr == ((struct struct_export_v5 *)pptrs->f_data)->nexthop.s_addr) return (FALSE | entry->key.nexthop.neg);
     else return (TRUE ^ entry->key.nexthop.neg);
+  default:
+    return TRUE;
   }
 }
 
 int pretag_bgp_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
 
   if (entry->last_matched == PRETAG_BGP_NEXTHOP) return FALSE;
@@ -1457,42 +1680,37 @@ int pretag_bgp_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   /* check network-related primitives against fallback scenarios */
   if (!evaluate_lm_method(pptrs, TRUE, config.nfacctd_net, NF_NET_KEEP)) return TRUE;
 
+  if (!pptrs->f_data) return TRUE;
+
   switch(hdr->version) {
   case 10:
   case 9:
     if (entry->key.bgp_nexthop.a.family == AF_INET) {
       if (tpl->tpl[NF9_BGP_IPV4_NEXT_HOP].len) {
-        if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_BGP_IPV4_NEXT_HOP].off, tpl->tpl[NF9_BGP_IPV4_NEXT_HOP].len))
+	if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_BGP_IPV4_NEXT_HOP].off, tpl->tpl[NF9_BGP_IPV4_NEXT_HOP].len))
 	  return (FALSE | entry->key.bgp_nexthop.neg);
       }
       else if (tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].len) {
-        if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].off, tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].len))
+	if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].off, tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].len))
 	  return (FALSE | entry->key.bgp_nexthop.neg);
       }
     }
-#if defined ENABLE_IPV6
     else if (entry->key.nexthop.a.family == AF_INET6) {
       if (tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].len) {
-        if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].off, tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].len))
-	  return (FALSE | entry->key.bgp_nexthop.neg);
-      }
-      else if (tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].len) {
-        if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].off, tpl->tpl[NF9_MPLS_TOP_LABEL_ADDR].len))
+	if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].off, tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].len))
 	  return (FALSE | entry->key.bgp_nexthop.neg);
       }
       else if (tpl->tpl[NF9_MPLS_TOP_LABEL_IPV6_ADDR].len) {
-        if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_MPLS_TOP_LABEL_IPV6_ADDR].off, tpl->tpl[NF9_MPLS_TOP_LABEL_IPV6_ADDR].len))
+	if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_MPLS_TOP_LABEL_IPV6_ADDR].off, tpl->tpl[NF9_MPLS_TOP_LABEL_IPV6_ADDR].len))
 	  return (FALSE | entry->key.bgp_nexthop.neg);
       }
     }
-#endif
-    else return (TRUE ^ entry->key.bgp_nexthop.neg);
-  case 8:
-    /* NetFlow v8 does not seem to contain any nexthop field */
-    return TRUE;
-  default:
+    return (TRUE ^ entry->key.bgp_nexthop.neg);
+  case 5:
     if (entry->key.bgp_nexthop.a.address.ipv4.s_addr == ((struct struct_export_v5 *)pptrs->f_data)->nexthop.s_addr) return (FALSE | entry->key.bgp_nexthop.neg);
     else return (TRUE ^ entry->key.bgp_nexthop.neg);
+  default:
+    return TRUE;
   }
 }
 
@@ -1516,11 +1734,9 @@ int pretag_bgp_bgp_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void
       if (info->attr->mp_nexthop.family == AF_INET) {
         ret = memcmp(&entry->key.bgp_nexthop.a.address.ipv4, &info->attr->mp_nexthop.address.ipv4, 4);
       }
-#if defined ENABLE_IPV6
       else if (info->attr->mp_nexthop.family == AF_INET6) {
         ret = memcmp(&entry->key.bgp_nexthop.a.address.ipv6, &info->attr->mp_nexthop.address.ipv6, 16);
       }
-#endif
       else {
 	ret = memcmp(&entry->key.bgp_nexthop.a.address.ipv4, &info->attr->nexthop, 4);
       }
@@ -1540,13 +1756,9 @@ int pretag_bgp_bgp_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void
 int pretag_engine_type_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
-  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
 
   switch(hdr->version) {
-  case 8:
-    if (entry->key.engine_type.n == ((struct struct_header_v8 *)pptrs->f_header)->engine_type) return (FALSE | entry->key.engine_type.neg);
-    else return (TRUE ^ entry->key.engine_type.neg);
   case 5:
     if (entry->key.engine_type.n == ((struct struct_header_v5 *)pptrs->f_header)->engine_type) return (FALSE | entry->key.engine_type.neg);
     else return (TRUE ^ entry->key.engine_type.neg);
@@ -1558,8 +1770,7 @@ int pretag_engine_type_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_engine_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
-  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   u_int32_t value;
 
   switch(hdr->version) {
@@ -1579,9 +1790,6 @@ int pretag_engine_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
     if (entry->key.engine_id.n == value) return (FALSE | entry->key.engine_id.neg);
     else return (TRUE ^ entry->key.engine_id.neg);
   }
-  case 8:
-    if (entry->key.engine_id.n == ((struct struct_header_v8 *)pptrs->f_header)->engine_id) return (FALSE | entry->key.engine_id.neg);
-    else return (TRUE ^ entry->key.engine_id.neg);
   case 5:
     if (entry->key.engine_id.n == ((struct struct_header_v5 *)pptrs->f_header)->engine_id) return (FALSE | entry->key.engine_id.neg);
     else return (TRUE ^ entry->key.engine_id.neg);
@@ -1593,8 +1801,10 @@ int pretag_engine_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_flowset_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+
+  if (!pptrs->f_tpl) return TRUE;
 
   switch(hdr->version) {
   case 10:
@@ -1618,29 +1828,17 @@ int pretag_filter_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   else return TRUE;
 }
 
-int pretag_v8agg_handler(struct packet_ptrs *pptrs, void *unused, void *e)
-{
-  struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
-
-  switch(hdr->version) {
-  case 8:
-    if (entry->key.v8agg.n == ((struct struct_header_v8 *)pptrs->f_header)->aggregation) return (FALSE | entry->key.v8agg.neg);
-    else return (TRUE ^ entry->key.v8agg.neg);
-  default:
-    return TRUE; /* this field does not exist: condition is always true */
-  }
-}
-
 int pretag_src_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t asn16 = 0;
   u_int32_t asn32 = 0;
 
   if (entry->last_matched == PRETAG_SRC_AS) return FALSE;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch(hdr->version) {
   case 10:
@@ -1654,32 +1852,10 @@ int pretag_src_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
       asn32 = ntohl(asn32);
     }
     break;
-  case 8:
-    switch(hdr->aggregation) {
-    case 1:
-      asn32 = ntohs(((struct struct_export_v8_1 *) pptrs->f_data)->src_as);
-      break;
-    case 3:
-      asn32 = ntohs(((struct struct_export_v8_3 *) pptrs->f_data)->src_as);
-      break;
-    case 5:
-      asn32 = ntohs(((struct struct_export_v8_5 *) pptrs->f_data)->src_as);
-      break;
-    case 9:
-      asn32 = ntohs(((struct struct_export_v8_9 *) pptrs->f_data)->src_as);
-      break;
-    case 11:
-      asn32 = ntohs(((struct struct_export_v8_11 *) pptrs->f_data)->src_as);
-      break;
-    case 13:
-      asn32 = ntohs(((struct struct_export_v8_13 *) pptrs->f_data)->src_as);
-      break;
-    default:
-      break;
-    }
+  case 5:
+    asn32 = ntohs(((struct struct_export_v5 *) pptrs->f_data)->src_as);
     break;
   default:
-    asn32 = ntohs(((struct struct_export_v5 *) pptrs->f_data)->src_as);
     break;
   }
 
@@ -1714,12 +1890,14 @@ int pretag_bgp_src_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_dst_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t asn16 = 0;
   u_int32_t asn32 = 0;
 
   if (entry->last_matched == PRETAG_DST_AS) return FALSE;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch(hdr->version) {
   case 10:
@@ -1733,32 +1911,10 @@ int pretag_dst_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
       asn32 = ntohl(asn32);
     }
     break;
-  case 8:
-    switch(hdr->aggregation) {
-    case 1:
-      asn32 = ntohs(((struct struct_export_v8_1 *) pptrs->f_data)->dst_as);
-      break;
-    case 4:
-      asn32 = ntohs(((struct struct_export_v8_4 *) pptrs->f_data)->dst_as);
-      break;
-    case 5:
-      asn32 = ntohs(((struct struct_export_v8_5 *) pptrs->f_data)->dst_as);
-      break;
-    case 9:
-      asn32 = ntohs(((struct struct_export_v8_9 *) pptrs->f_data)->dst_as);
-      break;
-    case 12:
-      asn32 = ntohs(((struct struct_export_v8_12 *) pptrs->f_data)->dst_as);
-      break;
-    case 13:
-      asn32 = ntohs(((struct struct_export_v8_13 *) pptrs->f_data)->dst_as);
-      break;
-    default:
-      break;
-    }
+  case 5:
+    asn32 = ntohs(((struct struct_export_v5 *) pptrs->f_data)->dst_as);
     break;
   default:
-    asn32 = ntohs(((struct struct_export_v5 *) pptrs->f_data)->dst_as);
     break;
   }
 
@@ -1797,10 +1953,10 @@ int pretag_peer_src_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   struct bgp_info *info;
   as_t asn = 0;
 
-  if (config.nfacctd_bgp_peer_as_src_type == BGP_SRC_PRIMITIVES_MAP) {
+  if (config.bgp_daemon_peer_as_src_type == BGP_SRC_PRIMITIVES_MAP) {
     asn = pptrs->bpas;
   }
-  else if (config.nfacctd_bgp_peer_as_src_type & BGP_SRC_PRIMITIVES_BGP) {
+  else if (config.bgp_daemon_peer_as_src_type & BGP_SRC_PRIMITIVES_BGP) {
     if (src_ret) {
       info = (struct bgp_info *) pptrs->bgp_src_info;
       if (info && info->attr) {
@@ -1842,10 +1998,10 @@ int pretag_src_local_pref_handler(struct packet_ptrs *pptrs, void *unused, void 
   struct bgp_info *info;
   u_int32_t local_pref = 0;
 
-  if (config.nfacctd_bgp_src_local_pref_type == BGP_SRC_PRIMITIVES_MAP) {
+  if (config.bgp_daemon_src_local_pref_type == BGP_SRC_PRIMITIVES_MAP) {
     local_pref = pptrs->blp;
   }
-  else if (config.nfacctd_bgp_src_local_pref_type & BGP_SRC_PRIMITIVES_BGP) {
+  else if (config.bgp_daemon_src_local_pref_type & BGP_SRC_PRIMITIVES_BGP) {
     if (src_ret) {
       info = (struct bgp_info *) pptrs->bgp_src_info;
       if (info && info->attr) {
@@ -1874,6 +2030,29 @@ int pretag_local_pref_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 
   if (entry->key.local_pref.n == local_pref) return (FALSE | entry->key.local_pref.neg);
   else return (TRUE ^ entry->key.local_pref.neg);
+}
+
+int pretag_src_roa_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct bgp_node *src_ret = (struct bgp_node *) pptrs->bgp_src;
+  u_int8_t roa = ROA_STATUS_UNKNOWN;
+
+  if (config.bgp_daemon_src_roa_type & BGP_SRC_PRIMITIVES_BGP) {
+    if (src_ret) roa = pptrs->src_roa;
+  }
+
+  if (entry->key.src_roa.n == roa) return (FALSE | entry->key.src_roa.neg);
+  else return (TRUE ^ entry->key.src_roa.neg);
+}
+
+int pretag_dst_roa_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  u_int8_t roa = ROA_STATUS_UNKNOWN;
+
+  if (entry->key.dst_roa.n == roa) return (FALSE | entry->key.dst_roa.neg);
+  else return (TRUE ^ entry->key.dst_roa.neg);
 }
 
 int pretag_src_comms_handler(struct packet_ptrs *pptrs, void *unused, void *e)
@@ -1919,39 +2098,90 @@ int pretag_comms_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_sample_type_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
-  struct struct_header_v5 *hdr5 = (struct struct_header_v5 *) pptrs->f_header;
-  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int8_t flow_type = pptrs->flow_type.traffic_type;
 
-  if (entry->key.sample_type.n == pptrs->flow_type) return (FALSE | entry->key.sample_type.neg); 
+  if (entry->key.sample_type.n == PM_FTYPE_TRAFFIC) {
+    if (flow_type >= PM_FTYPE_TRAFFIC && flow_type <= PM_FTYPE_TRAFFIC_MAX) {
+      flow_type = PM_FTYPE_TRAFFIC;
+    }
+  }
+
+  if (entry->key.sample_type.n == flow_type) return (FALSE | entry->key.sample_type.neg);
   else return (TRUE ^ entry->key.sample_type.neg);
 }
 
-int pretag_sampling_rate_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+int pretag_is_bi_flow_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
-  struct struct_header_v5 *hdr5 = (struct struct_header_v5 *) pptrs->f_header;
+
+  if (entry->key.is_bi_flow.n == pptrs->flow_type.is_bi) return (FALSE | entry->key.is_bi_flow.neg);
+  else return (TRUE ^ entry->key.is_bi_flow.neg);
+}
+
+int pretag_is_nsel_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
-  u_int16_t srate = 0;
+  u_int8_t nsel = FALSE;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
-  case 5:
-    hdr5 = (struct struct_header_v5 *) pptrs->f_header;
-    srate = ( ntohs(hdr5->sampling) & 0x3FFF );
-    if (entry->key.sampling_rate.n == srate) return (FALSE | entry->key.sampling_rate.neg);
-    else return (TRUE ^ entry->key.sampling_rate.neg);
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_FW_EVENT].len) {
+      nsel = TRUE;
+    }
+    break;
   default:
-    return TRUE; /* this field might not apply: condition is always true */
+    break; /* this field does not exist */
+  }
+
+  if ((entry->key.is_nsel.n && nsel) || (!entry->key.is_nsel.n && !nsel)) {
+    return (FALSE | entry->key.is_nsel.neg);
+  }
+  else {
+    return (TRUE ^ entry->key.is_nsel.neg);
+  }
+}
+
+int pretag_is_nel_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int8_t nel = FALSE;
+
+  if (!pptrs->f_data) return TRUE;
+
+  switch (hdr->version) {
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_NAT_EVENT].len) {
+      nel = TRUE;
+    }
+    break;
+  default:
+    break; /* this field does not exist */
+  }
+
+  if ((entry->key.is_nel.n && nel) || (!entry->key.is_nel.n && !nel)) {
+    return (FALSE | entry->key.is_nel.neg);
+  }
+  else {
+    return (TRUE ^ entry->key.is_nel.neg);
   }
 }
 
 int pretag_direction_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int8_t direction = 0;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
   case 10:
@@ -1961,6 +2191,28 @@ int pretag_direction_handler(struct packet_ptrs *pptrs, void *unused, void *e)
     }
     if (entry->key.direction.n == direction) return (FALSE | entry->key.direction.neg);
     else return (TRUE ^ entry->key.direction.neg);
+  default:
+    return TRUE; /* this field does not exist: condition is always true */
+  }
+}
+
+int pretag_nat_event_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int8_t nat_event = 0;
+
+  if (!pptrs->f_data) return TRUE;
+
+  switch (hdr->version) {
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_NAT_EVENT].len == 1) {
+      memcpy(&nat_event, pptrs->f_data+tpl->tpl[NF9_NAT_EVENT].off, 1);
+    }
+    if (entry->key.nat_event.n == nat_event) return (FALSE | entry->key.nat_event.neg);
+    else return (TRUE ^ entry->key.nat_event.neg);
   default:
     return TRUE; /* this field does not exist: condition is always true */
   }
@@ -1977,8 +2229,8 @@ int pretag_mpls_vpn_rd_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 
   if (dst_ret) {
     info = (struct bgp_info *) pptrs->bgp_dst_info;
-    if (info && info->extra) {
-      ret = memcmp(&entry->key.mpls_vpn_rd.rd, &info->extra->rd, sizeof(rd_t)); 
+    if (info && info->attr_extra) {
+      ret = memcmp(&entry->key.mpls_vpn_rd.rd, &info->attr_extra->rd, sizeof(rd_t)); 
     }
   }
 
@@ -1986,11 +2238,35 @@ int pretag_mpls_vpn_rd_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   else return (TRUE ^ entry->key.mpls_vpn_rd.neg);
 }
 
+int pretag_mpls_pw_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int32_t tmp32 = 0, mpls_pw_id = 0;;
+
+  switch (hdr->version) {
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_PSEUDOWIREID].len) {
+      memcpy(&tmp32, pptrs->f_data+tpl->tpl[NF9_PSEUDOWIREID].off, 4);
+      mpls_pw_id = ntohl(tmp32);
+    } 
+
+    if (entry->key.mpls_pw_id.n == mpls_pw_id) return (FALSE | entry->key.mpls_pw_id.neg);
+    else return (TRUE ^ entry->key.mpls_pw_id.neg);
+  default:
+    return TRUE; /* this field does not exist: condition is always true */
+  }
+}
+
 int pretag_src_mac_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
   case 10:
@@ -1998,8 +2274,8 @@ int pretag_src_mac_handler(struct packet_ptrs *pptrs, void *unused, void *e)
     if (tpl->tpl[NF9_IN_SRC_MAC].len) {
       if (!memcmp(&entry->key.src_mac.a, pptrs->f_data+tpl->tpl[NF9_IN_SRC_MAC].off, MIN(tpl->tpl[NF9_IN_SRC_MAC].len, 6)))
 	return (FALSE | entry->key.src_mac.neg);
-      else return (TRUE ^ entry->key.src_mac.neg);
     }
+    return (TRUE ^ entry->key.src_mac.neg);
   default:
     return TRUE; /* this field does not exist: condition is always true */
   }
@@ -2008,8 +2284,10 @@ int pretag_src_mac_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_dst_mac_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
   case 10:
@@ -2017,8 +2295,8 @@ int pretag_dst_mac_handler(struct packet_ptrs *pptrs, void *unused, void *e)
     if (tpl->tpl[NF9_IN_DST_MAC].len) {
       if (!memcmp(&entry->key.dst_mac.a, pptrs->f_data+tpl->tpl[NF9_IN_DST_MAC].off, MIN(tpl->tpl[NF9_IN_DST_MAC].len, 6)))
         return (FALSE | entry->key.dst_mac.neg);
-      else return (TRUE ^ entry->key.dst_mac.neg);
     }
+    return (TRUE ^ entry->key.dst_mac.neg);
   default:
     return TRUE; /* this field does not exist: condition is always true */
   }
@@ -2027,9 +2305,11 @@ int pretag_dst_mac_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 int pretag_vlan_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t tmp16 = 0, vlan_id = 0;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
   case 10:
@@ -2048,12 +2328,128 @@ int pretag_vlan_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   }
 }
 
-int pretag_forwarding_status_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+int pretag_src_net_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
-  u_int32_t fwdstatus = 0;
+  struct host_addr addr;
+
+  if (!pptrs->f_data) return TRUE;
+
+  switch(hdr->version) {
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_IPV4_SRC_ADDR].len) {
+      memcpy(&addr.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_SRC_ADDR].off, MIN(tpl->tpl[NF9_IPV4_SRC_ADDR].len, 4));
+      addr.family = AF_INET;
+    }
+    else if (tpl->tpl[NF9_IPV4_SRC_PREFIX].len) {
+      memcpy(&addr.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_SRC_PREFIX].off, MIN(tpl->tpl[NF9_IPV4_SRC_PREFIX].len, 4));
+      addr.family = AF_INET;
+    }
+    if (tpl->tpl[NF9_IPV6_SRC_ADDR].len) {
+      memcpy(&addr.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_SRC_ADDR].off, MIN(tpl->tpl[NF9_IPV6_SRC_ADDR].len, 16));
+      addr.family = AF_INET6;
+    }
+    else if (tpl->tpl[NF9_IPV6_SRC_PREFIX].len) {
+      memcpy(&addr.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_SRC_PREFIX].off, MIN(tpl->tpl[NF9_IPV6_SRC_PREFIX].len, 16));
+      addr.family = AF_INET6;
+    }
+    break;
+  case 5:
+    addr.address.ipv4.s_addr = ((struct struct_export_v5 *) pptrs->f_data)->srcaddr.s_addr;
+    addr.family = AF_INET;
+    break;
+  default:
+    return TRUE;
+  }
+
+  if (!host_addr_mask_cmp(&entry->key.src_net.a, &entry->key.src_net.m, &addr))
+    return (FALSE | entry->key.src_net.neg);
+  else
+    return (TRUE ^ entry->key.src_net.neg);
+}
+
+int pretag_dst_net_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  struct host_addr addr;
+
+  if (!pptrs->f_data) return TRUE;
+
+  switch(hdr->version) {
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_IPV4_DST_ADDR].len) {
+      memcpy(&addr.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_DST_ADDR].off, MIN(tpl->tpl[NF9_IPV4_DST_ADDR].len, 4));
+      addr.family = AF_INET;
+    }
+    else if (tpl->tpl[NF9_IPV4_DST_PREFIX].len) {
+      memcpy(&addr.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_DST_PREFIX].off, MIN(tpl->tpl[NF9_IPV4_DST_PREFIX].len, 4));
+      addr.family = AF_INET;
+    }
+    if (tpl->tpl[NF9_IPV6_DST_ADDR].len) {
+      memcpy(&addr.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_DST_ADDR].off, MIN(tpl->tpl[NF9_IPV6_DST_ADDR].len, 16));
+      addr.family = AF_INET6;
+    }
+    else if (tpl->tpl[NF9_IPV6_DST_PREFIX].len) {
+      memcpy(&addr.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_DST_PREFIX].off, MIN(tpl->tpl[NF9_IPV6_DST_PREFIX].len, 16));
+      addr.family = AF_INET6;
+    }
+    break;
+  case 5:
+    addr.address.ipv4.s_addr = ((struct struct_export_v5 *) pptrs->f_data)->dstaddr.s_addr;
+    addr.family = AF_INET;
+    break;
+  default:
+    return TRUE;
+  }
+
+  if (!host_addr_mask_cmp(&entry->key.dst_net.a, &entry->key.dst_net.m, &addr))
+    return (FALSE | entry->key.dst_net.neg);
+  else
+    return (TRUE ^ entry->key.dst_net.neg);
+}
+
+int pretag_is_multicast_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int8_t multicast = FALSE;
+
+  if (!pptrs->f_data) return TRUE;
+
+  switch (hdr->version) {
+  case 10:
+  case 9:
+    if (tpl->tpl[NF9_IN_DST_MAC].len) {
+      multicast = IS_MAC_MULTICAST(pptrs->f_data+tpl->tpl[NF9_IN_DST_MAC].off);
+    }
+    break;
+  default:
+    break; /* this field does not exist */
+  }
+
+  if ((entry->key.is_multicast.n && multicast) || (!entry->key.is_multicast.n && !multicast)) {
+    return (FALSE | entry->key.is_multicast.neg);
+  }
+  else {
+    return (TRUE ^ entry->key.is_multicast.neg);
+  }
+}
+
+int pretag_fwd_status_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int32_t fwd_status = 0;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
   case 10:
@@ -2061,25 +2457,25 @@ int pretag_forwarding_status_handler(struct packet_ptrs *pptrs, void *unused, vo
     /* being specific on the length because IANA defines this field as
        unsigned32 but vendor implementation suggests this is defined as
        1 octet */
-    if (tpl->tpl[NF9_FORWARDING_STATUS].len == 1) {
-      memcpy(&fwdstatus, pptrs->f_data+tpl->tpl[NF9_FORWARDING_STATUS].off, MIN(tpl->tpl[NF9_FORWARDING_STATUS].len, 1));
+    if (tpl->tpl[NF9_FWD_STATUS].len == 1) {
+      memcpy(&fwd_status, pptrs->f_data+tpl->tpl[NF9_FWD_STATUS].off, MIN(tpl->tpl[NF9_FWD_STATUS].len, 1));
     }
     else return TRUE;
     
-    u_int32_t comp = (entry->key.fwdstatus.n & 0xC0);
-    if ( comp == entry->key.fwdstatus.n) {
+    u_int32_t comp = (entry->key.fwd_status.n & 0xC0);
+    if (comp == entry->key.fwd_status.n) {
       /* We have a generic (unknown) status provided so we then take everything that match that. */
-      u_int32_t base = (fwdstatus & 0xC0);
+      u_int32_t base = (fwd_status & 0xC0);
       if ( comp == base )
-        return (FALSE | entry->key.fwdstatus.neg);
+        return (FALSE | entry->key.fwd_status.neg);
       else
-        return (TRUE ^ entry->key.fwdstatus.neg);
+        return (TRUE ^ entry->key.fwd_status.neg);
     }
     else { /* We have a specific code so lets handle that. */
-      if (entry->key.fwdstatus.n == fwdstatus) 
-        return (FALSE | entry->key.fwdstatus.neg);
+      if (entry->key.fwd_status.n == fwd_status) 
+        return (FALSE | entry->key.fwd_status.neg);
       else 
-        return (TRUE ^ entry->key.fwdstatus.neg);
+        return (TRUE ^ entry->key.fwd_status.neg);
     }
   default:
     return TRUE; /* this field does not exist: condition is always true */
@@ -2090,9 +2486,11 @@ int pretag_forwarding_status_handler(struct packet_ptrs *pptrs, void *unused, vo
 int pretag_cvlan_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t tmp16 = 0, cvlan_id = 0;
+
+  if (!pptrs->f_data) return TRUE;
 
   switch (hdr->version) {
   case 10:
@@ -2144,12 +2542,21 @@ int pretag_id_handler(struct packet_ptrs *pptrs, void *id, void *e)
 	if (info->attr->aspath && info->attr->aspath->str) {
 	  *tid = evaluate_first_asn(info->attr->aspath->str);
 
-	  if (!(*tid) && config.nfacctd_bgp_stdcomm_pattern_to_asn) {
+	  if (!(*tid) && config.bgp_daemon_stdcomm_pattern_to_asn) {
 	    char tmp_stdcomms[MAX_BGP_STD_COMMS];
 
 	    if (info->attr->community && info->attr->community->str) {
 	      evaluate_comm_patterns(tmp_stdcomms, info->attr->community->str, std_comm_patterns_to_asn, MAX_BGP_STD_COMMS);
 	      copy_stdcomm_to_asn(tmp_stdcomms, (as_t *)tid, FALSE);
+	    }
+          }
+
+	  if (!(*tid) && config.bgp_daemon_lrgcomm_pattern_to_asn) {
+	    char tmp_lrgcomms[MAX_BGP_LRG_COMMS];
+
+	    if (info->attr->lcommunity && info->attr->lcommunity->str) {
+	      evaluate_comm_patterns(tmp_lrgcomms, info->attr->lcommunity->str, lrg_comm_patterns_to_asn, MAX_BGP_LRG_COMMS);
+	      copy_lrgcomm_to_asn(tmp_lrgcomms, (as_t *)tid, FALSE);
 	    }
           }
         }
@@ -2181,8 +2588,11 @@ int pretag_id2_handler(struct packet_ptrs *pptrs, void *id, void *e)
 int pretag_label_handler(struct packet_ptrs *pptrs, void *id, void *e)
 {
   struct id_entry *entry = e;
+  pt_label_t *out_label = (pt_label_t *) id;
 
-  if (id) memcpy(id, &entry->label, sizeof(pt_label_t));
+  if (out_label) {
+    pretag_copy_label(out_label, &entry->label);
+  }
 
   return PRETAG_MAP_RCODE_LABEL; /* cap */
 }
@@ -2213,11 +2623,9 @@ int SF_pretag_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   if (entry->key.nexthop.a.family == AF_INET) {
     if (!memcmp(&entry->key.nexthop.a.address.ipv4, &sample->nextHop.address.ip_v4, 4)) return (FALSE | entry->key.nexthop.neg);
   }
-#if defined ENABLE_IPV6
   else if (entry->key.nexthop.a.family == AF_INET6) {
     if (!memcmp(&entry->key.nexthop.a.address.ipv6, &sample->nextHop.address.ip_v6, IP6AddrSz)) return (FALSE | entry->key.nexthop.neg);
   }
-#endif
 
   return (TRUE ^ entry->key.nexthop.neg);
 }
@@ -2235,11 +2643,9 @@ int SF_pretag_bgp_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void 
   if (entry->key.bgp_nexthop.a.family == AF_INET) {
     if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv4, &sample->bgp_nextHop.address.ip_v4, 4)) return (FALSE | entry->key.bgp_nexthop.neg);
   }
-#if defined ENABLE_IPV6
   else if (entry->key.bgp_nexthop.a.family == AF_INET6) {
     if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, &sample->bgp_nextHop.address.ip_v6, IP6AddrSz)) return (FALSE | entry->key.bgp_nexthop.neg);
   }
-#endif
 
   return (TRUE ^ entry->key.bgp_nexthop.neg);
 }
@@ -2253,19 +2659,9 @@ int SF_pretag_agent_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   else return (TRUE ^ entry->key.agent_id.neg);
 }
 
-int SF_pretag_sampling_rate_handler(struct packet_ptrs *pptrs, void *unused, void *e)
-{
-  struct id_entry *entry = e;
-  SFSample *sample = (SFSample *) pptrs->f_data;
-
-  if (entry->key.sampling_rate.n == sample->meanSkipCount) return (FALSE | entry->key.sampling_rate.neg);
-  else return (TRUE ^ entry->key.sampling_rate.neg);
-}
-
 int SF_pretag_sample_type_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  SFSample *sample = (SFSample *) pptrs->f_data;
 
   if (entry->key.sample_type.n == pptrs->sample_type) return (FALSE | entry->key.sample_type.neg);
   else return (TRUE ^ entry->key.sample_type.neg);
@@ -2335,6 +2731,75 @@ int SF_pretag_vlan_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   else return (TRUE ^ entry->key.vlan_id.neg);
 }
 
+int SF_pretag_mpls_pw_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+
+  if (entry->key.mpls_pw_id.n == sample->mpls_vll_vc_id) return (FALSE | entry->key.mpls_pw_id.neg);
+  else return (TRUE ^ entry->key.mpls_pw_id.neg);
+}
+
+int SF_pretag_src_net_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+  SFLAddress *sf_addr = &sample->ipsrc;
+  struct host_addr addr;
+
+  if (sample->gotIPV4) {
+    addr.address.ipv4.s_addr = sample->dcd_srcIP.s_addr;
+    addr.family = AF_INET;
+  }
+  else if (sample->gotIPV6) {
+    memcpy(&addr.address.ipv6, &sf_addr->address.ip_v6, IP6AddrSz);
+    addr.family = AF_INET6;
+  }
+
+  if (!host_addr_mask_cmp(&entry->key.src_net.a, &entry->key.src_net.m, &addr)) 
+    return (FALSE | entry->key.src_net.neg);
+  else
+    return (TRUE ^ entry->key.src_net.neg);
+}
+
+int SF_pretag_dst_net_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+  SFLAddress *sf_addr = &sample->ipdst;
+  struct host_addr addr;
+
+  if (sample->gotIPV4) {
+    addr.address.ipv4.s_addr = sample->dcd_dstIP.s_addr;
+    addr.family = AF_INET;
+  }
+  else if (sample->gotIPV6) {
+    memcpy(&addr.address.ipv6, &sf_addr->address.ip_v6, IP6AddrSz);
+    addr.family = AF_INET6;
+  }
+
+  if (!host_addr_mask_cmp(&entry->key.dst_net.a, &entry->key.dst_net.m, &addr)) 
+    return (FALSE | entry->key.dst_net.neg);
+  else
+    return (TRUE ^ entry->key.dst_net.neg);
+}
+
+int SF_pretag_is_multicast_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+  u_int8_t multicast;
+
+  multicast = IS_MAC_MULTICAST(sample->eth_dst);
+
+  if ((entry->key.is_multicast.n && multicast) || (!entry->key.is_multicast.n && !multicast)) {
+    return (FALSE | entry->key.is_multicast.neg);
+  }
+  else {
+    return (TRUE ^ entry->key.is_multicast.neg);
+  }
+}
+
 int PM_pretag_src_as_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
@@ -2369,6 +2834,14 @@ int PM_pretag_output_handler(struct packet_ptrs *pptrs, void *unused, void *e)
   else return (TRUE ^ entry->key.output.neg);
 }
 
+int PM_pretag_direction_handler(struct packet_ptrs *pptrs, void *unused, void *e)
+{
+  struct id_entry *entry = e;
+
+  if (entry->key.direction.n == pptrs->direction) return (FALSE | entry->key.output.neg);
+  else return (TRUE ^ entry->key.output.neg);
+}
+
 pm_id_t PT_stack_sum(pm_id_t tag, pm_id_t pre)
 {
   return tag + pre;
@@ -2398,12 +2871,10 @@ int BPAS_bgp_nexthop_handler(struct packet_ptrs *pptrs, void *unused, void *e)
             return (FALSE | entry->key.bgp_nexthop.neg);
 	}
       }
-#if defined ENABLE_IPV6
       else if (entry->key.nexthop.a.family == AF_INET6) {
 	if (!memcmp(&entry->key.bgp_nexthop.a.address.ipv6, &info->attr->mp_nexthop.address.ipv6, 16))
           return (FALSE | entry->key.bgp_nexthop.neg);
       }
-#endif
     }
   }
 
@@ -2423,12 +2894,21 @@ int BPAS_bgp_peer_dst_as_handler(struct packet_ptrs *pptrs, void *unused, void *
       if (info->attr->aspath && info->attr->aspath->str) {
         asn = evaluate_first_asn(info->attr->aspath->str);
 
-        if (!asn && config.nfacctd_bgp_stdcomm_pattern_to_asn) {
+        if (!asn && config.bgp_daemon_stdcomm_pattern_to_asn) {
           char tmp_stdcomms[MAX_BGP_STD_COMMS];
 
           if (info->attr->community && info->attr->community->str) {
             evaluate_comm_patterns(tmp_stdcomms, info->attr->community->str, std_comm_patterns_to_asn, MAX_BGP_STD_COMMS);
             copy_stdcomm_to_asn(tmp_stdcomms, &asn, FALSE);
+          }
+        }
+
+        if (!asn && config.bgp_daemon_lrgcomm_pattern_to_asn) {
+          char tmp_lrgcomms[MAX_BGP_LRG_COMMS];
+
+          if (info->attr->lcommunity && info->attr->lcommunity->str) {
+            evaluate_comm_patterns(tmp_lrgcomms, info->attr->lcommunity->str, lrg_comm_patterns_to_asn, MAX_BGP_LRG_COMMS);
+            copy_lrgcomm_to_asn(tmp_lrgcomms, &asn, FALSE);
           }
         }
       }
@@ -2442,7 +2922,7 @@ int BPAS_bgp_peer_dst_as_handler(struct packet_ptrs *pptrs, void *unused, void *
 int BITR_mpls_label_bottom_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   int label_idx;
   u_int32_t label;
@@ -2467,27 +2947,25 @@ int BITR_mpls_label_bottom_handler(struct packet_ptrs *pptrs, void *unused, void
 int BITR_mpls_vpn_id_handler(struct packet_ptrs *pptrs, void *unused, void *e)
 {
   struct id_entry *entry = e;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
-  u_int32_t tmp32 = 0, label = 0;
+  u_int32_t tmp32 = 0, id = 0;
 
   switch(hdr->version) {
   case 10:
   case 9:
     if (tpl->tpl[NF9_INGRESS_VRFID].len) {
       memcpy(&tmp32, pptrs->f_data+tpl->tpl[NF9_INGRESS_VRFID].off, MIN(tpl->tpl[NF9_INGRESS_VRFID].len, 4));
-      label = ntohl(tmp32);
+      id = ntohl(tmp32);
 
-      if (!memcmp(&entry->key.mpls_vpn_id.n, &label, 4))
-        return (FALSE | entry->key.mpls_vpn_id.neg);
+      if (entry->key.mpls_vpn_id.n == id) return (FALSE | entry->key.mpls_vpn_id.neg);
     }
 
     if (tpl->tpl[NF9_EGRESS_VRFID].len) {
       memcpy(&tmp32, pptrs->f_data+tpl->tpl[NF9_EGRESS_VRFID].off, MIN(tpl->tpl[NF9_EGRESS_VRFID].len, 4));
-      label = ntohl(tmp32);
+      id = ntohl(tmp32);
 
-      if (!memcmp(&entry->key.mpls_vpn_id.n, &label, 4))
-        return (FALSE | entry->key.mpls_vpn_id.neg);
+      if (entry->key.mpls_vpn_id.n == id) return (FALSE | entry->key.mpls_vpn_id.neg);
     }
 
     return (TRUE ^ entry->key.mpls_vpn_id.neg);
@@ -2532,7 +3010,7 @@ int custom_primitives_map_field_type_handler(char *filename, struct id_entry *e,
     u_int8_t repeat_id;
     int idx;
 
-    if (type = strchr(value, ':')) {
+    if ((type = strchr(value, ':'))) {
       pen = value;
       *type = '\0';
       type++;
@@ -2568,7 +3046,7 @@ int custom_primitives_map_packet_ptr_handler(char *filename, struct id_entry *e,
   char *layer = NULL, *proto_ptr = NULL, *offset_ptr = NULL, *endptr;
   u_int16_t offset = 0, proto = 0, idx = 0;
 
-  if (config.acct_type == ACCT_PM && table) {
+  if (/* config.acct_type == ACCT_PM && */ table) {
     for (idx = 0; idx < MAX_CUSTOM_PRIMITIVE_PD_PTRS; idx++) {
       if (!table->primitive[table->num].pd_ptr[idx].ptr_idx.set) { 
 	pd_ptr = &table->primitive[table->num].pd_ptr[idx];
@@ -2651,13 +3129,7 @@ int custom_primitives_map_packet_ptr_handler(char *filename, struct id_entry *e,
     pd_ptr->off = offset;
   }
   else {
-    if (config.acct_type != ACCT_PM) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] packet_ptr is only supported in pmacctd.\n", config.name, config.type, filename);
-    }
-    else {
-      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] custom aggregate primitives registry not allocated.\n", config.name, config.type, filename);
-    }
-
+    Log(LOG_WARNING, "WARN ( %s/%s ): [%s] custom aggregate primitives registry not allocated.\n", config.name, config.type, filename);
     return TRUE;
   }
 
@@ -2783,204 +3255,324 @@ void custom_primitives_map_validate(char *filename, struct plugin_requests *req)
   }
 }
 
-int PT_map_index_entries_ip_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_ip_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src; 
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.agent_ip, &src_e->key.agent_ip, sizeof(pt_hostaddr_t));
-  hash_serial_append(hash_serializer, (char *)&src_e->key.agent_ip.a, sizeof(struct host_addr), TRUE);
+  if ((src_e->key.agent_mask.family == AF_INET && src_e->key.agent_mask.len == 32) ||
+      (src_e->key.agent_mask.family == AF_INET6 && src_e->key.agent_mask.len == 128)) {
+    hash_serial_append(hash_serializer, (char *)&src_e->key.agent_ip.a, sizeof(struct host_addr), TRUE);
+  }
+  else {
+    Log(LOG_WARNING, "WARN ( %s/%s ): pretag_index_fill(): unsupported 'ip' mask\n", config.name, config.type);
+    return PRETAG_IDX_ERR_WARN;
+  }
 
   return FALSE;
 }
 
-int PT_map_index_entries_input_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_input_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.input, &src_e->key.input, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.input.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_output_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_output_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.output, &src_e->key.output, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.output.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_bgp_nexthop_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.bgp_nexthop, &src_e->key.bgp_nexthop, sizeof(pt_hostaddr_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.bgp_nexthop.a, sizeof(struct host_addr), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_src_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_src_as_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.src_as, &src_e->key.src_as, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.src_as.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_dst_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_dst_as_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.dst_as, &src_e->key.dst_as, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.dst_as.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_peer_src_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_peer_src_as_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.peer_src_as, &src_e->key.peer_src_as, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.peer_src_as.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_peer_dst_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_peer_dst_as_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.peer_dst_as, &src_e->key.peer_dst_as, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.peer_dst_as.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_mpls_vpn_rd_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_mpls_vpn_rd_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.mpls_vpn_rd, &src_e->key.mpls_vpn_rd, sizeof(pt_rd_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.mpls_vpn_rd.rd, sizeof(rd_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_mpls_label_bottom_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_mpls_pw_id_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE;
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.mpls_label_bottom, &src_e->key.mpls_label_bottom, sizeof(pt_uint32_t));
+  hash_serial_append(hash_serializer, (char *)&src_e->key.mpls_pw_id.n, sizeof(u_int32_t), TRUE);
+
+  return FALSE;
+}
+
+int PT_map_index_entries_mpls_label_bottom_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct id_entry *src_e = (struct id_entry *) src;
+
+  if (!idx || !hash_serializer || !src_e) return TRUE;
+
   hash_serial_append(hash_serializer, (char *)&src_e->key.mpls_label_bottom.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_mpls_vpn_id_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_mpls_vpn_id_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE;
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.mpls_vpn_id, &src_e->key.mpls_vpn_id, sizeof(pt_uint32_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.mpls_vpn_id.n, sizeof(u_int32_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_src_mac_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_src_mac_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.src_mac, &src_e->key.src_mac, sizeof(pt_etheraddr_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.src_mac.a, ETH_ADDR_LEN, TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_dst_mac_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_dst_mac_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE;
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.dst_mac, &src_e->key.dst_mac, sizeof(pt_etheraddr_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.dst_mac.a, ETH_ADDR_LEN, TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_vlan_id_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_vlan_id_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE; 
+  if (!idx || !hash_serializer || !src_e) return TRUE; 
 
-  memcpy(&e->key.vlan_id, &src_e->key.vlan_id, sizeof(pt_uint16_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.vlan_id.n, sizeof(u_int16_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_cvlan_id_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_cvlan_id_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE;
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.cvlan_id, &src_e->key.cvlan_id, sizeof(pt_uint16_t));
   hash_serial_append(hash_serializer, (char *)&src_e->key.cvlan_id.n, sizeof(u_int16_t), TRUE);
 
   return FALSE;
 }
 
-int PT_map_index_entries_fwdstatus_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_src_net_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct id_entry *src_e = (struct id_entry *) src;
 
-  if (!e || !hash_serializer || !src_e) return TRUE;
+  if (!idx || !hash_serializer || !src_e) return TRUE;
 
-  memcpy(&e->key.fwdstatus, &src_e->key.fwdstatus, sizeof(u_int8_t));
-  hash_serial_append(hash_serializer, (char *)&src_e->key.fwdstatus.n, sizeof(u_int8_t), TRUE);
+  hash_serial_append(hash_serializer, (char *)&src_e->key.src_net.a, sizeof(struct host_addr), TRUE);
+  hash_serial_append(hash_serializer, (char *)&src_e->key.src_net.m.len, sizeof(src_e->key.src_net.m.len), TRUE);
+
+  if (idx->netmask.hdlr_no) {
+    if (idx->netmask.hdlr_no != (idx_hdlr_no + 1)) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): Index network masks count exceeded. Indexing disabled.\n", config.name, config.type);
+      return TRUE; 
+    }
+  }
+
+  if (src_e->key.src_net.a.family == AF_INET) {
+    if (!idx->netmask.v4.list) {
+      idx->netmask.v4.list = cdada_list_create(u_int8_t);
+      idx->netmask.hdlr_no = (idx_hdlr_no + 1);
+    }
+
+    if (idx->netmask.v4.list) {
+      cdada_list_push_back(idx->netmask.v4.list, &src_e->key.src_net.m.len);
+    }
+    else {
+      Log(LOG_WARNING, "WARN ( %s/%s ): Unable to create Index network masks list. Indexing disabled.\n", config.name, config.type);
+      return TRUE;
+    }
+  }
+  else if (src_e->key.src_net.a.family == AF_INET6) {
+    if (!idx->netmask.v6.list) {
+      idx->netmask.v6.list = cdada_list_create(u_int8_t);
+      idx->netmask.hdlr_no = (idx_hdlr_no + 1);
+    }
+
+    if (idx->netmask.v6.list) {
+      cdada_list_push_back(idx->netmask.v6.list, &src_e->key.src_net.m.len);
+    }
+    else {
+      Log(LOG_WARNING, "WARN ( %s/%s ): Unable to create Index network masks list. Indexing disabled.\n", config.name, config.type);
+      return TRUE;
+    }
+  }
 
   return FALSE;
 }
 
-int PT_map_index_fdata_ip_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_entries_dst_net_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct id_entry *src_e = (struct id_entry *) src;
+
+  if (!idx || !hash_serializer || !src_e) return TRUE;
+
+  hash_serial_append(hash_serializer, (char *)&src_e->key.dst_net.a, sizeof(struct host_addr), TRUE);
+  hash_serial_append(hash_serializer, (char *)&src_e->key.dst_net.m.len, sizeof(src_e->key.dst_net.m.len), TRUE);
+
+  if (idx->netmask.hdlr_no) {
+    if (idx->netmask.hdlr_no != (idx_hdlr_no + 1)) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): Index network masks count exceeded. Indexing disabled.\n", config.name, config.type);
+      return TRUE;
+    }
+  }
+
+  if (src_e->key.dst_net.a.family == AF_INET) {
+    if (!idx->netmask.v4.list) {
+      idx->netmask.v4.list = cdada_list_create(u_int8_t);
+      idx->netmask.hdlr_no = (idx_hdlr_no + 1);
+    }
+
+    if (idx->netmask.v4.list) {
+      cdada_list_push_back(idx->netmask.v4.list, &src_e->key.dst_net.m.len);
+    }
+    else {
+      Log(LOG_WARNING, "WARN ( %s/%s ): Unable to create Index network masks list. Indexing disabled.\n", config.name, config.type);
+      return TRUE;
+    }
+  }
+  else if (src_e->key.dst_net.a.family == AF_INET6) {
+    if (!idx->netmask.v6.list) {
+      idx->netmask.v6.list = cdada_list_create(u_int8_t);
+      idx->netmask.hdlr_no = (idx_hdlr_no + 1);
+    }
+
+    if (idx->netmask.v6.list) {
+      cdada_list_push_back(idx->netmask.v6.list, &src_e->key.dst_net.m.len);
+    }
+    else {
+      Log(LOG_WARNING, "WARN ( %s/%s ): Unable to create Index network masks list. Indexing disabled.\n", config.name, config.type);
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+int PT_map_index_entries_is_multicast_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct id_entry *src_e = (struct id_entry *) src;
+
+  if (!idx || !hash_serializer || !src_e) return TRUE;
+
+  hash_serial_append(hash_serializer, (char *)&src_e->key.is_multicast.n, sizeof(u_int8_t), TRUE);
+
+  return FALSE;
+}
+
+int PT_map_index_entries_fwd_status_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct id_entry *src_e = (struct id_entry *) src;
+
+  if (!idx || !hash_serializer || !src_e) return TRUE;
+
+  hash_serial_append(hash_serializer, (char *)&src_e->key.fwd_status.n, sizeof(u_int8_t), TRUE);
+
+  return FALSE;
+}
+
+int PT_map_index_entries_null_handler(struct id_table_index *idx, int idx_hdlr_no, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct id_entry *src_e = (struct id_entry *) src;
+
+  if (!idx || !hash_serializer || !src_e) return TRUE;
+
+  hash_serial_append(hash_serializer, (char *)&src_e->key.null.n, sizeof(u_int8_t), TRUE);
+
+  return FALSE;
+}
+
+int PT_map_index_fdata_ip_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
   struct sockaddr *sa = (struct sockaddr *) pptrs->f_agent;
   SFSample *sample = (SFSample *)pptrs->f_data;
-  u_int16_t port, j;
+  u_int16_t port;
 
   if (config.acct_type == ACCT_NF) {
     sa_to_addr((struct sockaddr *)sa, &e->key.agent_ip.a, &port);
@@ -2990,12 +3582,10 @@ int PT_map_index_fdata_ip_handler(struct id_entry *e, pm_hash_serial_t *hash_ser
       e->key.agent_ip.a.family = AF_INET;
       e->key.agent_ip.a.address.ipv4.s_addr = sample->agent_addr.address.ip_v4.s_addr;
     }
-#if defined ENABLE_IPV6
     else if (sample->agent_addr.type == SFLADDRESSTYPE_IP_V6) {
       e->key.agent_ip.a.family = AF_INET6;
       memcpy(e->key.agent_ip.a.address.ipv6.s6_addr, sample->agent_addr.address.ip_v6.s6_addr, 16);
     }
-#endif 
   }
   else return TRUE;
 
@@ -3004,10 +3594,10 @@ int PT_map_index_fdata_ip_handler(struct id_entry *e, pm_hash_serial_t *hash_ser
   return FALSE;
 }
 
-int PT_map_index_fdata_input_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_input_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3031,12 +3621,11 @@ int PT_map_index_fdata_input_handler(struct id_entry *e, pm_hash_serial_t *hash_
         e->key.input.n = ntohl(iface32);
       }
       break; 
-    case 8:
-      /* unsupported */
-      break;
-    default:
+    case 5:
       iface16 = ntohs(((struct struct_export_v5 *) pptrs->f_data)->input);
       e->key.input.n = iface16;
+      break;
+    default:
       break;
     }
   }
@@ -3052,10 +3641,10 @@ int PT_map_index_fdata_input_handler(struct id_entry *e, pm_hash_serial_t *hash_
   return FALSE;
 }
 
-int PT_map_index_fdata_output_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_output_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3079,12 +3668,11 @@ int PT_map_index_fdata_output_handler(struct id_entry *e, pm_hash_serial_t *hash
         e->key.output.n = ntohl(iface32);
       }
       break;
-    case 8:
-      /* unsupported */
-      break;
-    default:
+    case 5:
       iface16 = ntohs(((struct struct_export_v5 *) pptrs->f_data)->output);
       e->key.output.n = iface16;
+      break;
+    default:
       break;
     }
   }
@@ -3100,10 +3688,10 @@ int PT_map_index_fdata_output_handler(struct id_entry *e, pm_hash_serial_t *hash
   return FALSE;
 }
 
-int PT_map_index_fdata_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_bgp_nexthop_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3119,11 +3707,9 @@ int PT_map_index_fdata_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t 
 	if (info->attr->mp_nexthop.family == AF_INET) {
 	  memcpy(&e->key.bgp_nexthop.a, &info->attr->mp_nexthop, HostAddrSz);
 	}
-#if defined ENABLE_IPV6
 	else if (info->attr->mp_nexthop.family == AF_INET6) {
 	  memcpy(&e->key.bgp_nexthop.a, &info->attr->mp_nexthop, HostAddrSz);
 	}
-#endif
 	else {
 	  e->key.bgp_nexthop.a.address.ipv4.s_addr = info->attr->nexthop.s_addr;
 	  e->key.bgp_nexthop.a.family = AF_INET;
@@ -3146,7 +3732,6 @@ int PT_map_index_fdata_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t 
 	    e->key.bgp_nexthop.a.family = AF_INET;
 	  }
 	}
-#if defined ENABLE_IPV6
 	else if (pptrs->l3_proto == ETHERTYPE_IPV6) {
 	  if (tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].len) {
 	    memcpy(&e->key.bgp_nexthop.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].off, MIN(tpl->tpl[NF9_BGP_IPV6_NEXT_HOP].len, 16));
@@ -3161,7 +3746,6 @@ int PT_map_index_fdata_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t 
 	    e->key.bgp_nexthop.a.family = AF_INET6;
 	  }
 	}
-#endif
       }
     }
     else if (config.acct_type == ACCT_SF) {
@@ -3169,12 +3753,10 @@ int PT_map_index_fdata_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t 
 	e->key.bgp_nexthop.a.family = AF_INET;
 	e->key.bgp_nexthop.a.address.ipv4.s_addr = sample->bgp_nextHop.address.ip_v4.s_addr;
       }
-#if defined ENABLE_IPV6
       else if (sample->gotIPV6) {
 	e->key.bgp_nexthop.a.family = AF_INET6;
 	memcpy(&e->key.bgp_nexthop.a.address.ipv6, &sample->bgp_nextHop.address.ip_v6, IP6AddrSz);
       }
-#endif
     }
     else return TRUE;
   }
@@ -3184,10 +3766,10 @@ int PT_map_index_fdata_bgp_nexthop_handler(struct id_entry *e, pm_hash_serial_t 
   return FALSE;
 }
 
-int PT_map_index_fdata_src_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_src_as_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3217,11 +3799,10 @@ int PT_map_index_fdata_src_as_handler(struct id_entry *e, pm_hash_serial_t *hash
 	  e->key.src_as.n = ntohl(asn32);
 	}
 	break;
-      case 8:
-	/* unsupported */
+      case 5:
+	e->key.src_as.n = ntohs(((struct struct_export_v5 *) pptrs->f_data)->src_as);
 	break;
       default:
-	e->key.src_as.n = ntohs(((struct struct_export_v5 *) pptrs->f_data)->src_as);
 	break;
       }
     }
@@ -3236,10 +3817,10 @@ int PT_map_index_fdata_src_as_handler(struct id_entry *e, pm_hash_serial_t *hash
   return FALSE;
 }
 
-int PT_map_index_fdata_dst_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_dst_as_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3269,12 +3850,11 @@ int PT_map_index_fdata_dst_as_handler(struct id_entry *e, pm_hash_serial_t *hash
           e->key.dst_as.n = ntohl(asn32);
         }
         break;
-      case 8:
-        /* unsupported */
-        break;
-      default:
+      case 5:
         e->key.dst_as.n = ntohs(((struct struct_export_v5 *) pptrs->f_data)->dst_as);
         break;
+      default:
+	break;
       }
     }
     else if (config.acct_type == ACCT_SF) {
@@ -3288,17 +3868,17 @@ int PT_map_index_fdata_dst_as_handler(struct id_entry *e, pm_hash_serial_t *hash
   return FALSE;
 }
 
-int PT_map_index_fdata_peer_src_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_peer_src_as_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
   struct bgp_node *src_ret = (struct bgp_node *) pptrs->bgp_src;
   struct bgp_info *info;
 
-  if (config.nfacctd_bgp_peer_as_src_type & BGP_SRC_PRIMITIVES_MAP) {
+  if (config.bgp_daemon_peer_as_src_type & BGP_SRC_PRIMITIVES_MAP) {
     e->key.peer_src_as.n = pptrs->bpas;
   }
   else {
@@ -3341,10 +3921,10 @@ int PT_map_index_fdata_peer_src_as_handler(struct id_entry *e, pm_hash_serial_t 
   return FALSE;
 }
 
-int PT_map_index_fdata_peer_dst_as_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_peer_dst_as_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3389,7 +3969,7 @@ int PT_map_index_fdata_peer_dst_as_handler(struct id_entry *e, pm_hash_serial_t 
   return FALSE;
 }
 
-int PT_map_index_fdata_mpls_vpn_rd_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_mpls_vpn_rd_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
   struct bgp_node *dst_ret = (struct bgp_node *) pptrs->bgp_dst;
@@ -3402,7 +3982,7 @@ int PT_map_index_fdata_mpls_vpn_rd_handler(struct id_entry *e, pm_hash_serial_t 
 
     if (dst_ret) {
       info = (struct bgp_info *) pptrs->bgp_dst_info;
-      if (info && info->extra) memcpy(&e->key.mpls_vpn_rd.rd, &info->extra->rd, sizeof(rd_t));
+      if (info && info->attr_extra) memcpy(&e->key.mpls_vpn_rd.rd, &info->attr_extra->rd, sizeof(rd_t));
     }
   }
 
@@ -3411,25 +3991,53 @@ int PT_map_index_fdata_mpls_vpn_rd_handler(struct id_entry *e, pm_hash_serial_t 
   return FALSE;
 }
 
-int PT_map_index_fdata_mpls_vpn_id_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_mpls_pw_id_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+  u_int32_t tmp32 = 0;
+
+  if (config.acct_type == ACCT_NF) {
+    switch (hdr->version) {
+    case 10:
+    case 9:
+      if (tpl->tpl[NF9_PSEUDOWIREID].len) {
+	memcpy(&tmp32, pptrs->f_data+tpl->tpl[NF9_PSEUDOWIREID].off, 4);
+	e->key.mpls_pw_id.n = ntohl(tmp32);
+      }
+    }
+  }
+  else if (config.acct_type == ACCT_SF) {
+    e->key.mpls_pw_id.n = sample->mpls_vll_vc_id;
+  }
+  else return TRUE;
+
+  hash_serial_append(hash_serializer, (char *)&e->key.mpls_pw_id.n, sizeof(u_int32_t), FALSE);
+  return FALSE;
+}
+
+int PT_map_index_fdata_mpls_vpn_id_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int32_t tmp32 = 0;
 
   if (config.acct_type == ACCT_NF) {
     switch(hdr->version) {
     case 10:
     case 9:
       if (tpl->tpl[NF9_INGRESS_VRFID].len) {
-        memcpy(&e->key.mpls_vpn_id.n, pptrs->f_data+tpl->tpl[NF9_INGRESS_VRFID].off, MIN(tpl->tpl[NF9_INGRESS_VRFID].len, 4));
+        memcpy(&tmp32, pptrs->f_data+tpl->tpl[NF9_INGRESS_VRFID].off, MIN(tpl->tpl[NF9_INGRESS_VRFID].len, 4));
+	e->key.mpls_vpn_id.n = ntohl(tmp32);
       }
 
-      if (tpl->tpl[NF9_EGRESS_VRFID].len) {
-        memcpy(&e->key.mpls_vpn_id.n, pptrs->f_data+tpl->tpl[NF9_EGRESS_VRFID].off, MIN(tpl->tpl[NF9_EGRESS_VRFID].len, 4));
+      if (tpl->tpl[NF9_EGRESS_VRFID].len && !e->key.mpls_vpn_id.n) {
+        memcpy(&tmp32, pptrs->f_data+tpl->tpl[NF9_EGRESS_VRFID].off, MIN(tpl->tpl[NF9_EGRESS_VRFID].len, 4));
+	e->key.mpls_vpn_id.n = ntohl(tmp32);
       }
-
-      break;
     }
   }
 
@@ -3438,12 +4046,11 @@ int PT_map_index_fdata_mpls_vpn_id_handler(struct id_entry *e, pm_hash_serial_t 
   return FALSE;
 }
 
-int PT_map_index_fdata_mpls_label_bottom_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_mpls_label_bottom_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
-  SFSample *sample = (SFSample *) pptrs->f_data;
 
   if (config.acct_type == ACCT_NF) {
     int label_idx;
@@ -3466,10 +4073,10 @@ int PT_map_index_fdata_mpls_label_bottom_handler(struct id_entry *e, pm_hash_ser
   return FALSE;
 }
 
-int PT_map_index_fdata_src_mac_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_src_mac_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3492,10 +4099,10 @@ int PT_map_index_fdata_src_mac_handler(struct id_entry *e, pm_hash_serial_t *has
   return FALSE;
 }
 
-int PT_map_index_fdata_dst_mac_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_dst_mac_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
 
@@ -3518,10 +4125,10 @@ int PT_map_index_fdata_dst_mac_handler(struct id_entry *e, pm_hash_serial_t *has
   return FALSE;
 }
 
-int PT_map_index_fdata_vlan_id_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_vlan_id_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   SFSample *sample = (SFSample *) pptrs->f_data;
   u_int16_t tmp16 = 0;
@@ -3550,10 +4157,10 @@ int PT_map_index_fdata_vlan_id_handler(struct id_entry *e, pm_hash_serial_t *has
   return FALSE;
 }
 
-int PT_map_index_fdata_cvlan_id_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_cvlan_id_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
   u_int16_t tmp16 = 0;
 
@@ -3574,47 +4181,238 @@ int PT_map_index_fdata_cvlan_id_handler(struct id_entry *e, pm_hash_serial_t *ha
   return FALSE;
 }
 
-int PT_map_index_fdata_fwdstatus_handler(struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+int PT_map_index_fdata_src_net_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
   struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
-  struct struct_header_v8 *hdr = (struct struct_header_v8 *) pptrs->f_header;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
   struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
-  u_int32_t fwdstatus = 0;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+  SFLAddress *sf_addr = &sample->ipsrc;
+  u_int8_t netmask;
+  int ret;
+
+  if (config.acct_type == ACCT_NF) {
+    switch(hdr->version) {
+    case 10:
+    case 9:
+      if (tpl->tpl[NF9_IPV4_SRC_ADDR].len) {
+	memcpy(&e->key.src_net.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_SRC_ADDR].off, MIN(tpl->tpl[NF9_IPV4_SRC_ADDR].len, 4));
+	e->key.src_net.a.family = AF_INET;
+      }
+      else if (tpl->tpl[NF9_IPV4_SRC_PREFIX].len) {
+	memcpy(&e->key.src_net.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_SRC_PREFIX].off, MIN(tpl->tpl[NF9_IPV4_SRC_PREFIX].len, 4));
+	e->key.src_net.a.family = AF_INET;
+      }
+      if (tpl->tpl[NF9_IPV6_SRC_ADDR].len) {
+	memcpy(&e->key.src_net.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_SRC_ADDR].off, MIN(tpl->tpl[NF9_IPV6_SRC_ADDR].len, 16));
+	e->key.src_net.a.family = AF_INET6;
+      }
+      else if (tpl->tpl[NF9_IPV6_SRC_PREFIX].len) {
+	memcpy(&e->key.src_net.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_SRC_PREFIX].off, MIN(tpl->tpl[NF9_IPV6_SRC_PREFIX].len, 16));
+	e->key.src_net.a.family = AF_INET6;
+      }
+      break;
+    case 5:
+      e->key.src_net.a.address.ipv4.s_addr = ((struct struct_export_v5 *) pptrs->f_data)->srcaddr.s_addr;
+      e->key.src_net.a.family = AF_INET;
+      break;
+    }
+  }
+  else if (config.acct_type == ACCT_SF) {
+    if (sample->gotIPV4) {
+      e->key.src_net.a.address.ipv4.s_addr = sample->dcd_srcIP.s_addr;
+      e->key.src_net.a.family = AF_INET;
+    }
+    else if (sample->gotIPV6) {
+      memcpy(&e->key.src_net.a.address.ipv6, &sf_addr->address.ip_v6, IP6AddrSz);
+      e->key.src_net.a.family = AF_INET6;
+    }
+  }
+  else return TRUE;
+
+  if (idx_netmask >= 0 && idx->netmask.hdlr_no == (idx_hdlr + 1)) {
+    if (e->key.src_net.a.family == AF_INET) {
+      ret = cdada_list_get(idx->netmask.v4.list, idx_netmask, &netmask);
+    }
+    else if (e->key.src_net.a.family == AF_INET6) {
+      ret = cdada_list_get(idx->netmask.v6.list, idx_netmask, &netmask);
+    }
+
+    if (ret == CDADA_SUCCESS) {
+      e->key.src_net.m.family = e->key.src_net.a.family;
+      e->key.src_net.m.len = netmask;
+      apply_addr_mask(&e->key.src_net.a, &e->key.src_net.m); 
+    }
+  }
+
+  hash_serial_append(hash_serializer, (char *)&e->key.src_net.a, sizeof(struct host_addr), FALSE);
+  hash_serial_append(hash_serializer, (char *)&e->key.src_net.m.len, sizeof(e->key.src_net.m.len), FALSE);
+
+  return FALSE;
+}
+
+int PT_map_index_fdata_dst_net_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  SFSample *sample = (SFSample *) pptrs->f_data;
+  SFLAddress *sf_addr = &sample->ipdst;
+  u_int8_t netmask;
+  int ret;
+
+  if (config.acct_type == ACCT_NF) {
+    switch(hdr->version) {
+    case 10:
+    case 9:
+      if (tpl->tpl[NF9_IPV4_DST_ADDR].len) {
+	memcpy(&e->key.dst_net.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_DST_ADDR].off, MIN(tpl->tpl[NF9_IPV4_DST_ADDR].len, 4));
+	e->key.dst_net.a.family = AF_INET;
+      }
+      else if (tpl->tpl[NF9_IPV4_DST_PREFIX].len) {
+	memcpy(&e->key.dst_net.a.address.ipv4, pptrs->f_data+tpl->tpl[NF9_IPV4_DST_PREFIX].off, MIN(tpl->tpl[NF9_IPV4_DST_PREFIX].len, 4));
+	e->key.dst_net.a.family = AF_INET;
+      }
+      if (tpl->tpl[NF9_IPV6_DST_ADDR].len) {
+	memcpy(&e->key.dst_net.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_DST_ADDR].off, MIN(tpl->tpl[NF9_IPV6_DST_ADDR].len, 16));
+	e->key.dst_net.a.family = AF_INET6;
+      }
+      else if (tpl->tpl[NF9_IPV6_DST_PREFIX].len) {
+	memcpy(&e->key.dst_net.a.address.ipv6, pptrs->f_data+tpl->tpl[NF9_IPV6_DST_PREFIX].off, MIN(tpl->tpl[NF9_IPV6_DST_PREFIX].len, 16));
+	e->key.dst_net.a.family = AF_INET6;
+      }
+      break;
+    case 5:
+      e->key.dst_net.a.address.ipv4.s_addr = ((struct struct_export_v5 *) pptrs->f_data)->dstaddr.s_addr;
+      e->key.dst_net.a.family = AF_INET;
+      break;
+    }
+  }
+  else if (config.acct_type == ACCT_SF) {
+    if (sample->gotIPV4) {
+      e->key.dst_net.a.address.ipv4.s_addr = sample->dcd_dstIP.s_addr;
+      e->key.dst_net.a.family = AF_INET;
+    }
+    else if (sample->gotIPV6) {
+      memcpy(&e->key.dst_net.a.address.ipv6, &sf_addr->address.ip_v6, IP6AddrSz);
+      e->key.dst_net.a.family = AF_INET6;
+    }
+  }
+  else return TRUE;
+
+  if (idx_netmask >= 0 && idx->netmask.hdlr_no == (idx_hdlr + 1)) {
+    if (e->key.dst_net.a.family == AF_INET) {
+      ret = cdada_list_get(idx->netmask.v4.list, idx_netmask, &netmask);
+    }
+    else if (e->key.dst_net.a.family == AF_INET6) {
+      ret = cdada_list_get(idx->netmask.v6.list, idx_netmask, &netmask);
+    }
+
+    if (ret == CDADA_SUCCESS) {
+      e->key.dst_net.m.family = e->key.dst_net.a.family;
+      e->key.dst_net.m.len = netmask;
+      apply_addr_mask(&e->key.dst_net.a, &e->key.dst_net.m);
+    }
+  }
+
+  hash_serial_append(hash_serializer, (char *)&e->key.dst_net.a, sizeof(struct host_addr), FALSE);
+  hash_serial_append(hash_serializer, (char *)&e->key.dst_net.m.len, sizeof(e->key.dst_net.m.len), FALSE);
+
+  return FALSE;
+}
+
+int PT_map_index_fdata_is_multicast_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  SFSample *sample = (SFSample *) pptrs->f_data;
 
   if (config.acct_type == ACCT_NF) {
     switch (hdr->version) {
     case 10:
     case 9:
-      if (tpl->tpl[NF9_FORWARDING_STATUS].len == 1) {
-        memcpy(&fwdstatus, pptrs->f_data+tpl->tpl[NF9_FORWARDING_STATUS].off, MIN(tpl->tpl[NF9_FORWARDING_STATUS].len, 1));
-        e->key.fwdstatus.n = fwdstatus;
+      if (tpl->tpl[NF9_IN_DST_MAC].len) {
+	e->key.is_multicast.n = IS_MAC_MULTICAST(pptrs->f_data+tpl->tpl[NF9_IN_DST_MAC].off);
+      }
+      break;
+    default:
+      break; /* this field does not exist */
+    }
+  }
+  else if (config.acct_type == ACCT_SF) {
+    e->key.is_multicast.n = IS_MAC_MULTICAST(sample->eth_dst);
+  }
+
+  hash_serial_append(hash_serializer, (char *)&e->key.is_multicast, sizeof(u_int8_t), FALSE);
+
+  return FALSE;
+}
+
+int PT_map_index_fdata_fwd_status_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
+{
+  struct packet_ptrs *pptrs = (struct packet_ptrs *) src;
+  struct struct_header_v5 *hdr = (struct struct_header_v5 *) pptrs->f_header;
+  struct template_cache_entry *tpl = (struct template_cache_entry *) pptrs->f_tpl;
+  u_int32_t fwd_status = 0;
+
+  if (config.acct_type == ACCT_NF) {
+    switch (hdr->version) {
+    case 10:
+    case 9:
+      if (tpl->tpl[NF9_FWD_STATUS].len == 1) {
+        memcpy(&fwd_status, pptrs->f_data+tpl->tpl[NF9_FWD_STATUS].off, MIN(tpl->tpl[NF9_FWD_STATUS].len, 1));
+        e->key.fwd_status.n = fwd_status;
       }
     }
   }
   else return TRUE;
 
-  hash_serial_append(hash_serializer, (char *)&e->key.fwdstatus.n, sizeof(u_int8_t), FALSE);
+  hash_serial_append(hash_serializer, (char *)&e->key.fwd_status.n, sizeof(u_int8_t), FALSE);
 
   return FALSE;
 }
 
-void pcap_interfaces_map_validate(char *filename, struct plugin_requests *req)
+int PT_map_index_fdata_null_handler(struct id_table_index *idx, int idx_hdlr, int idx_netmask, struct id_entry *e, pm_hash_serial_t *hash_serializer, void *src)
 {
-  struct pcap_interfaces *table = (struct pcap_interfaces *) req->key_value_table;
+  e->key.null.n = 0;
+
+  hash_serial_append(hash_serializer, (char *)&e->key.null.n, sizeof(u_int8_t), FALSE);
+
+  return FALSE;
+}
+
+void pm_pcap_interfaces_map_validate(char *filename, struct plugin_requests *req)
+{
+  struct pm_pcap_interfaces *table = (struct pm_pcap_interfaces *) req->key_value_table;
   int valid = FALSE;
 
   if (table && table->list) {
-    if (table->list[table->num].ifindex && strlen(table->list[table->num].ifname))
-      valid = TRUE;
+    if (strlen(table->list[table->num].ifname)) {
+      if (config.pcap_ifindex == PCAP_IFINDEX_MAP) {
+	if (table->list[table->num].ifindex) {
+	  valid = TRUE;
+	}
+      }
+      else {
+	valid = TRUE;
+      }
+    }
 
-    if (valid) table->num++;
-    else memset(&table->list[table->num], 0, sizeof(struct pcap_interface));
+    if (valid) {
+      table->num++;
+    }
+    else {
+      Log(LOG_WARNING, "WARN ( %s/%s ): [%s] Invalid entry: ifname=%s\n",
+	  config.name, config.type, filename, table->list[table->num].ifname);
+      memset(&table->list[table->num], 0, sizeof(struct pm_pcap_interface));
+    }
   }
 }
 
-int pcap_interfaces_map_ifindex_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+int pm_pcap_interfaces_map_ifindex_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  struct pcap_interfaces *table = (struct pcap_interfaces *) req->key_value_table;
+  struct pm_pcap_interfaces *table = (struct pm_pcap_interfaces *) req->key_value_table;
   char *endp;
 
   if (table && table->list) {
@@ -3638,9 +4436,9 @@ int pcap_interfaces_map_ifindex_handler(char *filename, struct id_entry *e, char
   return FALSE;
 }
 
-int pcap_interfaces_map_ifname_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+int pm_pcap_interfaces_map_ifname_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  struct pcap_interfaces *table = (struct pcap_interfaces *) req->key_value_table;
+  struct pm_pcap_interfaces *table = (struct pm_pcap_interfaces *) req->key_value_table;
 
   if (table && table->list) {
     if (table->num < PCAP_MAX_INTERFACES) {
@@ -3663,9 +4461,9 @@ int pcap_interfaces_map_ifname_handler(char *filename, struct id_entry *e, char 
   return FALSE;
 }
 
-int pcap_interfaces_map_direction_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
+int pm_pcap_interfaces_map_direction_handler(char *filename, struct id_entry *e, char *value, struct plugin_requests *req, int acct_type)
 {
-  struct pcap_interfaces *table = (struct pcap_interfaces *) req->key_value_table;
+  struct pm_pcap_interfaces *table = (struct pm_pcap_interfaces *) req->key_value_table;
 
   if (table && table->list) {
     if (table->num < PCAP_MAX_INTERFACES) {
@@ -3690,55 +4488,55 @@ int pcap_interfaces_map_direction_handler(char *filename, struct id_entry *e, ch
   return FALSE;
 }
 
-void pcap_interfaces_map_initialize(struct pcap_interfaces *map)
+void pm_pcap_interfaces_map_initialize(struct pm_pcap_interfaces *map)
 {
-  memset(map, 0, sizeof(struct pcap_interfaces));
+  memset(map, 0, sizeof(struct pm_pcap_interfaces));
 
   /* Setting up the list */
-  map->list = malloc((PCAP_MAX_INTERFACES) * sizeof(struct pcap_interface));
+  map->list = malloc((PCAP_MAX_INTERFACES) * sizeof(struct pm_pcap_interface));
   if (!map->list) {
     Log(LOG_ERR, "ERROR ( %s/%s ): unable to allocate pcap_interfaces_map. Exiting ...\n", config.name, config.type);
-    exit(1);
+    exit_gracefully(1);
   }
-  else memset(map->list, 0, (PCAP_MAX_INTERFACES) * sizeof(struct pcap_interface));
+  else memset(map->list, 0, (PCAP_MAX_INTERFACES) * sizeof(struct pm_pcap_interface));
 }
 
-void pcap_interfaces_map_load(struct pcap_interfaces *map)
+void pm_pcap_interfaces_map_load(struct pm_pcap_interfaces *map)
 {
   struct plugin_requests req;
-  int pcap_interfaces_allocated = FALSE;
+  int pm_pcap_interfaces_allocated = FALSE;
 
   memset(&req, 0, sizeof(req));
 
   req.key_value_table = (void *) map;
-  load_id_file(MAP_PCAP_INTERFACES, config.pcap_interfaces_map, NULL, &req, &pcap_interfaces_allocated);
+  load_id_file(MAP_PCAP_INTERFACES, config.pcap_interfaces_map, NULL, &req, &pm_pcap_interfaces_allocated);
 }
 
-void pcap_interfaces_map_destroy(struct pcap_interfaces *map)
+void pm_pcap_interfaces_map_destroy(struct pm_pcap_interfaces *map)
 {
   int idx;
 
-  for (idx = 0; idx < map->num; idx++) memset(&map->list[idx], 0, sizeof(struct pcap_interface));
+  for (idx = 0; idx < map->num; idx++) memset(&map->list[idx], 0, sizeof(struct pm_pcap_interface));
 
   map->num = 0;
 }
 
-void pcap_interfaces_map_copy(struct pcap_interfaces *dst, struct pcap_interfaces *src)
+void pm_pcap_interfaces_map_copy(struct pm_pcap_interfaces *dst, struct pm_pcap_interfaces *src)
 {
   int idx;
 
-  for (idx = 0; idx < src->num; idx++) memcpy(&dst->list[idx], &src->list[idx], sizeof(struct pcap_interface)); 
+  for (idx = 0; idx < src->num; idx++) memcpy(&dst->list[idx], &src->list[idx], sizeof(struct pm_pcap_interface)); 
 
   dst->num = src->num;
 }
 
-u_int32_t pcap_interfaces_map_lookup_ifname(struct pcap_interfaces *map, char *ifname)
+u_int32_t pm_pcap_interfaces_map_lookup_ifname(struct pm_pcap_interfaces *map, char *ifname)
 {
   u_int32_t ifindex = 0;
   int idx;
 
   for (idx = 0; idx < map->num; idx++) {
-    if (!strncmp(map->list[idx].ifname, ifname, strlen(ifname))) {
+    if (strlen(map->list[idx].ifname) == strlen(ifname) && !strncmp(map->list[idx].ifname, ifname, strlen(ifname))) {
       ifindex = map->list[idx].ifindex;
       break;
     }
@@ -3747,12 +4545,12 @@ u_int32_t pcap_interfaces_map_lookup_ifname(struct pcap_interfaces *map, char *i
   return ifindex;
 }
 
-struct pcap_interface *pcap_interfaces_map_getentry_by_ifname(struct pcap_interfaces *map, char *ifname)
+struct pm_pcap_interface *pm_pcap_interfaces_map_getentry_by_ifname(struct pm_pcap_interfaces *map, char *ifname)
 {
   int idx;
 
   for (idx = 0; idx < map->num; idx++) {
-    if (!strncmp(map->list[idx].ifname, ifname, strlen(ifname))) {
+    if (strlen(map->list[idx].ifname) == strlen(ifname) && !strncmp(map->list[idx].ifname, ifname, strlen(ifname))) {
       return &map->list[idx];
     }
   }
@@ -3760,7 +4558,16 @@ struct pcap_interface *pcap_interfaces_map_getentry_by_ifname(struct pcap_interf
   return NULL;
 }
 
-char *pcap_interfaces_map_getnext_ifname(struct pcap_interfaces *map, int *index)
+struct pm_pcap_interface *pm_pcap_interfaces_map_getentry_by_idx(struct pm_pcap_interfaces *map, int idx)
+{
+  if (idx < map->num) {
+    return &map->list[idx];
+  }
+
+  return NULL;
+}
+
+char *pm_pcap_interfaces_map_getnext_ifname(struct pm_pcap_interfaces *map, int *index)
 {
   char *ifname = NULL;
   int loc_idx = (*index);
@@ -3771,4 +4578,26 @@ char *pcap_interfaces_map_getnext_ifname(struct pcap_interfaces *map, int *index
   }
 
   return ifname;
+}
+
+char *pm_pcap_interfaces_map_get_ifname(struct pm_pcap_interfaces *map, int index)
+{
+  char *ifname = NULL;
+
+  if (index < map->num) {
+    ifname = map->list[index].ifname;
+  }
+
+  return ifname;
+}
+
+int pm_pcap_interfaces_map_get_direction(struct pm_pcap_interfaces *map, int index)
+{
+  int direction = 0;
+
+  if (index < map->num) {
+    direction = map->list[index].direction;
+  }
+
+  return direction;
 }

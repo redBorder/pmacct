@@ -34,14 +34,6 @@
 extern char *__progname;
 #endif
 
-char pmacctd_globstr[] = "pmacctd\0";
-char nfacctd_globstr[] = "nfacctd\0";
-char sfacctd_globstr[] = "sfacctd\0";
-char uacctd_globstr[] = "uacctd\0";
-char pmtele_globstr[] = "pmtelemetryd\0";
-char pmbgpd_globstr[] = "pmbgpd\0";
-char pmbmpd_globstr[] = "pmbmpd\0";
-
 /*
  * NEWSTR -- Create a copy of a C string
  */
@@ -95,7 +87,6 @@ initsetproctitle(argc, argv, envp)
 	char **envp;
 {
 	register int i;
-	int align;
 	extern char **environ;
 
 	/*
@@ -136,10 +127,10 @@ initsetproctitle(argc, argv, envp)
 	}
 
 #if defined PROGNAME && SPT_TYPE == SPT_REUSEARGV
-	if (config.acct_type == ACCT_PM) __progname = pmacctd_globstr;
+	if (config.uacctd_group) __progname = uacctd_globstr; /* XXX: hack */
+	else if (config.acct_type == ACCT_PM) __progname = pmacctd_globstr;
 	else if (config.acct_type == ACCT_NF) __progname = nfacctd_globstr;
 	else if (config.acct_type == ACCT_SF) __progname = sfacctd_globstr;
-	else if (config.acct_type == ACCT_UL) __progname = uacctd_globstr;
 	else if (config.acct_type == ACCT_PMTELE) __progname = pmtele_globstr;
 	else if (config.acct_type == ACCT_PMBGP) __progname = pmbgpd_globstr;
 	else if (config.acct_type == ACCT_PMBMP) __progname = pmbmpd_globstr;

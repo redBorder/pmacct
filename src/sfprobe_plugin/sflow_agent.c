@@ -1,5 +1,14 @@
-/* Copyright (c) 2002-2006 InMon Corp. Licensed under the terms of the InMon sFlow licence: */
-/* http://www.inmon.com/technology/sflowlicense.txt */
+/*
+    pmacct (Promiscuous mode IP Accounting package)
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
+*/
+
+/* 
+   Originally based on sflowtool which is:
+
+   Copyright (c) 2002-2006 InMon Corp. Licensed under the terms of the InMon sFlow licence:
+   http://www.inmon.com/technology/sflowlicense.txt
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +17,7 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include "pmacct.h"
 #include "sflow_api.h"
 
 static void * sflAlloc(SFLAgent *agent, size_t bytes);
@@ -31,11 +41,13 @@ void sfl_agent_init(SFLAgent *agent,
 		    errorFn_t errorFn,
 		    sendFn_t sendFn)
 {
-  struct sockaddr ssource_ip;
-  int ret;
+  struct sockaddr_storage ssource_ip;
+  int ret = 0, family = 0;
 
   /* first clear everything */
   memset(agent, 0, sizeof(*agent));
+  memset(&ssource_ip, 0, sizeof(ssource_ip));
+
   /* now copy in the parameters */
   agent->myIP = *myIP; /* structure copy */
   agent->subId = subId;
@@ -47,14 +59,18 @@ void sfl_agent_init(SFLAgent *agent,
   agent->errorFn = errorFn;
   agent->sendFn = sendFn;
 
+  if (myIP->type == SFLADDRESSTYPE_IP_V4) family = AF_INET;
+  else if (myIP->type == SFLADDRESSTYPE_IP_V6) family = AF_INET6;
+
   if (config.nfprobe_source_ip) {
     ret = str_to_addr(config.nfprobe_source_ip, &config.nfprobe_source_ha);
-    addr_to_sa(&ssource_ip, &config.nfprobe_source_ha, 0);
+    addr_to_sa((struct sockaddr *) &ssource_ip, &config.nfprobe_source_ha, 0);
+    family = config.nfprobe_source_ha.family; 
   }
   
   if(sendFn == NULL) {
     /* open the socket */
-    if((agent->receiverSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
+    if ((agent->receiverSocket = socket(family, SOCK_DGRAM, IPPROTO_UDP)) == -1)
       sfl_agent_sysError(agent, "agent", "socket open failed");
   }
 
@@ -62,20 +78,20 @@ void sfl_agent_init(SFLAgent *agent,
     int opt = config.nfprobe_ipprec << 5;
     int rc;
 
-    rc = setsockopt(agent->receiverSocket, IPPROTO_IP, IP_TOS, &opt, sizeof(opt));
+    rc = setsockopt(agent->receiverSocket, IPPROTO_IP, IP_TOS, &opt, (socklen_t) sizeof(opt));
     if (rc < 0) Log(LOG_WARNING, "WARN ( %s/%s ): setsockopt() failed for IP_TOS: %s\n", config.name, config.type, strerror(errno));
   }
 
   if (ret && bind(agent->receiverSocket, (struct sockaddr *) &ssource_ip, sizeof(ssource_ip)) == -1) {
     Log(LOG_ERR, "ERROR ( %s/%s ): bind() failed: %s\n", config.name, config.type, strerror(errno));
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   if (config.pipe_size) {
     int rc, value;
 
     value = MIN(config.pipe_size, INT_MAX);
-    rc = Setsocksize(agent->receiverSocket, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value));
+    rc = Setsocksize(agent->receiverSocket, SOL_SOCKET, SO_SNDBUF, &value, (socklen_t) sizeof(value));
     if (rc < 0) Log(LOG_WARNING, "WARN ( %s/%s ): setsockopt() failed for SOL_SNDBUF: %s\n", config.name, config.type, strerror(errno));
   }
 }

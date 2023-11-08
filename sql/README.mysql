@@ -12,7 +12,7 @@ the two scripts below, in the same order (assuming mysql command is in the path)
   * data will be available in 'acct' table of 'pmacct' DB.
   * Add 'sql_table_version: 1' line to your configuration.
 
-Similarly, v2 to v7 tables: 
+Similarly, v2 to v9 tables: 
 
 - To create v2 tables:
   * mysql -u root -p < pmacct-create-db_v2.mysql
@@ -24,13 +24,13 @@ Similarly, v2 to v7 tables:
 
 [ ... ]
 
-- To create v7 tables:
-  * mysql -u root -p < pmacct-create-db_v7.mysql
+- To create v9 tables:
+  * mysql -u root -p < pmacct-create-db_v9.mysql
   * mysql -u root -p < pmacct-grant-db.mysql
 
-- To use v7 tables:
-  * data will be available in 'acct_v7' table of 'pmacct' DB.
-  * Add 'sql_table_version: 7' line to your configuration.
+- To use v9 tables:
+  * data will be available in 'acct_v9' table of 'pmacct' DB.
+  * Add 'sql_table_version: 9' line to your configuration.
 
 Similarly, BGP tables:
 
@@ -45,14 +45,15 @@ Similarly, BGP tables:
 
 - To understand difference between the various table versions:
   * Do you need any of the BGP primitives ? Then look the next section.
+  * Do you need tags for traffic tagging ? Then you have to use v9. 
   * Do you need TCP flags ? Then you have to use v7.
   * Do you need both IP addresses and AS numbers in the same table ? Then you have to use v6.
   * Do you need packet classification ? Then you have to use v5.
   * Do you need flows (other than packets) accounting ? Then you have to use v4.
   * Do you need ToS/DSCP field (QoS) accounting ? Then you have to use v3.
-  * Do you need agent ID for distributed accounting and packet tagging ? Then you have to use v2. 
   * Do you need VLAN traffic accounting ? Then you have to use v2.
   * If all of the above points sound useless, then use v1.
+  * v8 changes field names so to bring all supported databases to the same naming convention. 
 
 - To understand difference between the various BGP table versions:
   * Only BGP table v1 is currently available.
@@ -75,13 +76,9 @@ Similarly, BGP tables:
   * peer_src_as => peer_as_src (INT(4) UNSIGNED NOT NULL)
   * peer_dst_as => peer_as_dst (INT(4) UNSIGNED NOT NULL)
   * peer_src_ip => peer_ip_src (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * peer_dst_ip => peer_ip_dst (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * mpls_vpn_rd => mpls_vpn_rd (CHAR(18) NOT NULL)
   * std_comm => comms (CHAR(24) NOT NULL)
   * ext_comm => ecomms (CHAR(24) NOT NULL)
@@ -89,12 +86,14 @@ Similarly, BGP tables:
   * as_path => as_path (CHAR(21) NOT NULL)
   * local_pref => local_pref (INT(4) UNSIGNED NOT NULL)
   * med => med (INT(4) UNSIGNED NOT NULL)
+  * dst_roa => roa_dst (CHAR(1) NULL)
   * src_std_comm => comms_src (CHAR(24) NOT NULL)
   * src_ext_comm => ecomms_src (CHAR(24) NOT NULL)
   * src_lrg_comm => lcomms_src (CHAR(24) NOT NULL)
   * src_as_path => as_path_src (CHAR(21) NOT NULL)
   * src_local_pref => local_pref_src (INT(4) UNSIGNED NOT NULL)
   * src_med => med_src (INT(4) UNSIGNED NOT NULL)
+  * src_roa => roa_src (CHAR(1) NULL)
   * in_iface => iface_in (INT(4) UNSIGNED NOT NULL, see README.iface)
   * out_iface => iface_out (INT(4) UNSIGNED NOT NULL, see README.iface)
   * src_mask => mask_src (INT(1) UNSIGNED NOT NULL, see README.mask)
@@ -105,62 +104,60 @@ Similarly, BGP tables:
   * dst_host_country => country_ip_dst (CHAR(2) NOT NULL, see README.GeoIP)
   * src_host_pocode => pocode_ip_src (CHAR(12) NOT NULL, see README.GeoIP)
   * dst_host_pocode => pocode_ip_dst (CHAR(12) NOT NULL, see README.GeoIP)
-  * sampling_rate => sampling_rate (INT(4) UNSIGNED NOT NULL, see README.sampling_rate)
+  * src_host_coords => lat_ip_src (FLOAT NOT NULL, see README.GeoIP)
+  * src_host_coords => lon_ip_src (FLOAT NOT NULL, see README.GeoIP)
+  * dst_host_coords => lat_ip_dst (FLOAT NOT NULL, see README.GeoIP)
+  * dst_host_coords => lon_ip_dst (FLOAT NOT NULL, see README.GeoIP)
+  * sampling_rate => sampling_rate (INT(4) UNSIGNED NOT NULL, see README.sampling)
+  * sampling_direction => sampling_direction (CHAR(1) NOT NULL, see README.sampling)
   * class => class_id (CHAR(16) NOT NULL)
   * src_mac => mac_src (CHAR(17) NOT NULL)
   * dst_mac => mac_dst (CHAR(17) NOT NULL)
   * vlan => vlan (INT(2) UNSIGNED NOT NULL)
+  * in_vlan => vlan_in (INT(2) UNSIGNED NOT NULL)
+  * out_vlan => vlan_out (INT(2) UNSIGNED NOT NULL)
   * src_as => as_src (INT(4) UNSIGNED NOT NULL)
   * dst_as => as_dst (INT(4) UNSIGNED NOT NULL)
   * src_host => ip_src (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * dst_host => ip_dst (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * src_net => net_src (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * dst_net => net_dst (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * src_port => src_port (INT(2) UNSIGNED NOT NULL)
     - or src_port => port_src (INT(2) UNSIGNED NOT NULL, if sql_table_version >= 8)
   * dst_port => dst_port (INT(2) UNSIGNED NOT NULL)
     - or dst_port => port_dst (INT(2) UNSIGNED NOT NULL, if sql_table_version >= 8)
-  * tcpflags => tcp_flags (INT(4) UNSIGNED NOT NULL)
+  * tcpflags => tcp_flags (INT(2) UNSIGNED NOT NULL)
   * proto => ip_proto (CHAR(6) NOT NULL)
     - or (INT(1) UNSIGNED NOT NULL, if sql_num_protos: true)
   * tos => tos (INT(4) UNSIGNED NOT NULL)
   * post_nat_src_host => post_nat_ip_src (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * post_nat_dst_host => post_nat_ip_dst (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * post_nat_src_port => post_nat_port_src (INT(2) UNSIGNED NOT NULL)
   * post_nat_dst_port => post_nat_port_dst (INT(2) UNSIGNED NOT NULL)
   * nat_event => nat_event (INT(1) UNSIGNED NOT NULL)
+  * fwd_status => fwd_status (INT(1) UNSIGNED NOT NULL)
+    - or (VARCHAR(50) NOT NULL, if fwd_status_encode_as_string: true)
   * mpls_label_top => mpls_label_top (INT(4) UNSIGNED NOT NULL)
   * mpls_label_bottom => mpls_label_bottom (INT(4) UNSIGNED NOT NULL)
-  * mpls_stack_depth => mpls_stack_depth (INT(1) UNSIGNED NOT NULL)
+  * mpls_label_stack => mpls_label_stack (VARCHAR(255) NOT NULL)
+  * tunnel_src_mac => tunnel_mac_src (CHAR(17) NOT NULL)
+  * tunnel_dst_mac => tunnel_mac_dst (CHAR(17) NOT NULL)
   * tunnel_src_host => tunnel_ip_src (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * tunnel_dst_host => tunnel_ip_dst (CHAR(45) NOT NULL)
-    - or (CHAR(15) NOT NULL, if --disable-ipv6)
-    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true; see README.IPv6)
-    - or (INT(4) UNSIGNED NOT NULL, if sql_num_hosts: true and --disable-ipv6)
+    - or (VARBINARY(16) NOT NULL, if sql_num_hosts: true)
   * tunnel_proto => tunnel_ip_proto (CHAR(6) NOT NULL)
     - or (INT(1) UNSIGNED NOT NULL, if sql_num_protos: true)
   * tunnel_tos => tunnel_tos (INT(4) UNSIGNED NOT NULL)
+  * tunnel_src_port => tunnel_port_src (INT(2) UNSIGNED NOT NULL)
+  * tunnel_dst_port => tunnel_port_dst (INT(2) UNSIGNED NOT NULL)
+  * tunnel_tcpflags => tunnel_tcp_flags (INT(2) UNSIGNED NOT NULL)
   * timestamp_start => timestamp_start, timestamp_start_residual:
     - timestamp_start DATETIME NOT NULL, see README.timestamp)
     - timestamp_start_residual INT NOT NULL, see README.timestamp)
@@ -176,19 +173,35 @@ Similarly, BGP tables:
   * timestamp_max => timestamp_max, timestamp_max_residual:
     - timestamp_max DATETIME NOT NULL, see README.timestamp)
     - timestamp_max_residual INT NOT NULL, see README.timestamp)
+  * export_proto_seqno => export_proto_seqno (INT(4) UNSIGNED NOT NULL, see README.export_proto) 
+  * export_proto_version => export_proto_version (INT(2) UNSIGNED NOT NULL, see README.export_proto) 
+  * export_proto_sysid => export_proto_sysid (INT(4) UNSIGNED NOT NULL, see README.export_proto) 
 
 - 'packets' and 'bytes' counters need to be defined as part of the SQL schema
   whenever traffic flows are being accounted for; they are not required, and
   are zeroed, if accounting for events, ie. using Cisco NEL; 'stamp_inserted'
   and 'stamp_updated' time references are mandatory only if temporal aggregation
   (sql_history) is enabled:
+  * flows (INT UNSIGNED NOT NULL)
+    - or (flows BIGINT UNSIGNED NOT NULL)
   * packets (INT UNSIGNED NOT NULL)
+    - or (packets BIGINT UNSIGNED NOT NULL)
   * bytes (BIGINT UNSIGNED NOT NULL)
   * stamp_inserted (DATETIME NOT NULL)
+    - or (stamp_inserted BIGINT UNSIGNED NOT NULL, if timestamps_since_epoch: true)
   * stamp_updated (DATETIME)
+    - or (stamp_updated BIGINT UNSIGNED, if timestamps_since_epoch: true)
 
 - For custom-defined primitives refer to the README.custom_primitives doc.
 
+NOTE: certain primitives, ie. BGP attributtes like AS-PATH and communities
+(as_path, std_comm, etc.), can get arbitrarily long if not properly scoped
+(ie. bgp_aspath_radius, bgp_stdcomm_pattern, etc.) and hence not fit in
+default field definitions (ie. CHAR(21) or CHAR(24)). It is possible to
+define these as arbitrarily-long variable-length strings using VARCHAR or
+TEXT data types. Consult latest MySQL/MariaDB docs for examples and notes
+(charset choices, etc.).
+ 
 NOTE: mind to specify EVERYTIME which SQL table version you
 intend to adhere to by using the following config directives:
 

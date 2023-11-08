@@ -6,8 +6,156 @@ the changes done or break old assumptions no longer valid; while the effort
 is to keep these cases at a low, please read this file in preparation to
 upgrading your installation.
 
+TO:	>= 1.7.8
+FROM:	<= 1.7.7
+TOPIC:	kafka_avro_schema_registry
+DESC:	Until version 1.7.7 a custom "-value" string was forcingly appended 
+	to the schema name. This was non-standard practice and hence such
+	practice has been terminated. 
+
+TO:     >= 1.7.8
+FROM:   <= 1.7.7
+TOPIC:	mpls_stack_depth primitive
+DESC:	Support for the primitive has been removed. This has been coincidental
+	with the introduction of the mpls_label_stack primitive, that exposes
+	the full MPLS label stack, including its complex representation (on
+	top of its stringy one), via the mpls_label_stack_encode_as_array
+	configuration directive, in JSON and Apache Avro formats.
+
+TO:	>= 1.7.8
+FROM:	<= 1.7.7
+TOPIC:	BGP, BMP message log / dumps & "label" field
+DESC:	Until version 1.7.7, the output of BGP message logs / dumps would
+	include MPLS labels, ie. as a result of a NLRI being part of a VPN,
+	in the "label" field for both JSON and Avro encodings. In order to
+	align naming convention with flow data plugins and to facilitate
+	introduction of pre_tag_map support in BGP / BMP daemons (which
+	output can be a "tag" or a "label" field), MPLS labels will now be
+	encoded in the "mpls_label" field.  
+
+TO:	>= 1.7.7
+FROM:	<= 1.7.6
+TOPIC:	pmtelemetryd, JSON telemetry input and JSON daemon output
+DESC:	Until version 1.7.6, JSON telemetry input data would be embedded as
+	a 'telemetry_data' string part of the JSON daemon output along with
+	some other meta-data. While this was useful, it was slightly not
+	convenient as extracting actual content from 'telemetry_data' does
+	require some (simple) scriptware in the middle; starting version
+	1.7.7, 'telemetry_data' is a JSON object (hence making the whole
+	JSON daemon output nested) making it easier for consumers to parse
+	the content.
+
+TO:	>= 1.7.7
+FROM:	<= 1.7.6
+TOPIC:  Obsoleted features
+DESC:   Following is the list of features, knobs and plugins that are being
+        discontinued with release 1.7.7:
+	* sql_history_since_epoch was removed from docs for a while; it is
+	  replaced by timestamps_since_epoch so that all timestamps-related
+	  config keys have the 'timestamps' suffix;
+	* refresh_maps and pre_tag_map_entries were removed from docs for a
+	  while; they are replaced respectively by maps_refresh and
+	  maps_entries so that all maps-related config keys have the 'maps'
+	  suffix.
+	* interface_wait and interface were removed from docs for a while;
+	  they are replaced respectively by pcap_interface_wait and
+	  pcap_interface so that all pmacctd / libpcap-related config keys
+	  have the 'pcap' suffix.
+
+TO:	>= 1.7.6
+FROM:	<= 1.7.5
+TOPIC:	Obsoleted features
+DESC:   Following is the list of features, knobs and plugins that are being
+        discontinued with release 1.7.6:
+	* Prefix labels, enabled with --enable-plabel configure switch, has
+	  been removed as now pre_tag_map supports a 'set_label' action to
+	  achieve the same.
+	* sfacctd & timestamp_start aggregation primitive: sFlow does not
+	  include a timestamp as part of its header structure and a time is
+	  effectively created on arrival (timestamp_arrival). While this is
+	  still the case and timestamp_arrival is populated, timestamp_start
+	  will cease to be aliased over timestamp_arrival in order to avoid
+	  confusions.
+
+TO:     >= 1.7.6
+FROM:   <= 1.7.5
+TOPIC:  Default nfprobe plugin protocol version
+DESC:   Since its conception nfprobe plugin default export version has been
+	5. With IPFIX having been standardized back in 2013 with RFC7011 and
+	being widely adopted by both exporters and collector, it is felt it
+	is the right moment to switch the default version. On a sidenote,
+	there are no plans to retire support for verdion 5.
+
+TO:	>= 1.7.6
+FROM:	<= 1.7.5
+TOPIC:	BMP dump timestamps
+DESC:	In order to align the namespace of timestamps to existing ones, ie.
+        timestamp_start timestamp_end timestamp_arrival etc., the field
+	'event_timestamp' was renamed 'timestamp_event'.
+
+TO:	>= 1.7.3
+FROM:	<= 1.7.2
+TOPIC:	BGP-related src primitives (ie. src_as_path) and JSON/Avro encoding
+DESC:	Majority of these primitives were written in a 'src_' field, ie.
+	src_as_path, contraddicting the prevailing name convention of other
+	source/destination fields, ie. port_src, peer_ip_dst, etc.. These
+	fields have now been aligned to the name convention - with src or
+	dst qualifier at the end - and here is the full list of the fields
+	modified: src_comms, src_ecomms, src_lcomms, src_med, src_as_path
+	and src_local_pref; changed in: comms_src, ecomms_src, lcomms_src,
+	med_src, as_path_src and local_pref_src respectively. 
+
+TO:	>= 1.7.3
+FROM:	<= 1.7.2
+TOPIC:	BGP attribute "origin" encoding change
+DESC:	The "origin" attribute was encded as an integer, until 1.7.2. To
+	make output more human-friendly, the encoding has been changed to
+	string in 1.7.3, where three single-letter values are defined:
+	IGP (i), EGP (e) and Incomplete (u). Only release 1.7 releases
+	starting with 1.7.7 do feature a tmp_bgp_daemon_origin_type_int
+	true/false configuration knob to revert to the old encoding in
+	order to allow for smoother pre-1.7.3 upgrades.
+
 TO:	>= 1.7.2
 FROM:	<= 1.7.1
+TOPIC:  Obsoleted features
+DESC:   Following is the list of features, knobs and plugins that are being
+        discontinued with release 1.7.2:
+	* pre_tag_map: matching on 'sampling_rate' is not supported anymore
+	  since a sampling_rate primitive is available from version 0.14.2;
+	  the 'return' feature to return matched data before completing the
+	  map workflow has started the process of being obsolete (retired
+	  from docs but still available).
+	* nfacctd: collection, processing and replication of NetFlow v1, v7
+	  and v8 has been discontinued. The focus will remain on popular v5,
+	  v9 and IPFIX. 
+	* tee_plugin: tee_dissect_send_full_pkt was allowing to specify if,
+	  when dissecting replicated packets due to a complex pre_tag_map,
+	  to send (or not) the full packet. Now, in a simplification move,
+	  full packets are replicated only if no pre_tag_map is set or a
+	  simple pre_tag_map is defined. In the context of replication, in
+	  QUICKSTART is defined what is a simple and a complex pre_tag_map.
+	* Kafka plugin: configuration directives kafka_avro_schema_topic and
+	  kafka_avro_schema_refresh_time allow to produce an Avro schema at
+	  regular time intervals to a topic; Confluent Platform supports an
+	  Avro schema registry which is the clean/preferred way to handle the
+	  distribution of schemas; as a result of this, the existing feature
+	  is made legacy and will be discontinued at the next major release
+	  and a new configuration directive kafka_avro_schema_registry is
+	  introduced. 
+
+TO:	>= 1.7.1
+FROM:	<= 1.7.0
+TOPIC:	nfprobe plugin, nfprobe_engine and NetFlow v9/IPFIX
+DESC:	Until version 1.7.0 it was possible to (mistakenly) configure the
+	NetFlow v9 SourceID field/IPFIX Observation Domain ID with the old
+	NetFlow v5 jargon, ie. '1:1'. This is now threated as invalid and
+	a positive 32-bit number, ie. '100000', is expected. If exporting
+	NetFlow v5, nothing changed: the Engine ID/Engine Type input, ie.
+	'1:1', is still valid and expected.
+
+TO:	>= 1.7.1
+FROM:	<= 1.7.0
 TOPIC:	NetFlow/IPFIX/sFlow statistics via SIGUSR1
 DESC:	If using this feature, please note that there has been a change in
 	the output format. Mainly: 1) agent stats are now one per line, 2)
@@ -52,7 +200,17 @@ DESC:   Following is the list of features, knobs and plugins that are being
         discontinued with release 1.7.1:
 	* pkt_len_distrib primitive is discontinued due to apparent lack of
 	  interest; the primitive was meant to bucket packet/flow/sample
-	  lenghts in a distribution.
+	  lenghts in a distribution. Alternatively pre_tag_map can be used
+	  to achieve the same. Buckets could be defined as follows:
+
+	  set_tag=100	filter='ip[2:2] > 0 && ip[2:2] <= 512'
+	  set_tag=200	filter='ip[2:2] > 512 && ip[2:2] <= 1024'
+	  set_tag=300	filter='ip[2:2] > 1024 && ip[2:2] <= 9000'
+
+	  Then the 'tag' primiive will carry the defined packet size bucket.
+        * BGP daemon offline code, ie. bgp_daemon_offline_* directives, has
+	  been deprecated in favor of alternative approaches, ie. BGP Looking
+	  Glass (bgp_daemon_lg_*) and BGP Xconnects (bgp_daemon_xconnect_*).
 	* removed --enable-threads / --disable-threads configure switch to
 	  allow to compile pmacct even if no pthreads library is available.
 	  From this release support for threads is mandatory. 

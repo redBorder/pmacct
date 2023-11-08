@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -24,13 +24,13 @@
     ndpi.c ndpiReader.c | nDPI | Copyright (C) 2011-17 - ntop.org
 */
 
-#define __NDPI_C
-
-#ifdef WITH_NDPI
 #include "../pmacct.h"
 #include "../ip_flow.h"
 #include "../classifier.h"
 #include "ndpi.h"
+
+/* Global variables */
+struct pm_ndpi_workflow *pm_ndpi_wfl;
 
 void pm_ndpi_free_flow_info_half(struct pm_ndpi_flow_info *flow)
 {
@@ -78,8 +78,8 @@ struct pm_ndpi_flow_info *pm_ndpi_get_flow_info(struct pm_ndpi_workflow *workflo
 						 struct ndpi_tcphdr **tcph,
 						 struct ndpi_udphdr **udph,
 						 u_int16_t *sport, u_int16_t *dport,
-						 struct ndpi_id_struct **src,
-						 struct ndpi_id_struct **dst,
+						 ndpi_id_struct_t **src,
+						 ndpi_id_struct_t **dst,
 						 u_int8_t *proto,
 						 u_int8_t **payload,
 						 u_int16_t *payload_len,
@@ -211,7 +211,7 @@ struct pm_ndpi_flow_info *pm_ndpi_get_flow_info(struct pm_ndpi_workflow *workflo
 
       if (newflow == NULL) {
 	Log(LOG_ERR, "ERROR ( %s/core ): pm_ndpi_get_flow_info() not enough memory (1).\n", config.name);
-	exit(1);
+	exit_gracefully(1);
       }
 
       memset(newflow, 0, sizeof(struct pm_ndpi_flow_info));
@@ -223,19 +223,19 @@ struct pm_ndpi_flow_info *pm_ndpi_get_flow_info(struct pm_ndpi_workflow *workflo
 
       if ((newflow->ndpi_flow = ndpi_flow_malloc(SIZEOF_FLOW_STRUCT)) == NULL) {
 	Log(LOG_ERR, "ERROR ( %s/core ): pm_ndpi_get_flow_info() not enough memory (2).\n", config.name);
-	exit(1);
+	exit_gracefully(1);
       }
       else memset(newflow->ndpi_flow, 0, SIZEOF_FLOW_STRUCT);
 
       if ((newflow->src_id = ndpi_malloc(SIZEOF_ID_STRUCT)) == NULL) {
 	Log(LOG_ERR, "ERROR ( %s/core ): pm_ndpi_get_flow_info() not enough memory (3).\n", config.name);
-	exit(1);
+	exit_gracefully(1);
       }
       else memset(newflow->src_id, 0, SIZEOF_ID_STRUCT);
 
       if ((newflow->dst_id = ndpi_malloc(SIZEOF_ID_STRUCT)) == NULL) {
 	Log(LOG_ERR, "ERROR ( %s/core ): pm_ndpi_get_flow_info() not enough memory (4).\n", config.name);
-	exit(1);
+	exit_gracefully(1);
       }
       else memset(newflow->dst_id, 0, SIZEOF_ID_STRUCT);
 
@@ -268,8 +268,8 @@ struct pm_ndpi_flow_info *pm_ndpi_get_flow_info6(struct pm_ndpi_workflow *workfl
 						  struct ndpi_tcphdr **tcph,
 						  struct ndpi_udphdr **udph,
 						  u_int16_t *sport, u_int16_t *dport,
-						  struct ndpi_id_struct **src,
-						  struct ndpi_id_struct **dst,
+						  ndpi_id_struct_t **src,
+						  ndpi_id_struct_t **dst,
 						  u_int8_t *proto,
 						  u_int8_t **payload,
 						  u_int16_t *payload_len,
@@ -281,7 +281,7 @@ struct pm_ndpi_flow_info *pm_ndpi_get_flow_info6(struct pm_ndpi_workflow *workfl
   iph.version = IPVERSION;
   iph.saddr = iph6->ip6_src.u6_addr.u6_addr32[2] + iph6->ip6_src.u6_addr.u6_addr32[3];
   iph.daddr = iph6->ip6_dst.u6_addr.u6_addr32[2] + iph6->ip6_dst.u6_addr.u6_addr32[3];
-  iph.protocol = iph6->ip6_ctlun.ip6_un1.ip6_un1_nxt;
+  iph.protocol = iph6->ip6_hdr.ip6_un1_nxt;
 
   if (iph.protocol == IPPROTO_DSTOPTS /* IPv6 destination option */) {
     u_int8_t *options = (u_int8_t*)iph6 + sizeof(const struct ndpi_ipv6hdr);
@@ -291,7 +291,7 @@ struct pm_ndpi_flow_info *pm_ndpi_get_flow_info6(struct pm_ndpi_workflow *workfl
 
   return(pm_ndpi_get_flow_info(workflow, pptrs, vlan_id, &iph, iph6, ip_offset,
 			    sizeof(struct ndpi_ipv6hdr),
-			    ntohs(iph6->ip6_ctlun.ip6_un1.ip6_un1_plen),
+			    ntohs(iph6->ip6_hdr.ip6_un1_plen),
 			    tcph, udph, sport, dport,
 			    src, dst, proto, payload, payload_len, src_to_dst_direction));
 }
@@ -312,7 +312,7 @@ struct ndpi_proto pm_ndpi_packet_processing(struct pm_ndpi_workflow *workflow,
 					   u_int16_t ip_offset,
 					   u_int16_t ipsize, u_int16_t rawsize)
 {
-  struct ndpi_id_struct *src, *dst;
+  ndpi_id_struct_t *src, *dst;
   struct pm_ndpi_flow_info *flow = NULL;
   struct ndpi_flow_struct *ndpi_flow = NULL;
   u_int8_t proto;
@@ -354,9 +354,15 @@ struct ndpi_proto pm_ndpi_packet_processing(struct pm_ndpi_workflow *workflow,
   /* Protocol already detected */
   if (flow->detection_completed) return(flow->detected_protocol);
 
+#if (NDPI_MAJOR == 4 && NDPI_MINOR >= 2) || NDPI_MAJOR > 4
+  flow->detected_protocol = ndpi_detection_process_packet(workflow->ndpi_struct, ndpi_flow,
+							  iph ? (uint8_t *)iph : (uint8_t *)iph6,
+							  ipsize, time);
+#else
   flow->detected_protocol = ndpi_detection_process_packet(workflow->ndpi_struct, ndpi_flow,
 							  iph ? (uint8_t *)iph : (uint8_t *)iph6,
 							  ipsize, time, src, dst);
+#endif
 
   if ((flow->detected_protocol.app_protocol != NDPI_PROTOCOL_UNKNOWN)
      || ((proto == IPPROTO_UDP) && (flow->packets > workflow->prefs.giveup_proto_tcp))
@@ -372,8 +378,9 @@ struct ndpi_proto pm_ndpi_packet_processing(struct pm_ndpi_workflow *workflow,
   }
 
   if (flow->detection_completed || flow->tcp_finished) {
-    if (flow->detected_protocol.app_protocol == NDPI_PROTOCOL_UNKNOWN)
-      flow->detected_protocol = ndpi_detection_giveup(workflow->ndpi_struct, flow->ndpi_flow);
+    if (flow->detected_protocol.app_protocol == NDPI_PROTOCOL_UNKNOWN) {
+      flow->detected_protocol = ndpi_detection_giveup(workflow->ndpi_struct, flow->ndpi_flow, 1, &workflow->prefs.protocol_guess);
+    }
 
     if (workflow->prefs.protocol_guess) {
       if (flow->detected_protocol.app_protocol == NDPI_PROTOCOL_UNKNOWN && !flow->guess_completed) {
@@ -440,6 +447,7 @@ u_int16_t pm_ndpi_node_guess_undetected_protocol(struct pm_ndpi_workflow *workfl
   if (!flow || !workflow) return 0;
 
   flow->detected_protocol = ndpi_guess_undetected_protocol(workflow->ndpi_struct,
+							   flow->ndpi_flow,
                                                            flow->protocol,
                                                            ntohl(flow->lower_ip),
                                                            ntohs(flow->lower_port),
@@ -461,7 +469,7 @@ int pm_ndpi_node_idle_scan_walker(const void *node, const pm_VISIT which, const 
 
   if (workflow->num_idle_flows == workflow->prefs.idle_scan_budget) return FALSE;
 
-  if ((which == ndpi_preorder) || (which == ndpi_leaf)) { /* Avoid walking the same node multiple times */
+  if ((which == (pm_VISIT)ndpi_preorder) || (which == (pm_VISIT)ndpi_leaf)) { /* Avoid walking the same node multiple times */
     /* expire Idle and TCP finished flows */
     if ((flow->last_seen + workflow->prefs.idle_max_time < workflow->last_time) ||
 	(flow->tcp_finished == TRUE)) {
@@ -496,4 +504,3 @@ void pm_ndpi_idle_flows_cleanup(struct pm_ndpi_workflow *workflow)
     workflow->last_idle_scan_time = workflow->last_time;
   }
 }
-#endif

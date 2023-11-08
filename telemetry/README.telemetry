@@ -1,0 +1,158 @@
+INTRODUCTION.
+pmacct strategy towards Streaming Telemetry is currently twofold and does
+encompass two daemons: 1) pmtelemetryd, written in C, and documented in
+"Quickstart guide to setup Streaming Telemetry collection" chapter of the
+QUICKSTART document; 2) pmgrpcd.py, written in Python, and documented in
+telemetry/decoders/v3/README.pmgrpcd. Following is the support matrix for
+Streaming Telemetry collection:
+
+Input transports:
+* TCP proprietary / non-standard (pmtelemetryd)
+* UDP proprietary / non-standard (pmtelemetryd)
+* UDP draft-ietf-netconf-udp-notif (pmtelemetryd)
+* gRPC (pmgrpcd.py)
+* gNMI (pmgrcpd.py [WiP])
+
+Input encodings:
+* JSON (pmtelemetryd)
+* Protobuf (pmgrpcd.py)
+
+Output methods:
+* Kafka (pmtelemetryd, pmgrpcd.py)
+* files (pmtelemetryd)
+
+Output encodings:
+* JSON (pmtelemetryd, pmgrpcd.py [WiP])
+* Avro (pmgrpcd.py)
+
+Examples of supported collection scenarios:
+* TCP/JSON -> pmtelemetryd -> Kafka/JSON
+* UDP draft-ietf-netconf-udp-notif/JSON -> pmtelemetryd -> Kafka/JSON
+* gRPC/Protobuf -> pmgrpcd.py -> Kafka/Avro
+* gRPC/Protobuf -> pmgrpcd.py -> Kafka/JSON
+* gRPC/Protobuf -> pmgrpcd.py -> pmtelemetryd -> files/JSON (-> decodeGPB.py)
+
+HISTORICAL NOTES.
+pmtelemetryd, the pmacct Streaming Telemetry daemon, does natively support
+TCP and UDP transports and JSON encoding; pmtelemetryd is also evolving to
+support upcoming IETF standards (ie. https-notif, udp-notif, cbor).
+
+In terms of encoding, in pmtelemetryd, GPB (or Google Protocol Buffers) is
+is only base64'd on output for de-marshalling upon post-processing (where
+utils/decodeGPB.py can help); also GPB encoding is mainly coupled with gRPC
+as a transport resulting in limited (or buggy) support for C language. As a
+result of that, in the problematic area of gRPC, two efforts are currently
+pursued: 1) write decoders to hold gRPC sessions and pre-process GPB encoding
+and pass de-serialized data to pmtelemetryd; decoders can be written in any
+language and pass data onto pmtelemetryd via a ZeroMQ queue; sample decoders
+can be found in telemetry/decoders/v1 and are written in Python; 2) write a
+slightly more autonomous tool in Python 3, pmgrpcd.py, to hold gRPC sessions,
+process GPB encoding and write JSON or Avro to Kafka (that is, bypassing
+pmtelemetryd); a sample of such tool can be found in telemetry/decoders/v3
+along with its own documentation.
+
+In the ROUTER CONFIGS section below there are snippets of some routers
+configuration in order to export Streaming Telemetry data. Quickstart
+guides for collection are in telemetry/decoders/v1/README.grpc_dialout
+and telemetry/decoders/v3/README.pmgrpcd
+
+ROUTER CONFIGS.
+IOS XR configuration example, gRPC JSON encoding suitable (at time of
+this writing) for Openconfig YANG models, ie. openconfig-interface and
+openconfig-platform:
+
+telemetry model-driven
+ destination-group COLLECTOR
+  address-family ipv4 X.X.X.X port 10000
+   encoding json
+   protocol grpc no-tls
+  !
+ !
+ sensor-group SENSOR
+  sensor-path openconfig-platform:components
+  sensor-path openconfig-interfaces:interfaces
+ !
+ subscription SUBSCRIPTION
+  sensor-group-id SENSOR sample-interval 30000
+  destination-id COLLECTOR
+  source-interface Loopback0
+ !
+!
+
+IOS XR configuration example, gRPC GPB key-value encoding suitable for 
+for Cisco YANG models, ie. Cisco-IOS-XR-infra-statsd-oper: 
+
+telemetry model-driven
+ destination-group COLLECTOR
+  address-family ipv4 X.X.X.X port 10000
+   encoding compact-gpb
+   protocol grpc no-tls
+  !
+ !
+ sensor-group SENSOR
+  sensor-path Cisco-IOS-XR-infra-statsd-oper:infra-statistics/interfaces/interface/latest/generic-counters
+ !
+ subscription SUBSCRIPTION
+  sensor-group-id SENSOR sample-interval 30000
+  destination-id COLLECTOR
+  source-interface Loopback0
+ !
+!
+
+Huawei VRP configuration example, gRPC compact GPB encoding:
+
+telemetry
+ #
+ sensor-group SENSOR
+  sensor-path huawei-ifm:ifm/interfaces/interface/ifStatistics
+ #
+ destination-group COLLECTOR
+  ipv4-address X.X.X.X port 10000 vpn-instance MANAGEMENT_VRF protocol grpc no-tls
+ #
+ subscription SUBSCRIPTION
+  sensor-group SENSOR
+  destination-group COLLECTOR
+#
+return
+
+Huawei VRP configuration example, JSON over UDP-notif (draft-ietf-netconf-udp-notif) transport:
+
+telemetry
+ udp-model udp-notif
+ #
+ sensor-group SENSOR
+  sensor-path huawei-ifm:ifm/interfaces/interface/ifStatistics
+ #
+ destination-group COLLECTOR
+  ipv4-address X.X.X.X port 10000 vpn-instance MANAGEMENT_VRF
+ #
+ subscription SUBSCRIPTION
+  protocol udp
+  encoding json
+  sensor-group SENSOR
+  destination-group COLLECTOR
+#
+return
+
+Juniper Native format telemetry configuration example, GPB encoding over UDP transport:
+
+services {
+    analytics {
+	streaming-server pmacct-server {
+	    remote-address X.X.X.X;
+	    remote-port 50000;
+        }
+        export-profile pmacct-server-export-params {
+	    local-address X.X.X.X;
+	    local-port 21111;           
+	    reporting-rate 30;
+	    format gpb;
+	    transport udp;
+        }
+        sensor interface-xe {
+	    server-name pmacct-server;
+	    export-name pmacct-server-export-params;
+	    resource /junos/system/linecard/interface/logical/usage/;
+        }
+    }
+}

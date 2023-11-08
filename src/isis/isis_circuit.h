@@ -46,8 +46,8 @@ struct isis_bcast_info
   char run_dr_elect[2];		/* Should we run dr election ? */
   struct thread *t_run_dr[2];	/* DR election thread */
   struct thread *t_send_lan_hello[2];	/* send LAN IIHs in this thread */
-  struct list *adjdb[2];	/* adjacency dbs */
-  struct list *lan_neighs[2];	/* list of lx neigh snpa */
+  struct pm_list *adjdb[2];	/* adjacency dbs */
+  struct pm_list *lan_neighs[2];	/* list of lx neigh snpa */
   char is_dr[2];		/* Are we level x DR ? */
   u_char l1_desig_is[ISIS_SYS_ID_LEN + 1];	/* level-1 DR */
   u_char l2_desig_is[ISIS_SYS_ID_LEN + 1];	/* level-2 DR */
@@ -84,7 +84,7 @@ struct isis_circuit
   struct thread *t_read;
   struct thread *t_send_csnp[2];
   struct thread *t_send_psnp[2];
-  struct list *lsp_queue;	/* LSPs to be txed (both levels) */
+  struct pm_list *lsp_queue;	/* LSPs to be txed (both levels) */
   /* there is no real point in two streams, just for programming kicker */
   int (*rx) (struct isis_circuit * circuit, u_char * ssnpa);
   struct stream *rcv_stream;	/* Stream for receiving */
@@ -120,12 +120,10 @@ struct isis_circuit
   struct password *c_rx_passwds;	/* circuitReceivePasswords */
   struct password *c_tc_passwd;	/* circuitTransmitPassword */
   int ip_router;		/* Route IP ? */
-  struct list *ip_addrs;	/* our IP addresses */
-#ifdef ENABLE_IPV6
+  struct pm_list *ip_addrs;	/* our IP addresses */
   int ipv6_router;		/* Route IPv6 ? */
-  struct list *ipv6_link;	/* our link local IPv6 addresses */
-  struct list *ipv6_non_link;	/* our non-link local IPv6 addresses */
-#endif				/* ENABLE_IPV6 */
+  struct pm_list *ipv6_link;	/* our link local IPv6 addresses */
+  struct pm_list *ipv6_non_link;	/* our non-link local IPv6 addresses */
   /* 
    * RFC 2973 IS-IS Mesh Groups 
    */
@@ -156,22 +154,16 @@ struct sockaddr_ll {
   unsigned char sll_addr[8];
 };
 
-#if (!defined __ISIS_CIRCUIT_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT struct isis_circuit *isis_circuit_new ();
-EXT void isis_circuit_del (struct isis_circuit *);
-EXT void isis_circuit_configure (struct isis_circuit *, struct isis_area *);
-EXT void isis_circuit_up (struct isis_circuit *);
-EXT void isis_circuit_deconfigure (struct isis_circuit *, struct isis_area *);
-EXT int isis_circuit_destroy (struct isis_circuit *);
-EXT void isis_circuit_if_add (struct isis_circuit *, struct interface *);
-EXT void isis_circuit_if_del (struct isis_circuit *);
-EXT void circuit_update_nlpids (struct isis_circuit *);
-EXT void isis_circuit_update_params (struct isis_circuit *, struct interface *);
-EXT void isis_circuit_down (struct isis_circuit *circuit);
-#undef EXT
+extern struct isis_circuit *isis_circuit_new ();
+extern void isis_circuit_del (struct isis_circuit *);
+extern void isis_circuit_configure (struct isis_circuit *, struct isis_area *);
+extern void isis_circuit_up (struct isis_circuit *);
+extern void isis_circuit_deconfigure (struct isis_circuit *, struct isis_area *);
+extern int isis_circuit_destroy (struct isis_circuit *);
+extern void isis_circuit_if_add (struct isis_circuit *, struct interface *);
+extern void isis_circuit_if_del (struct isis_circuit *);
+extern void circuit_update_nlpids (struct isis_circuit *);
+extern void isis_circuit_update_params (struct isis_circuit *, struct interface *);
+extern void isis_circuit_down (struct isis_circuit *circuit);
 
 #endif /* _ISIS_CIRCUIT_H_ */

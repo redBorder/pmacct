@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
 */
 
 /*
@@ -23,30 +23,32 @@
 #define _BMP_LOGDUMP_H_
 
 /* defines */
-#define	BMP_LOG_TYPE_STATS	1
-#define BMP_LOG_TYPE_INIT	2
-#define BMP_LOG_TYPE_TERM	3
-#define BMP_LOG_TYPE_PEER_UP	4
-#define BMP_LOG_TYPE_PEER_DOWN	5
-#define BMP_LOG_TYPE_ROUTE	6
+#define BMP_LOG_TYPE_STATS	BMP_MSG_STATS
+#define BMP_LOG_TYPE_INIT	BMP_MSG_INIT
+#define BMP_LOG_TYPE_TERM	BMP_MSG_TERM
+#define BMP_LOG_TYPE_PEER_UP	BMP_MSG_PEER_UP
+#define BMP_LOG_TYPE_PEER_DOWN	BMP_MSG_PEER_DOWN
+#define BMP_LOG_TYPE_ROUTE	BMP_MSG_ROUTE_MONITOR
+#define BMP_LOG_TYPE_RPAT	BMP_MSG_TMP_RPAT
+
+#define BMP_LOG_TYPE_LOGINIT    BGP_LOG_TYPE_LOGINIT
+#define BMP_LOG_TYPE_LOGCLOSE	BGP_LOG_TYPE_LOGCLOSE
+#define BMP_LOG_TYPE_DUMPINIT   BGP_LOG_TYPE_DUMPINIT
+#define BMP_LOG_TYPE_DUMPCLOSE	BGP_LOG_TYPE_DUMPCLOSE
+#define BMP_LOG_TYPE_MAX	BGP_LOG_TYPE_DUMPCLOSE
 
 struct bmp_log_stats {
   u_int16_t cnt_type;
+  afi_t cnt_afi;
+  safi_t cnt_safi;
   u_int64_t cnt_data;
-  u_int8_t got_data;
 };
 
-struct bmp_log_init {
-  u_int16_t type; 
-  u_int16_t len;
-  char *val;
-};
-
-struct bmp_log_term {
+struct bmp_log_tlv {
+  u_int32_t pen;
   u_int16_t type;
   u_int16_t len;
-  char *val;
-  u_int16_t reas_type;
+  void *val;
 };
 
 struct bmp_log_peer_up {
@@ -66,11 +68,10 @@ struct bmp_dump_se {
   int se_type;
   union {
     struct bmp_log_stats stats;
-    struct bmp_log_init init;
-    struct bmp_log_term term;
     struct bmp_log_peer_up peer_up;
     struct bmp_log_peer_down peer_down;
   } se;
+  struct pm_list *tlvs;
 };
 
 struct bmp_dump_se_ll_elem {
@@ -84,30 +85,43 @@ struct bmp_dump_se_ll {
 };
 
 /* prototypes */
-#if (!defined __BMP_LOGDUMP_C)
-#define EXT extern
-#else
-#define EXT
+extern void bmp_daemon_msglog_init_amqp_host();
+extern void bmp_dump_init_peer(struct bgp_peer *);
+extern void bmp_dump_close_peer(struct bgp_peer *);
+
+extern int bmp_log_msg(struct bgp_peer *, struct bmp_data *, struct pm_list *tlvs, bgp_tag_t *, void *, u_int64_t, char *, int, int);
+extern int bmp_log_msg_stats(struct bgp_peer *, struct bmp_data *, struct pm_list *, struct bmp_log_stats *, char *, int, void *);
+extern int bmp_log_msg_init(struct bgp_peer *, struct bmp_data *, struct pm_list *, char *, int, void *);
+extern int bmp_log_msg_term(struct bgp_peer *, struct bmp_data *, struct pm_list *, char *, int, void *);
+extern int bmp_log_msg_peer_up(struct bgp_peer *, struct bmp_data *, struct pm_list *, struct bmp_log_peer_up *, char *, int, void *);
+extern int bmp_log_msg_peer_down(struct bgp_peer *, struct bmp_data *, struct pm_list *, struct bmp_log_peer_down *, char *, int, void *);
+extern int bmp_log_msg_route_monitor_tlv(struct pm_list *, int, void *);
+extern int bmp_log_rm_tlv_path_marking(struct bgp_peer *, struct bmp_data *, void *, void *, char *, int , void *);
+extern int bmp_log_rm_tlv_pm_status(u_int32_t, int, void *);
+
+extern void bmp_dump_se_ll_append(struct bgp_peer *, struct bmp_data *, struct pm_list *tlvs, void *, int);
+extern void bmp_dump_se_ll_destroy(struct bmp_dump_se_ll *);
+
+extern void bmp_handle_dump_event(int);
+extern int bmp_dump_event_runner(struct pm_dump_runner *);
+extern void bmp_daemon_msglog_init_amqp_host();
+extern void bmp_dump_init_amqp_host(void *);
+extern int bmp_daemon_msglog_init_kafka_host();
+extern int bmp_dump_init_kafka_host(void *);
+
+#if defined WITH_AVRO
+extern avro_schema_t p_avro_schema_build_bmp_rm(int, char *);
+extern avro_schema_t p_avro_schema_build_bmp_init(char *);
+extern avro_schema_t p_avro_schema_build_bmp_term(char *);
+extern avro_schema_t p_avro_schema_build_bmp_peer_up(char *);
+extern avro_schema_t p_avro_schema_build_bmp_peer_down(char *);
+extern avro_schema_t p_avro_schema_build_bmp_stats(char *);
+
+extern avro_schema_t p_avro_schema_build_bmp_log_initclose(int, char *);
+extern avro_schema_t p_avro_schema_build_bmp_dump_init(int, char *);
+extern avro_schema_t p_avro_schema_build_bmp_dump_close(int, char *);
+
+extern void p_avro_schema_build_bmp_common(avro_schema_t *, avro_schema_t *, avro_schema_t *, avro_schema_t *);
 #endif
-EXT void bmp_daemon_msglog_init_amqp_host();
-EXT void bmp_dump_init_amqp_host();
-EXT void bmp_dump_init_peer(struct bgp_peer *);
-EXT void bmp_dump_close_peer(struct bgp_peer *);
 
-EXT int bmp_log_msg(struct bgp_peer *, struct bmp_data *, void *, u_int64_t, char *, int, int);
-EXT int bmp_log_msg_stats(struct bgp_peer *, struct bmp_data *, struct bmp_log_stats *, char *, int, void *);
-EXT int bmp_log_msg_init(struct bgp_peer *, struct bmp_data *, struct bmp_log_init *, char *, int, void *);
-EXT int bmp_log_msg_term(struct bgp_peer *, struct bmp_data *, struct bmp_log_term *, char *, int, void *);
-EXT int bmp_log_msg_peer_up(struct bgp_peer *, struct bmp_data *, struct bmp_log_peer_up *, char *, int, void *);
-EXT int bmp_log_msg_peer_down(struct bgp_peer *, struct bmp_data *, struct bmp_log_peer_down *, char *, int, void *);
-
-EXT void bmp_dump_se_ll_append(struct bgp_peer *, struct bmp_data *, void *, int);
-EXT void bmp_dump_se_ll_destroy(struct bmp_dump_se_ll *);
-
-EXT void bmp_handle_dump_event();
-EXT void bmp_daemon_msglog_init_amqp_host();
-EXT void bmp_dump_init_amqp_host();
-EXT int bmp_daemon_msglog_init_kafka_host();
-EXT int bmp_dump_init_kafka_host();
-#undef EXT
 #endif

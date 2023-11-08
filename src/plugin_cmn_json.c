@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,22 +19,25 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __PLUGIN_CMN_JSON_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
 #include "pmacct-data.h"
 #include "plugin_common.h"
 #include "plugin_cmn_json.h"
 #include "ip_flow.h"
 #include "classifier.h"
+#include "bgp/bgp.h"
+#include "rpki/rpki.h"
 #if defined (WITH_NDPI)
 #include "ndpi/ndpi.h"
 #endif
 
-/* Functions */
 #ifdef WITH_JANSSON
+
+/* Global variables */
+compose_json_handler cjhandler[N_PRIMITIVES];
+
+/* Functions */
 void compose_json(u_int64_t wtc, u_int64_t wtc_2)
 {
   int idx = 0;
@@ -57,7 +60,12 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
   }
 
   if (wtc_2 & COUNT_LABEL) {
-    cjhandler[idx] = compose_json_label;
+    if (config.pretag_label_encode_as_map) {
+      cjhandler[idx] = compose_json_map_label;
+    }
+    else {
+      cjhandler[idx] = compose_json_label;
+    }
     idx++;
   }
 
@@ -86,6 +94,11 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
 
   if (wtc & COUNT_VLAN) {
     cjhandler[idx] = compose_json_vlan;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_OUT_VLAN) {
+    cjhandler[idx] = compose_json_out_vlan;
     idx++;
   }
 
@@ -140,6 +153,11 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
     idx++;
   }
 
+  if (wtc_2 & COUNT_DST_ROA) {
+    cjhandler[idx] = compose_json_dst_roa;
+    idx++;
+  }
+
   if (wtc & COUNT_PEER_SRC_AS) {
     cjhandler[idx] = compose_json_peer_src_as;
     idx++;
@@ -190,6 +208,11 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
     idx++;
   }
 
+  if (wtc_2 & COUNT_SRC_ROA) {
+    cjhandler[idx] = compose_json_src_roa;
+    idx++;
+  }
+
   if (wtc & COUNT_IN_IFACE) {
     cjhandler[idx] = compose_json_in_iface;
     idx++;
@@ -202,6 +225,11 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
 
   if (wtc & COUNT_MPLS_VPN_RD) {
     cjhandler[idx] = compose_json_mpls_vpn_rd;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_MPLS_PW_ID) {
+    cjhandler[idx] = compose_json_mpls_pw_id;
     idx++;
   }
 
@@ -276,10 +304,46 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
     cjhandler[idx] = compose_json_dst_host_pocode;
     idx++;
   }
+
+  if (wtc_2 & COUNT_SRC_HOST_COORDS) {
+    cjhandler[idx] = compose_json_src_host_coords;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_DST_HOST_COORDS) {
+    cjhandler[idx] = compose_json_dst_host_coords;
+    idx++;
+  }
+
 #endif
 
   if (wtc & COUNT_TCPFLAGS) {
-    cjhandler[idx] = compose_json_tcp_flags;
+    if (config.tcpflags_encode_as_array) {
+      cjhandler[idx] = compose_json_array_tcpflags;
+    }
+    else {
+      cjhandler[idx] = compose_json_tcp_flags;
+    }
+    idx++;
+  }
+  
+  if (wtc_2 & COUNT_FWD_STATUS) {
+    if (config.fwd_status_encode_as_string) {
+      cjhandler[idx] = compose_json_string_fwd_status;
+    }
+    else {
+      cjhandler[idx] = compose_json_fwd_status;
+    }
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_MPLS_LABEL_STACK) {
+    if (config.mpls_label_stack_encode_as_array) {
+      cjhandler[idx] = compose_json_array_mpls_label_stack;
+    }
+    else {
+      cjhandler[idx] = compose_json_mpls_label_stack;
+    }
     idx++;
   }
 
@@ -295,6 +359,11 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
 
   if (wtc_2 & COUNT_SAMPLING_RATE) {
     cjhandler[idx] = compose_json_sampling_rate;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_SAMPLING_DIRECTION) {
+    cjhandler[idx] = compose_json_sampling_direction;
     idx++;
   }
 
@@ -323,6 +392,11 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
     idx++;
   }
 
+  if (wtc_2 & COUNT_FW_EVENT) {
+    cjhandler[idx] = compose_json_fw_event;
+    idx++;
+  }
+
   if (wtc_2 & COUNT_MPLS_LABEL_TOP) {
     cjhandler[idx] = compose_json_mpls_label_top;
     idx++;
@@ -333,8 +407,13 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
     idx++;
   }
 
-  if (wtc_2 & COUNT_MPLS_STACK_DEPTH) {
-    cjhandler[idx] = compose_json_mpls_stack_depth;
+  if (wtc_2 & COUNT_TUNNEL_SRC_MAC) {
+    cjhandler[idx] = compose_json_tunnel_src_mac;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_TUNNEL_DST_MAC) {
+    cjhandler[idx] = compose_json_tunnel_dst_mac;
     idx++;
   }
 
@@ -355,6 +434,31 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
     
   if (wtc_2 & COUNT_TUNNEL_IP_TOS) {
     cjhandler[idx] = compose_json_tunnel_tos;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_TUNNEL_SRC_PORT) {
+    cjhandler[idx] = compose_json_tunnel_src_port;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_TUNNEL_DST_PORT) {
+    cjhandler[idx] = compose_json_tunnel_dst_port;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_TUNNEL_TCPFLAGS) {
+    if (config.tcpflags_encode_as_array) {
+      cjhandler[idx] = compose_json_array_tunnel_tcp_flags;
+    }
+    else {
+      cjhandler[idx] = compose_json_tunnel_tcp_flags;
+    }
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_VXLAN) {
+    cjhandler[idx] = compose_json_vxlan;
     idx++;
   }
 
@@ -385,6 +489,16 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
 
   if (wtc_2 & COUNT_EXPORT_PROTO_VERSION) {
     cjhandler[idx] = compose_json_export_proto_version;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_EXPORT_PROTO_SYSID) {
+    cjhandler[idx] = compose_json_export_proto_sysid;
+    idx++;
+  }
+
+  if (wtc_2 & COUNT_EXPORT_PROTO_TIME) {
+    cjhandler[idx] = compose_json_timestamp_export;
     idx++;
   }
 
@@ -435,7 +549,6 @@ void compose_json_label(json_t *obj, struct chained_cache *cc)
 
 void compose_json_class(json_t *obj, struct chained_cache *cc)
 {
-  char empty_string[] = "", *str_ptr;
   struct pkt_primitives *pbase = &cc->primitives;
 
   json_object_set_new_nocheck(obj, "class", json_string((pbase->class && class[(pbase->class)-1].id) ? class[(pbase->class)-1].protocol : "unknown"));
@@ -455,6 +568,7 @@ void compose_json_ndpi_class(json_t *obj, struct chained_cache *cc)
 }
 #endif
 
+#if defined (HAVE_L2)
 void compose_json_src_mac(json_t *obj, struct chained_cache *cc)
 {
   char mac[18];
@@ -473,7 +587,17 @@ void compose_json_dst_mac(json_t *obj, struct chained_cache *cc)
 
 void compose_json_vlan(json_t *obj, struct chained_cache *cc)
 {
-  json_object_set_new_nocheck(obj, "vlan", json_integer((json_int_t)cc->primitives.vlan_id));
+  if (config.tmp_vlan_legacy) {
+    json_object_set_new_nocheck(obj, "vlan", json_integer((json_int_t)cc->primitives.vlan_id));
+  }
+  else {
+    json_object_set_new_nocheck(obj, "vlan_in", json_integer((json_int_t)cc->primitives.vlan_id));
+  }
+}
+
+void compose_json_out_vlan(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "vlan_out", json_integer((json_int_t)cc->primitives.out_vlan_id));
 }
 
 void compose_json_cos(json_t *obj, struct chained_cache *cc)
@@ -488,6 +612,7 @@ void compose_json_etype(json_t *obj, struct chained_cache *cc)
   sprintf(misc_str, "%x", cc->primitives.etype);
   json_object_set_new_nocheck(obj, "etype", json_string(misc_str));
 }
+#endif
 
 void compose_json_src_as(json_t *obj, struct chained_cache *cc)
 {
@@ -577,6 +702,11 @@ void compose_json_med(json_t *obj, struct chained_cache *cc)
   json_object_set_new_nocheck(obj, "med", json_integer((json_int_t)cc->pbgp->med));
 }
 
+void compose_json_dst_roa(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "roa_dst", json_string(rpki_roa_print(cc->pbgp->dst_roa)));
+}
+
 void compose_json_peer_src_as(json_t *obj, struct chained_cache *cc)
 {
   json_object_set_new_nocheck(obj, "peer_as_src", json_integer((json_int_t)cc->pbgp->peer_src_as));
@@ -599,7 +729,7 @@ void compose_json_peer_dst_ip(json_t *obj, struct chained_cache *cc)
 {
   char ip_address[INET6_ADDRSTRLEN];
 
-  addr_to_str(ip_address, &cc->pbgp->peer_dst_ip);
+  addr_to_str2(ip_address, &cc->pbgp->peer_dst_ip, ft2af(cc->flow_type));
   json_object_set_new_nocheck(obj, "peer_ip_dst", json_string(ip_address));
 }
 
@@ -617,7 +747,7 @@ void compose_json_src_std_comm(json_t *obj, struct chained_cache *cc)
   }
   else str_ptr = empty_string;
 
-  json_object_set_new_nocheck(obj, "src_comms", json_string(str_ptr));
+  json_object_set_new_nocheck(obj, "comms_src", json_string(str_ptr));
 }
 
 void compose_json_src_ext_comm(json_t *obj, struct chained_cache *cc)
@@ -634,7 +764,7 @@ void compose_json_src_ext_comm(json_t *obj, struct chained_cache *cc)
   }
   else str_ptr = empty_string;
 
-  json_object_set_new_nocheck(obj, "src_ecomms", json_string(str_ptr));
+  json_object_set_new_nocheck(obj, "ecomms_src", json_string(str_ptr));
 }
 
 void compose_json_src_lrg_comm(json_t *obj, struct chained_cache *cc)
@@ -651,7 +781,7 @@ void compose_json_src_lrg_comm(json_t *obj, struct chained_cache *cc)
   }
   else str_ptr = empty_string;
 
-  json_object_set_new_nocheck(obj, "src_lcomms", json_string(str_ptr));
+  json_object_set_new_nocheck(obj, "lcomms_src", json_string(str_ptr));
 }
 
 void compose_json_src_as_path(json_t *obj, struct chained_cache *cc)
@@ -668,17 +798,22 @@ void compose_json_src_as_path(json_t *obj, struct chained_cache *cc)
   }
   else str_ptr = empty_string;
 
-  json_object_set_new_nocheck(obj, "src_as_path", json_string(str_ptr));
+  json_object_set_new_nocheck(obj, "as_path_src", json_string(str_ptr));
 }
 
 void compose_json_src_local_pref(json_t *obj, struct chained_cache *cc)
 {
-  json_object_set_new_nocheck(obj, "src_local_pref", json_integer((json_int_t)cc->pbgp->src_local_pref));
+  json_object_set_new_nocheck(obj, "local_pref_src", json_integer((json_int_t)cc->pbgp->src_local_pref));
 }
 
 void compose_json_src_med(json_t *obj, struct chained_cache *cc)
 {
-  json_object_set_new_nocheck(obj, "src_med", json_integer((json_int_t)cc->pbgp->src_med));
+  json_object_set_new_nocheck(obj, "med_src", json_integer((json_int_t)cc->pbgp->src_med));
+}
+
+void compose_json_src_roa(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "roa_src", json_string(rpki_roa_print(cc->pbgp->src_roa)));
 }
 
 void compose_json_in_iface(json_t *obj, struct chained_cache *cc)
@@ -697,6 +832,11 @@ void compose_json_mpls_vpn_rd(json_t *obj, struct chained_cache *cc)
 
   bgp_rd2str(rd_str, &cc->pbgp->mpls_vpn_rd);
   json_object_set_new_nocheck(obj, "mpls_vpn_rd", json_string(rd_str));
+}
+
+void compose_json_mpls_pw_id(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "mpls_pw_id", json_integer((json_int_t)cc->pbgp->mpls_pw_id));
 }
 
 void compose_json_src_host(json_t *obj, struct chained_cache *cc)
@@ -812,6 +952,18 @@ void compose_json_dst_host_pocode(json_t *obj, struct chained_cache *cc)
   else
     json_object_set_new_nocheck(obj, "pocode_ip_dst", json_string(empty_string));
 }
+
+void compose_json_src_host_coords(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "lat_ip_src", json_real(cc->primitives.src_ip_lat));
+  json_object_set_new_nocheck(obj, "lon_ip_src", json_real(cc->primitives.src_ip_lon));
+}
+
+void compose_json_dst_host_coords(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "lat_ip_dst", json_real(cc->primitives.dst_ip_lat));
+  json_object_set_new_nocheck(obj, "lon_ip_dst", json_real(cc->primitives.dst_ip_lon));
+}
 #endif
 
 void compose_json_tcp_flags(json_t *obj, struct chained_cache *cc)
@@ -822,14 +974,35 @@ void compose_json_tcp_flags(json_t *obj, struct chained_cache *cc)
   json_object_set_new_nocheck(obj, "tcp_flags", json_string(misc_str));
 }
 
-void compose_json_proto(json_t *obj, struct chained_cache *cc)
+void compose_json_fwd_status(json_t *obj, struct chained_cache *cc)
 {
   char misc_str[VERYSHORTBUFLEN];
 
-  if (!config.num_protos && (cc->primitives.proto < protocols_number))
-    json_object_set_new_nocheck(obj, "ip_proto", json_string(_protocols[cc->primitives.proto].name));
-  else
-    json_object_set_new_nocheck(obj, "ip_proto", json_integer((json_int_t)cc->primitives.proto));
+  sprintf(misc_str, "%u", cc->pnat->fwd_status);
+  json_object_set_new_nocheck(obj, "fwd_status", json_string(misc_str));
+}
+
+void compose_json_mpls_label_stack(json_t *obj, struct chained_cache *cc)
+{
+  char label_stack[MAX_MPLS_LABEL_STACK];
+  char *label_stack_ptr = NULL;
+  int label_stack_len = 0;
+
+  memset(label_stack, 0, MAX_MPLS_LABEL_STACK);
+
+  label_stack_len = vlen_prims_get(cc->pvlen, COUNT_INT_MPLS_LABEL_STACK, &label_stack_ptr);
+  if (label_stack_ptr) {
+    mpls_label_stack_to_str(label_stack, sizeof(label_stack), (u_int32_t *)label_stack_ptr, label_stack_len);
+  }
+
+  json_object_set_new_nocheck(obj, "mpls_label_stack", json_string(label_stack));
+}
+
+void compose_json_proto(json_t *obj, struct chained_cache *cc)
+{
+  char proto[PROTO_NUM_STRLEN];
+
+  json_object_set_new_nocheck(obj, "ip_proto", json_string(ip_proto_print(cc->primitives.proto, proto, PROTO_NUM_STRLEN)));
 }
 
 void compose_json_tos(json_t *obj, struct chained_cache *cc)
@@ -840,6 +1013,11 @@ void compose_json_tos(json_t *obj, struct chained_cache *cc)
 void compose_json_sampling_rate(json_t *obj, struct chained_cache *cc)
 {
   json_object_set_new_nocheck(obj, "sampling_rate", json_integer((json_int_t)cc->primitives.sampling_rate));
+}
+
+void compose_json_sampling_direction(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "sampling_direction", json_string(sampling_direction_print(cc->primitives.sampling_direction)));
 }
 
 void compose_json_post_nat_src_host(json_t *obj, struct chained_cache *cc)
@@ -873,6 +1051,11 @@ void compose_json_nat_event(json_t *obj, struct chained_cache *cc)
   json_object_set_new_nocheck(obj, "nat_event", json_integer((json_int_t)cc->pnat->nat_event));
 }
 
+void compose_json_fw_event(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "fw_event", json_integer((json_int_t)cc->pnat->fw_event));
+}
+
 void compose_json_mpls_label_top(json_t *obj, struct chained_cache *cc)
 {
   json_object_set_new_nocheck(obj, "mpls_label_top", json_integer((json_int_t)cc->pmpls->mpls_label_top));
@@ -883,9 +1066,20 @@ void compose_json_mpls_label_bottom(json_t *obj, struct chained_cache *cc)
   json_object_set_new_nocheck(obj, "mpls_label_bottom", json_integer((json_int_t)cc->pmpls->mpls_label_bottom));
 }
 
-void compose_json_mpls_stack_depth(json_t *obj, struct chained_cache *cc)
+void compose_json_tunnel_src_mac(json_t *obj, struct chained_cache *cc)
 {
-  json_object_set_new_nocheck(obj, "mpls_stack_depth", json_integer((json_int_t)cc->pmpls->mpls_stack_depth));
+  char mac[18];
+
+  etheraddr_string(cc->ptun->tunnel_eth_shost, mac);
+  json_object_set_new_nocheck(obj, "tunnel_mac_src", json_string(mac));
+}
+
+void compose_json_tunnel_dst_mac(json_t *obj, struct chained_cache *cc)
+{
+  char mac[18];
+
+  etheraddr_string(cc->ptun->tunnel_eth_dhost, mac);
+  json_object_set_new_nocheck(obj, "tunnel_mac_dst", json_string(mac));
 }
 
 void compose_json_tunnel_src_host(json_t *obj, struct chained_cache *cc)
@@ -906,17 +1100,50 @@ void compose_json_tunnel_dst_host(json_t *obj, struct chained_cache *cc)
 
 void compose_json_tunnel_proto(json_t *obj, struct chained_cache *cc)
 {
-  char misc_str[VERYSHORTBUFLEN];
+  char proto[PROTO_NUM_STRLEN];
 
-  if (!config.num_protos && (cc->ptun->tunnel_proto < protocols_number))
-    json_object_set_new_nocheck(obj, "tunnel_ip_proto", json_string(_protocols[cc->ptun->tunnel_proto].name));
-  else
-    json_object_set_new_nocheck(obj, "tunnel_ip_proto", json_integer((json_int_t)cc->ptun->tunnel_proto));
+  json_object_set_new_nocheck(obj, "tunnel_ip_proto", json_string(ip_proto_print(cc->ptun->tunnel_proto, proto, PROTO_NUM_STRLEN)));
 }
 
 void compose_json_tunnel_tos(json_t *obj, struct chained_cache *cc)
 {
   json_object_set_new_nocheck(obj, "tunnel_tos", json_integer((json_int_t)cc->ptun->tunnel_tos));
+}
+
+void compose_json_tunnel_src_port(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "tunnel_port_src", json_integer((json_int_t)cc->ptun->tunnel_src_port));
+}
+
+void compose_json_tunnel_dst_port(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "tunnel_port_dst", json_integer((json_int_t)cc->ptun->tunnel_dst_port));
+}
+
+void compose_json_tunnel_tcp_flags(json_t *obj, struct chained_cache *cc)
+{
+  char misc_str[VERYSHORTBUFLEN];
+
+  sprintf(misc_str, "%u", cc->tunnel_tcp_flags);
+  json_object_set_new_nocheck(obj, "tunnel_tcp_flags", json_string(misc_str));
+}
+
+void compose_json_array_tunnel_tcp_flags(json_t *obj, struct chained_cache *cc)
+{
+  /* linked-list creation */
+  cdada_list_t *ll = tcpflags_to_linked_list(cc->tunnel_tcp_flags);
+  size_t ll_size = cdada_list_size(ll);
+
+  json_t *root_l1 = compose_tcpflags_json_data(ll, ll_size);
+
+  json_object_set_new_nocheck(obj, "tunnel_tcp_flags", root_l1);
+
+  cdada_list_destroy(ll);
+}
+
+void compose_json_vxlan(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "vxlan", json_integer((json_int_t)cc->ptun->tunnel_id));
 }
 
 void compose_json_timestamp_start(json_t *obj, struct chained_cache *cc)
@@ -949,6 +1176,16 @@ void compose_json_timestamp_arrival(json_t *obj, struct chained_cache *cc)
   json_object_set_new_nocheck(obj, "timestamp_arrival", json_string(tstamp_str));
 }
 
+void compose_json_timestamp_export(json_t *obj, struct chained_cache *cc)
+{
+  char tstamp_str[VERYSHORTBUFLEN];
+
+  compose_timestamp(tstamp_str, VERYSHORTBUFLEN, &cc->pnat->timestamp_export, TRUE,
+		    config.timestamps_since_epoch, config.timestamps_rfc3339,
+		    config.timestamps_utc);
+  json_object_set_new_nocheck(obj, "timestamp_export", json_string(tstamp_str));
+}
+
 void compose_json_timestamp_stitching(json_t *obj, struct chained_cache *cc)
 {
   char tstamp_str[VERYSHORTBUFLEN];
@@ -972,6 +1209,11 @@ void compose_json_export_proto_seqno(json_t *obj, struct chained_cache *cc)
 void compose_json_export_proto_version(json_t *obj, struct chained_cache *cc)
 {
   json_object_set_new_nocheck(obj, "export_proto_version", json_integer((json_int_t)cc->primitives.export_proto_version));
+}
+
+void compose_json_export_proto_sysid(json_t *obj, struct chained_cache *cc)
+{
+  json_object_set_new_nocheck(obj, "export_proto_sysid", json_integer((json_int_t)cc->primitives.export_proto_sysid));
 }
 
 void compose_json_custom_primitives(json_t *obj, struct chained_cache *cc)
@@ -1070,10 +1312,185 @@ void compose_json(u_int64_t wtc, u_int64_t wtc_2)
 void *compose_purge_init_json(char *writer_name, pid_t writer_pid)
 {
   if (config.debug) Log(LOG_DEBUG, "DEBUG ( %s/%s ): compose_purge_init_json(): JSON object not created due to missing --enable-jansson\n", config.name, config.type);
+
+  return NULL;
 }
 
 void *compose_purge_close_json(char *writer_name, pid_t writer_pid, int purged_entries, int total_entries, int duration)
 {
   if (config.debug) Log(LOG_DEBUG, "DEBUG ( %s/%s ): compose_purge_close_json(): JSON object not created due to missing --enable-jansson\n", config.name, config.type);
+
+  return NULL;
 }
 #endif
+
+void compose_json_map_label(json_t *obj, struct chained_cache *cc)
+{
+  char empty_string[] = "", *str_ptr;
+
+  vlen_prims_get(cc->pvlen, COUNT_INT_LABEL, &str_ptr);
+  if (!str_ptr) str_ptr = empty_string;
+
+  /* labels normalization */
+  cdada_str_t *lbls_cdada = cdada_str_create(str_ptr);
+  cdada_str_replace_all(lbls_cdada, PRETAG_LABEL_KV_SEP, DEFAULT_SEP);
+  const char *lbls_norm = cdada_str(lbls_cdada);
+
+  /* linked-list creation */
+  cdada_list_t *ptm_ll = ptm_labels_to_linked_list(lbls_norm);
+  size_t ll_size = cdada_list_size(ptm_ll);
+
+  json_t *root_l1 = compose_label_json_data(ptm_ll, ll_size);
+
+  json_object_set_new_nocheck(obj, "label", root_l1);
+  
+  cdada_str_destroy(lbls_cdada);
+  cdada_list_destroy(ptm_ll);
+}
+
+void compose_json_array_tcpflags(json_t *obj, struct chained_cache *cc)
+{
+  /* linked-list creation */
+  cdada_list_t *ll = tcpflags_to_linked_list(cc->tcp_flags);
+  size_t ll_size = cdada_list_size(ll);
+
+  json_t *root_l1 = compose_tcpflags_json_data(ll, ll_size);
+
+  json_object_set_new_nocheck(obj, "tcp_flags", root_l1);
+
+  cdada_list_destroy(ll);
+}
+
+void compose_json_string_fwd_status(json_t *obj, struct chained_cache *cc)
+{
+  /* linked-list creation */
+  cdada_list_t *fwd_status_ll = fwd_status_to_linked_list();
+  size_t ll_size = cdada_list_size(fwd_status_ll);
+
+  json_t *root_l1 = compose_fwd_status_json_data(cc->pnat->fwd_status, fwd_status_ll, ll_size);
+
+  json_object_set_new_nocheck(obj, "fwd_status", root_l1);
+
+  cdada_list_destroy(fwd_status_ll);
+}
+
+void compose_json_array_mpls_label_stack(json_t *obj, struct chained_cache *cc)
+{
+  char *label_stack_ptr = NULL;
+  int label_stack_len = 0;
+
+  label_stack_len = vlen_prims_get(cc->pvlen, COUNT_INT_MPLS_LABEL_STACK, &label_stack_ptr);
+  json_t *root_l1 = compose_mpls_label_stack_json_data((u_int32_t *)label_stack_ptr, label_stack_len);
+
+  json_object_set_new_nocheck(obj, "mpls_label_stack", root_l1);
+}
+
+json_t *compose_label_json_data(cdada_list_t *ll, int ll_size)
+{
+  ptm_label lbl;
+
+  json_t *root = json_object();
+  json_t *j_str_tmp = NULL;
+
+  size_t idx_0;
+  for (idx_0 = 0; idx_0 < ll_size; idx_0++) {
+    memset(&lbl, 0, sizeof(lbl));
+    cdada_list_get(ll, idx_0, &lbl);
+    j_str_tmp = json_string(lbl.value);
+    json_object_set_new_nocheck(root, lbl.key, j_str_tmp);
+  }
+
+  return root;
+}
+
+json_t *compose_tcpflags_json_data(cdada_list_t *ll, int ll_size)
+{
+  tcpflag tcpstate;
+
+  json_t *root = json_array();
+  json_t *j_str_tmp = NULL;
+
+  size_t idx_0;
+  for (idx_0 = 0; idx_0 < ll_size; idx_0++) {
+    memset(&tcpstate, 0, sizeof(tcpstate));
+    cdada_list_get(ll, idx_0, &tcpstate);
+    if (strncmp(tcpstate.flag, "NULL", (TCP_FLAG_LEN - 1)) != 0) {
+      j_str_tmp = json_string(tcpstate.flag);
+      json_array_append(root, j_str_tmp);
+    }
+  }
+
+  return root;
+}
+
+json_t *compose_fwd_status_json_data(size_t fwdstatus_decimal, cdada_list_t *ll, int ll_size)
+{
+  fwd_status fwdstate;
+  json_t *root = NULL;
+
+  /* default fwdstatus */
+  if ((fwdstatus_decimal >= 0) && (fwdstatus_decimal <= 63)) {
+    root = json_string("UNKNOWN Unclassified");
+  }
+  else if ((fwdstatus_decimal >= 64) && (fwdstatus_decimal <= 127)) {
+    root = json_string("FORWARDED Unclassified");
+  }
+  else if ((fwdstatus_decimal >= 128) && (fwdstatus_decimal <= 191)) {
+    root = json_string("DROPPED Unclassified");
+  }
+  else if ((fwdstatus_decimal >= 192) && (fwdstatus_decimal <= 255)) {
+    root = json_string("CONSUMED Unclassified");
+  }
+  else {
+    root = json_string("RFC-7270 Misinterpreted");
+  }
+
+  size_t idx_0;
+  for (idx_0 = 0; idx_0 < ll_size; idx_0++) {
+    memset(&fwdstate, 0, sizeof(fwdstate));
+    cdada_list_get(ll, idx_0, &fwdstate);
+    if (fwdstate.decimal == fwdstatus_decimal) {
+      json_string_set(root, fwdstate.description);
+    }
+  }
+
+  return root;
+}
+
+json_t *compose_mpls_label_stack_json_data(u_int32_t *label_stack, int ls_len)
+{
+  const int MAX_IDX_LEN = 4;
+  const int MAX_MPLS_LABEL_IDX_LEN = (MAX_IDX_LEN + MAX_MPLS_LABEL_LEN);
+  int max_mpls_label_idx_len_dec = 0;
+  char label_buf[MAX_MPLS_LABEL_LEN];
+  char label_idx_buf[MAX_MPLS_LABEL_IDX_LEN];
+  char idx_buf[MAX_IDX_LEN];
+  u_int8_t ls_depth = 0;
+
+  if (!(ls_len % 4)) {
+    ls_depth = (ls_len / 4);
+  }
+  else {
+    return NULL;
+  }
+
+  json_t *root = json_array();
+  json_t *j_str_tmp = NULL;
+
+  size_t idx_0;
+  for (idx_0 = 0; idx_0 < ls_depth; idx_0++) {
+    memset(&label_buf, 0, sizeof(label_buf));
+    snprintf(label_buf, MAX_MPLS_LABEL_LEN, "%u", *(label_stack + idx_0));
+    memset(&idx_buf, 0, sizeof(idx_buf));
+    memset(&label_idx_buf, 0, sizeof(label_idx_buf));
+    snprintf(idx_buf, MAX_IDX_LEN, "%zu", idx_0);
+    strncat(label_idx_buf, idx_buf, (MAX_MPLS_LABEL_IDX_LEN - max_mpls_label_idx_len_dec));
+    strncat(label_idx_buf, "-", (MAX_MPLS_LABEL_IDX_LEN - max_mpls_label_idx_len_dec));
+    strncat(label_idx_buf, label_buf, (MAX_MPLS_LABEL_IDX_LEN - max_mpls_label_idx_len_dec));
+    max_mpls_label_idx_len_dec = (strlen(idx_buf) + strlen("-") + strlen(label_buf) + 3);
+    j_str_tmp = json_string(label_idx_buf);
+    json_array_append(root, j_str_tmp); 
+  }
+
+  return root;
+}

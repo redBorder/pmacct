@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -19,12 +19,11 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#if (!defined __NDPI_UTIL_C)
-#define EXT extern
-#else
-#define EXT
-#endif
+#ifndef NDPI_UTIL_H
+#define NDPI_UTIL_H
+
 /* prototypes */
-EXT struct pm_ndpi_workflow *pm_ndpi_workflow_init();
-EXT void pm_ndpi_export_proto_to_class(struct pm_ndpi_workflow *);
-#undef EXT
+extern struct pm_ndpi_workflow *pm_ndpi_workflow_init();
+extern void pm_ndpi_export_proto_to_class(struct pm_ndpi_workflow *);
+
+#endif //NDPI_UTIL_H

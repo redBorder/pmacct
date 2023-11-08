@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,17 +19,52 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __NDPI_UTIL_C
+#define NDPI_LIB_COMPILATION
+/* 4.2.0-stable trick */
+#define SAVED_PACKAGE PACKAGE
+#undef PACKAGE
+#define SAVED_PACKAGE_BUGREPORT PACKAGE_BUGREPORT
+#undef PACKAGE_BUGREPORT
+#define SAVED_PACKAGE_NAME PACKAGE_NAME
+#undef PACKAGE_NAME
+#define SAVED_PACKAGE_STRING PACKAGE_STRING
+#undef PACKAGE_STRING
+#define SAVED_PACKAGE_TARNAME PACKAGE_TARNAME
+#undef PACKAGE_TARNAME
+#define SAVED_PACKAGE_VERSION PACKAGE_VERSION
+#undef PACKAGE_VERSION
+#define SAVED_VERSION VERSION
+#undef VERSION
 
-#ifdef WITH_NDPI
 #include "../pmacct.h"
+
+/* 4.2.0-stable trick */
+#undef PACKAGE
+#define PACKAGE SAVED_PACKAGE
+#undef PACKAGE_BUGREPORT
+#define PACKAGE_BUGREPORT SAVED_PACKAGE_BUGREPORT
+#undef PACKAGE_NAME
+#define PACKAGE_NAME SAVED_PACKAGE_NAME
+#undef PACKAGE_STRING
+#define PACKAGE_STRING SAVED_PACKAGE_STRING
+#undef PACKAGE_TARNAME
+#define PACKAGE_TARNAME SAVED_PACKAGE_TARNAME
+#undef PACKAGE_VERSION
+#define PACKAGE_VERSION SAVED_PACKAGE_VERSION
+#undef VERSION
+#define VERSION SAVED_VERSION
+#undef NDPI_LIB_COMPILATION
 #include "../ip_flow.h"
 #include "../classifier.h"
 #include "ndpi.h"
 
 struct pm_ndpi_workflow *pm_ndpi_workflow_init()
 {
-  struct ndpi_detection_module_struct *module = ndpi_init_detection_module();
+    
+  NDPI_PROTOCOL_BITMASK all;
+    
+  ndpi_init_prefs pm_ndpi_init_prefs = ndpi_no_prefs;
+  struct ndpi_detection_module_struct *module = ndpi_init_detection_module(pm_ndpi_init_prefs);
   struct pm_ndpi_workflow *workflow = ndpi_calloc(1, sizeof(struct pm_ndpi_workflow));
 
   log_notification_init(&log_notifications.ndpi_cache_full);
@@ -68,10 +103,16 @@ struct pm_ndpi_workflow *pm_ndpi_workflow_init()
 
   if (workflow->ndpi_struct == NULL) {
     Log(LOG_ERR, "ERROR ( %s/core ): nDPI global structure initialization failed.\n", config.name);
-    exit(1);
+    exit_gracefully(1);
   }
 
   workflow->ndpi_flows_root = ndpi_calloc(workflow->prefs.num_roots, sizeof(void *));
+    
+  // enable all protocols
+  NDPI_BITMASK_SET_ALL(all);
+  ndpi_set_protocol_detection_bitmask2(workflow->ndpi_struct, &all);
+
+  ndpi_finalize_initialization(workflow->ndpi_struct);
 
   return workflow;
 }
@@ -93,9 +134,9 @@ void pm_ndpi_export_proto_to_class(struct pm_ndpi_workflow *workflow)
       memset(&css, 0, sizeof(css));
       css.id = workflow->ndpi_struct->proto_defaults[idx].protoId;
       strncpy(css.protocol, workflow->ndpi_struct->proto_defaults[idx].protoName, MAX_PROTOCOL_LEN);
+      css.category = workflow->ndpi_struct->proto_defaults[idx].protoCategory;
       ret = pmct_ndpi_register(&css);
       if (!ret) Log(LOG_WARNING, "WARN ( %s/core ): unable to register nDPI class ID %u.\n", config.name, css.id);
     }
   }
 }
-#endif

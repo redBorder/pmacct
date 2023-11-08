@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
 */
 
 /*
@@ -19,13 +19,9 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-/* defines */
-#define __BMP_LOOKUP_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
-#include "../bgp/bgp.h"
+#include "bgp/bgp.h"
 #include "bmp.h"
 
 void bmp_srcdst_lookup(struct packet_ptrs *pptrs)
@@ -45,12 +41,10 @@ struct bgp_peer *bgp_lookup_find_bmp_peer(struct sockaddr *sa, struct xflow_stat
       peer_idx = xs_entry->peer_v4_idx;
       peer_idx_ptr = &xs_entry->peer_v4_idx;
     }
-#if defined ENABLE_IPV6
     else if (l3_proto == ETHERTYPE_IPV6) {
       peer_idx = xs_entry->peer_v6_idx;
       peer_idx_ptr = &xs_entry->peer_v6_idx;
     }
-#endif
   }
 
   if (xs_entry && peer_idx) {
@@ -63,7 +57,7 @@ struct bgp_peer *bgp_lookup_find_bmp_peer(struct sockaddr *sa, struct xflow_stat
     }
   }
   else {
-    for (peer = NULL, peers_idx = 0; peers_idx < config.nfacctd_bmp_max_peers; peers_idx++) {
+    for (peer = NULL, peers_idx = 0; peers_idx < config.bmp_daemon_max_peers; peers_idx++) {
       /* use-case #1: BMP peer being the edge router */
       if (!sa_addr_cmp(sa, &bmp_peers[peers_idx].self.addr) || !sa_addr_cmp(sa, &bmp_peers[peers_idx].self.id)) {
         peer = &bmp_peers[peers_idx].self;
@@ -72,9 +66,14 @@ struct bgp_peer *bgp_lookup_find_bmp_peer(struct sockaddr *sa, struct xflow_stat
       }
       /* use-case #2: BMP peer being the reflector; XXX: fix caching */
       else {
-	void *ret;
+	void *ret = NULL;
 
-	ret = pm_tfind(sa, &bmp_peers[peers_idx].bgp_peers, bgp_peer_sa_addr_cmp);
+	if (sa->sa_family == AF_INET) {
+	  ret = pm_tfind(sa, &bmp_peers[peers_idx].bgp_peers_v4, bgp_peer_sa_addr_cmp);
+	}
+	else if (sa->sa_family == AF_INET6) {
+	  ret = pm_tfind(sa, &bmp_peers[peers_idx].bgp_peers_v6, bgp_peer_sa_addr_cmp);
+	}
 
 	if (ret) {
 	  peer = (*(struct bgp_peer **) ret);
@@ -111,24 +110,45 @@ int bgp_lookup_node_match_cmp_bmp(struct bgp_info *info, struct node_match_cmp_t
   struct bmp_peer *bmpp = info->peer->bmp_se;
   struct bgp_peer *peer_local = &bmpp->self;
   struct bgp_peer *peer_remote = info->peer;
-  int no_match = FALSE;
+  int no_match = FALSE, compare_rd = FALSE;
 
   /* peer_local: edge router use-case; peer_remote: replicator use-case */
   if (peer_local == nmct2->peer || peer_remote == nmct2->peer) {
-    if (nmct2->safi == SAFI_MPLS_VPN) no_match++;
-    if (nmct2->peer->cap_add_paths) no_match++;
-
-    if (nmct2->safi == SAFI_MPLS_VPN) {
-      if (info->extra && !memcmp(&info->extra->rd, &nmct2->rd, sizeof(rd_t))) no_match--;
+    if (nmct2->safi == SAFI_MPLS_VPN || !is_empty_256b(nmct2->rd, sizeof(rd_t))) {
+      no_match++;
+      compare_rd = TRUE;
     }
 
-    if (nmct2->peer->cap_add_paths) {
-      if (info->attr) {
-        if (info->attr->mp_nexthop.family == nmct2->peer_dst_ip->family) {
-          if (!memcmp(&info->attr->mp_nexthop, &nmct2->peer_dst_ip, HostAddrSz)) no_match--;
-        }
+    if (nmct2->peer->cap_add_paths.cap[nmct2->afi][nmct2->safi]) no_match++;
+
+    if (compare_rd) {
+      /* RD typical location */
+      if (info->attr_extra && !memcmp(&info->attr_extra->rd, nmct2->rd, sizeof(rd_t))) {
+	no_match--;
+      }
+      /* RD location when decoded from Peer Distinguisher */
+      else {
+	if (info->bmed.id == BGP_MSG_EXTRA_DATA_BMP) {
+	  struct bmp_chars *bmed_bmp = (struct bmp_chars *) info->bmed.data;
+
+	  if (bmed_bmp && !memcmp(&bmed_bmp->rd, nmct2->rd, sizeof(rd_t))) {
+	    no_match--;
+	  }
+	}
+      }
+    }
+
+    if (nmct2->peer->cap_add_paths.cap[nmct2->afi][nmct2->safi]) {
+      if (info->attr && nmct2->peer_dst_ip) {
+	if (info->attr->mp_nexthop.family) {
+	  if (!host_addr_cmp(&info->attr->mp_nexthop, nmct2->peer_dst_ip)) {
+	    no_match--;
+	  }
+	}
         else if (info->attr->nexthop.s_addr && nmct2->peer_dst_ip->family == AF_INET) {
-          if (info->attr->nexthop.s_addr == nmct2->peer_dst_ip->address.ipv4.s_addr) no_match--;
+          if (info->attr->nexthop.s_addr == nmct2->peer_dst_ip->address.ipv4.s_addr) {
+	    no_match--;
+	  }
         }
       }
     }

@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2021 by Paolo Lucente
 */
 
 /*
@@ -19,33 +19,41 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __IP_FRAG_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
 #include "pmacct-data.h"
 #include "plugin_hooks.h"
 #include "ip_frag.h"
 #include "jhash.h"
+
+/* global variables */
+struct ip_fragment *ipft[IPFT_HASHSZ];
+struct lru_l lru_list;
+
+struct ip6_fragment *ipft6[IPFT_HASHSZ];
+struct lru_l6 lru_list6;
 
 u_int32_t ipft_total_nodes;  
 time_t prune_deadline;
 time_t emergency_prune;
 u_int32_t trivial_hash_rnd = 140281; /* ummmh */
 
-#if defined ENABLE_IPV6
 u_int32_t ipft6_total_nodes;
 time_t prune_deadline6;
 time_t emergency_prune6;
-#endif
+
+void enable_ip_fragment_handler()
+{
+  if (!config.handle_fragments) {
+    config.handle_fragments = TRUE;
+    init_ip_fragment_handler();
+  }
+}
 
 void init_ip_fragment_handler()
 {
   init_ip4_fragment_handler();
-#if defined ENABLE_IPV6
   init_ip6_fragment_handler();
-#endif
 }
 
 void init_ip4_fragment_handler()
@@ -145,7 +153,7 @@ int create_fragment(u_int32_t now, struct ip_fragment *fp, u_int8_t is_candidate
 
   if (!ipft_total_nodes) {
     if (now > emergency_prune+EMER_PRUNE_INTERVAL) {
-      Log(LOG_INFO, "INFO ( %s/core ): Fragment/4 buffer full. Skipping fragments.\n", config.name);
+      Log(LOG_INFO, "INFO ( %s/core ): Fragment/4 buffer full. Skipping fragments. Increase %s_frag_buffer_size\n", config.name, config.progname);
       emergency_prune = now;
       prune_old_fragments(now, 0);
     }
@@ -159,7 +167,7 @@ int create_fragment(u_int32_t now, struct ip_fragment *fp, u_int8_t is_candidate
       newf = (struct ip_fragment *) malloc(sizeof(struct ip_fragment));
       if (!newf) { 
 	if (now > emergency_prune+EMER_PRUNE_INTERVAL) {
-	  Log(LOG_INFO, "INFO ( %s/core ): Fragment/4 buffer full. Skipping fragments.\n", config.name);
+	  Log(LOG_INFO, "INFO ( %s/core ): Fragment/4 buffer full. Skipping fragments. Increase %s_frag_buffer_size\n", config.name, config.progname);
 	  emergency_prune = now;
 	  prune_old_fragments(now, 0);
 	}
@@ -191,7 +199,7 @@ int create_fragment(u_int32_t now, struct ip_fragment *fp, u_int8_t is_candidate
     fp = (struct ip_fragment *) malloc(sizeof(struct ip_fragment));  
     if (!fp) {
       if (now > emergency_prune+EMER_PRUNE_INTERVAL) {
-        Log(LOG_INFO, "INFO ( %s/core ): Fragment/4 buffer full. Skipping fragments.\n", config.name);
+        Log(LOG_INFO, "INFO ( %s/core ): Fragment/4 buffer full. Skipping fragments. Increase %s_frag_buffer_size\n", config.name, config.progname);
         emergency_prune = now;
         prune_old_fragments(now, 0);
       }
@@ -278,7 +286,7 @@ unsigned int hash_fragment(u_int16_t id, u_int32_t src, u_int32_t dst, u_int8_t 
 void notify_orphan_fragment(struct ip_fragment *frag)
 {
   struct host_addr a;
-  u_char src_host[INET_ADDRSTRLEN], dst_host[INET_ADDRSTRLEN];
+  char src_host[INET_ADDRSTRLEN], dst_host[INET_ADDRSTRLEN];
   u_int16_t id;
 
   a.family = AF_INET;
@@ -291,7 +299,6 @@ void notify_orphan_fragment(struct ip_fragment *frag)
 		  config.name, src_host, dst_host, frag->ip_p, id);
 }
 
-#if defined ENABLE_IPV6
 void init_ip6_fragment_handler()
 {
   if (config.frag_bufsz) ipft6_total_nodes = config.frag_bufsz / sizeof(struct ip6_fragment);
@@ -406,7 +413,7 @@ int create_fragment6(u_int32_t now, struct ip6_fragment *fp, u_int8_t is_candida
 
   if (!ipft6_total_nodes) { 
     if (now > emergency_prune6+EMER_PRUNE_INTERVAL) {
-      Log(LOG_INFO, "INFO ( %s/core ): Fragment/6 buffer full. Skipping fragments.\n", config.name);
+      Log(LOG_INFO, "INFO ( %s/core ): Fragment/6 buffer full. Skipping fragments. Increase %s_frag_buffer_size\n", config.name, config.progname);
       emergency_prune6 = now;
       prune_old_fragments6(now, 0);
     }
@@ -420,7 +427,7 @@ int create_fragment6(u_int32_t now, struct ip6_fragment *fp, u_int8_t is_candida
       newf = (struct ip6_fragment *) malloc(sizeof(struct ip6_fragment));
       if (!newf) {
 	if (now > emergency_prune6+EMER_PRUNE_INTERVAL) {
-	  Log(LOG_INFO, "INFO ( %s/core ): Fragment/6 buffer full. Skipping fragments.\n", config.name);
+	  Log(LOG_INFO, "INFO ( %s/core ): Fragment/6 buffer full. Skipping fragments. Increase %s_frag_buffer_size\n", config.name, config.progname);
 	  emergency_prune6 = now;
 	  prune_old_fragments6(now, 0);
 	}
@@ -452,7 +459,7 @@ int create_fragment6(u_int32_t now, struct ip6_fragment *fp, u_int8_t is_candida
     fp = (struct ip6_fragment *) malloc(sizeof(struct ip6_fragment));
     if (!fp) {
       if (now > emergency_prune6+EMER_PRUNE_INTERVAL) {
-        Log(LOG_INFO, "INFO ( %s/core ): Fragment/6 buffer full. Skipping fragments.\n", config.name);
+        Log(LOG_INFO, "INFO ( %s/core ): Fragment/6 buffer full. Skipping fragments. Increase %s_frag_buffer_size\n", config.name, config.progname);
         emergency_prune6 = now;
         prune_old_fragments6(now, 0);
       }
@@ -531,7 +538,7 @@ void prune_old_fragments6(u_int32_t now, u_int32_t off)
 void notify_orphan_fragment6(struct ip6_fragment *frag)
 {
   struct host_addr a;
-  u_char src_host[INET6_ADDRSTRLEN], dst_host[INET6_ADDRSTRLEN];
+  char src_host[INET6_ADDRSTRLEN], dst_host[INET6_ADDRSTRLEN];
   u_int32_t id;
 
   a.family = AF_INET6;
@@ -543,4 +550,3 @@ void notify_orphan_fragment6(struct ip6_fragment *frag)
   Log(LOG_DEBUG, "DEBUG ( %s/core ): Expiring orphan fragment: ip_src=%s ip_dst=%s id=%u\n",
 			config.name, src_host, dst_host, id);
 }
-#endif

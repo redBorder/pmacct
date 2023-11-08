@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,26 +19,46 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __KAFKA_COMMON_C
-
 /* includes */
 #include "pmacct.h"
 #include "pmacct-data.h"
+#include "plugin_common.h"
 #include "kafka_common.h"
+#include "base64.h"
+
+struct p_kafka_host kafkap_kafka_host;
+struct p_kafka_host bgp_daemon_msglog_kafka_host;
+struct p_kafka_host bmp_daemon_msglog_kafka_host;
+struct p_kafka_host sfacctd_counter_kafka_host;
+struct p_kafka_host telemetry_kafka_host;
+struct p_kafka_host telemetry_daemon_msglog_kafka_host;
+struct p_kafka_host nfacctd_kafka_host;
+
+int kafkap_ret_err_cb;
+int dyn_partition_key;
+char default_kafka_broker_host[] = "127.0.0.1";
+int default_kafka_broker_port = 9092;
+char default_kafka_topic[] = "pmacct.acct";
 
 /* Functions */
-void p_kafka_init_host(struct p_kafka_host *kafka_host, char *config_file)
+void p_kafka_init_host_struct(struct p_kafka_host *kafka_host)
 {
   if (kafka_host) {
     memset(kafka_host, 0, sizeof(struct p_kafka_host));
     P_broker_timers_set_retry_interval(&kafka_host->btimers, PM_KAFKA_DEFAULT_RETRY);
+  }
+}
+
+void p_kafka_init_host_conf(struct p_kafka_host *kafka_host, char *config_file)
+{
+  if (kafka_host) {
     p_kafka_set_config_file(kafka_host, config_file);
 
     kafka_host->cfg = rd_kafka_conf_new();
     if (kafka_host->cfg) {
       rd_kafka_conf_set_log_cb(kafka_host->cfg, p_kafka_logger);
       rd_kafka_conf_set_error_cb(kafka_host->cfg, p_kafka_msg_error);
-      rd_kafka_conf_set_dr_cb(kafka_host->cfg, p_kafka_msg_delivered);
+      rd_kafka_conf_set_dr_msg_cb(kafka_host->cfg, p_kafka_msg_delivered);
       rd_kafka_conf_set_stats_cb(kafka_host->cfg, p_kafka_stats);
       rd_kafka_conf_set_opaque(kafka_host->cfg, kafka_host);
       p_kafka_apply_global_config(kafka_host);
@@ -57,6 +77,12 @@ void p_kafka_init_host(struct p_kafka_host *kafka_host, char *config_file)
   }
 }
 
+void p_kafka_init_host(struct p_kafka_host *kafka_host, char *config_file)
+{
+  p_kafka_init_host_struct(kafka_host);
+  p_kafka_init_host_conf(kafka_host, config_file);
+}
+
 void p_kafka_unset_topic(struct p_kafka_host *kafka_host)
 {
   if (kafka_host && kafka_host->topic) {
@@ -67,7 +93,7 @@ void p_kafka_unset_topic(struct p_kafka_host *kafka_host)
 
 void p_kafka_set_topic(struct p_kafka_host *kafka_host, char *topic)
 {
-  if (kafka_host) {
+  if (kafka_host && kafka_host->rk) {
     kafka_host->topic_cfg = rd_kafka_topic_conf_new();
     p_kafka_apply_topic_config(kafka_host);
 
@@ -90,16 +116,31 @@ void p_kafka_set_topic(struct p_kafka_host *kafka_host, char *topic)
     /* destroy current allocation before making a new one */
     if (kafka_host->topic) p_kafka_unset_topic(kafka_host);
 
-    if (kafka_host->rk && kafka_host->topic_cfg) {
+    if (kafka_host->topic_cfg) {
       kafka_host->topic = rd_kafka_topic_new(kafka_host->rk, topic, kafka_host->topic_cfg);
       kafka_host->topic_cfg = NULL; /* rd_kafka_topic_new() destroys conf as per rdkafka.h */
     }
   }
 }
 
+rd_kafka_t *p_kafka_get_handler(struct p_kafka_host *kafka_host)
+{
+  if (kafka_host) return kafka_host->rk;
+
+  return NULL;
+}
+
+char *p_kafka_get_broker(struct p_kafka_host *kafka_host)
+{
+  if (kafka_host && strlen(kafka_host->broker)) return kafka_host->broker;
+
+  return NULL;
+}
+
 char *p_kafka_get_topic(struct p_kafka_host *kafka_host)
 {
-  if (kafka_host && kafka_host->topic) return rd_kafka_topic_name(kafka_host->topic);
+  if (kafka_host && kafka_host->topic)
+    return (char*)rd_kafka_topic_name(kafka_host->topic);
 
   return NULL;
 }
@@ -132,6 +173,7 @@ void p_kafka_set_broker(struct p_kafka_host *kafka_host, char *host, int port)
     if (multiple_brokers) snprintf(kafka_host->broker, SRVBUFLEN, "%s", host);
     else {
       if (host && port) snprintf(kafka_host->broker, SRVBUFLEN, "%s:%u", host, port);
+      else if (host && !port) snprintf(kafka_host->broker, SRVBUFLEN, "%s", host);
     }
 
     if ((ret = rd_kafka_brokers_add(kafka_host->rk, kafka_host->broker)) == 0) {
@@ -213,7 +255,7 @@ int p_kafka_parse_config_entry(char *buf, char *type, char **key, char **value)
     (*value) = NULL;
     index = 0;
 
-    while (token = extract_token(&value_ptr, ',')) {
+    while ((token = extract_token(&value_ptr, ','))) {
       index++;
       trim_spaces(token);
 
@@ -265,8 +307,7 @@ void p_kafka_apply_global_config(struct p_kafka_host *kafka_host)
         }
 	else {
 	  if (ret == ERR) {
-	    Log(LOG_WARNING, "WARN ( %s/%s ): [%s:%u] Line malformed. Ignored.", config.name, config.type, kafka_host->config_file, lineno);
-	    continue;
+	    Log(LOG_WARNING, "WARN ( %s/%s ): [%s:%u] Line malformed. Ignored.\n", config.name, config.type, kafka_host->config_file, lineno);
 	  }
 	}
       }
@@ -302,8 +343,7 @@ void p_kafka_apply_topic_config(struct p_kafka_host *kafka_host)
         }
         else {
           if (ret == ERR) {
-            Log(LOG_WARNING, "WARN ( %s/%s ): [%s:%u] Line malformed. Ignored.", config.name, config.type, kafka_host->config_file, lineno);
-            continue;
+            Log(LOG_WARNING, "WARN ( %s/%s ): [%s:%u] Line malformed. Ignored.\n", config.name, config.type, kafka_host->config_file, lineno);
           }
         }
       }
@@ -317,32 +357,34 @@ void p_kafka_apply_topic_config(struct p_kafka_host *kafka_host)
 
 void p_kafka_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
-  struct timeval tv;
-
-  gettimeofday(&tv, NULL);
-
   Log(LOG_DEBUG, "DEBUG ( %s/%s ): RDKAFKA-%i-%s: %s: %s\n", config.name, config.type, level, fac, rd_kafka_name(rk), buf);
 }
 
-void p_kafka_msg_delivered(rd_kafka_t *rk, void *payload, size_t len, int error_code, void *opaque, void *msg_opaque)
+void p_kafka_msg_delivered(rd_kafka_t *rk, const rd_kafka_message_t *rk_msg, void *opaque)
 {
-  struct p_kafka_host *kafka_host = (struct p_kafka_host *) opaque; 
+  struct p_kafka_host *kafka_host = (struct p_kafka_host *) opaque;
 
-  if (error_code) {
-    Log(LOG_ERR, "ERROR ( %s/%s ): Kafka message delivery failed: %s\n", config.name, config.type, rd_kafka_err2str(error_code));
+  if (rk_msg->err) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): Kafka message delivery failed: %s\n", config.name, config.type, rd_kafka_err2str(rk_msg->err));
   }
   else {
     if (config.debug) {
       if (p_kafka_get_content_type(kafka_host) == PM_KAFKA_CNT_TYPE_STR) {
-        char *payload_str = (char *) payload;
-	char saved = payload_str[len];
+        char *payload_str = (char *) rk_msg->payload;
+        char saved = payload_str[rk_msg->len - 1];
 
-	payload_str[len] = '\0';
-        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Kafka message delivery successful (%zd bytes): %s\n", config.name, config.type, len, payload);
-	payload_str[len] = saved;
+        payload_str[rk_msg->len - 1] = '\0';
+        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Kafka message delivery successful (%zd bytes): %p\n",
+            config.name, config.type, rk_msg->len, rk_msg->payload);
+        payload_str[rk_msg->len - 1] = saved;
       }
       else {
-	Log(LOG_DEBUG, "DEBUG ( %s/%s ): Kafka message delivery successful (%zd bytes)\n", config.name, config.type, len);
+        size_t base64_data_len = 0;
+        u_char *base64_data = base64_encode(rk_msg->payload, rk_msg->len, &base64_data_len);
+
+        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Kafka message delivery successful (%zd bytes): %s\n", config.name, config.type, rk_msg->len, base64_data);
+
+        if (base64_data) base64_freebuf(base64_data);
       }
     }
   }
@@ -356,12 +398,23 @@ void p_kafka_msg_error(rd_kafka_t *rk, int err, const char *reason, void *opaque
 int p_kafka_stats(rd_kafka_t *rk, char *json, size_t json_len, void *opaque)
 {
   Log(LOG_INFO, "INFO ( %s/%s ): %s\n", config.name, config.type, json);
+
+  /* We return 0 since we don't want to hold data any further;
+     see librdkafka header/docs for more info. */
+  return FALSE;
 }
 
 int p_kafka_connect_to_produce(struct p_kafka_host *kafka_host)
 {
   if (kafka_host) {
-    kafka_host->rk = rd_kafka_new(RD_KAFKA_PRODUCER, kafka_host->cfg, kafka_host->errstr, sizeof(kafka_host->errstr));
+    rd_kafka_conf_t* cfg = rd_kafka_conf_dup(kafka_host->cfg);
+    if (cfg == NULL) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): Failed to clone kafka config object\n", config.name, config.type);
+      p_kafka_close(kafka_host, TRUE);
+      return ERR;
+    }
+
+    kafka_host->rk = rd_kafka_new(RD_KAFKA_PRODUCER, cfg, kafka_host->errstr, sizeof(kafka_host->errstr));
     if (!kafka_host->rk) {
       Log(LOG_ERR, "ERROR ( %s/%s ): Failed to create new Kafka producer: %s\n", config.name, config.type, kafka_host->errstr);
       p_kafka_close(kafka_host, TRUE);
@@ -375,20 +428,26 @@ int p_kafka_connect_to_produce(struct p_kafka_host *kafka_host)
   return SUCCESS;
 }
 
-int p_kafka_produce_data_to_part(struct p_kafka_host *kafka_host, void *data, u_int32_t data_len, int part)
+int p_kafka_produce_data_to_part(struct p_kafka_host *kafka_host, void *data, size_t data_len, int part, int do_free)
 {
   int ret = SUCCESS;
+  int flag = RD_KAFKA_MSG_F_COPY;
 
   kafkap_ret_err_cb = FALSE;
 
+  if (do_free) {
+    flag = RD_KAFKA_MSG_F_FREE;
+  }
+
   if (kafka_host && kafka_host->rk && kafka_host->topic) {
-    ret = rd_kafka_produce(kafka_host->topic, part, RD_KAFKA_MSG_F_COPY,
-			   data, data_len, kafka_host->key, kafka_host->key_len, NULL);
+    ret = rd_kafka_produce(kafka_host->topic, part, flag, data, data_len,
+			   kafka_host->key, kafka_host->key_len, NULL);
 
     if (ret == ERR) {
       Log(LOG_ERR, "ERROR ( %s/%s ): Failed to produce to topic %s partition %i: %s\n", config.name, config.type,
-          rd_kafka_topic_name(kafka_host->topic), part, rd_kafka_err2str(rd_kafka_errno2err(errno)));
+          rd_kafka_topic_name(kafka_host->topic), part, rd_kafka_err2str(rd_kafka_last_error()));
       p_kafka_close(kafka_host, TRUE);
+      return ERR;
     }
   }
   else return ERR;
@@ -398,9 +457,106 @@ int p_kafka_produce_data_to_part(struct p_kafka_host *kafka_host, void *data, u_
   return ret; 
 }
 
-int p_kafka_produce_data(struct p_kafka_host *kafka_host, void *data, u_int32_t data_len)
+int p_kafka_produce_data(struct p_kafka_host *kafka_host, void *data, size_t data_len)
 {
-  return p_kafka_produce_data_to_part(kafka_host, data, data_len, kafka_host->partition);
+  return p_kafka_produce_data_to_part(kafka_host, data, data_len, kafka_host->partition, FALSE);
+}
+
+int p_kafka_produce_data_and_free(struct p_kafka_host *kafka_host, void *data, size_t data_len)
+{
+  return p_kafka_produce_data_to_part(kafka_host, data, data_len, kafka_host->partition, TRUE);
+}
+
+int p_kafka_connect_to_consume(struct p_kafka_host *kafka_host)
+{
+  if (kafka_host) {
+    rd_kafka_conf_t* cfg = rd_kafka_conf_dup(kafka_host->cfg);
+    if (cfg == NULL) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): Failed to clone kafka config object\n", config.name, config.type);
+      p_kafka_close(kafka_host, TRUE);
+      return ERR;
+    }
+
+    kafka_host->rk = rd_kafka_new(RD_KAFKA_CONSUMER, cfg, kafka_host->errstr, sizeof(kafka_host->errstr));
+    if (!kafka_host->rk) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): Failed to create new Kafka producer: %s\n", config.name, config.type, kafka_host->errstr);
+      p_kafka_close(kafka_host, TRUE);
+      return ERR;
+    }
+
+    if (config.debug) rd_kafka_set_log_level(kafka_host->rk, LOG_DEBUG);
+  }
+  else return ERR;
+
+  return SUCCESS;
+}
+
+int p_kafka_manage_consumer(struct p_kafka_host *kafka_host, int is_start)
+{
+  int ret = SUCCESS;
+
+  kafkap_ret_err_cb = FALSE;
+
+  if (kafka_host && kafka_host->rk && kafka_host->topic && !validate_truefalse(is_start)) {
+    if (is_start) {
+      ret = rd_kafka_consume_start(kafka_host->topic, kafka_host->partition, RD_KAFKA_OFFSET_END);
+      if (ret == ERR) {
+        Log(LOG_ERR, "ERROR ( %s/%s ): Failed to start consuming topic %s partition %i: %s\n", config.name, config.type,
+          rd_kafka_topic_name(kafka_host->topic), kafka_host->partition, rd_kafka_err2str(rd_kafka_last_error()));
+        p_kafka_close(kafka_host, TRUE);
+        return ERR;
+      }
+    }
+    else {
+      rd_kafka_consume_stop(kafka_host->topic, kafka_host->partition);
+      p_kafka_close(kafka_host, FALSE);
+    }
+  }
+  else return ERR;
+
+  return ret;
+}
+
+int p_kafka_consume_poller(struct p_kafka_host *kafka_host, void **data, int timeout)
+{
+  rd_kafka_message_t *kafka_msg;
+  int ret = SUCCESS;
+
+  if (kafka_host && data && timeout) {
+    kafka_msg = rd_kafka_consume(kafka_host->topic, kafka_host->partition, timeout);
+    if (!kafka_msg) ret = FALSE; /* timeout */
+    else ret = TRUE; /* got data */
+
+    (*data) = kafka_msg;
+  }
+  else {
+    (*data) = NULL;
+    ret = ERR;
+  }
+
+  return ret;
+}
+
+int p_kafka_consume_data(struct p_kafka_host *kafka_host, void *data, u_char *payload, size_t payload_len)
+{
+  rd_kafka_message_t *kafka_msg = (rd_kafka_message_t *) data;
+  int ret = 0;
+
+  if (kafka_host && data && payload && payload_len) {
+    if (kafka_msg->payload && kafka_msg->len) {
+      if (kafka_msg->len <= payload_len) {
+        memcpy(payload, kafka_msg->payload, kafka_msg->len);
+        ret = kafka_msg->len;
+      }
+      else ret = ERR;
+    }
+    else ret = 0;
+  }
+  else ret = ERR;
+
+  rd_kafka_message_destroy(kafka_msg);
+
+  return ret;
 }
 
 void p_kafka_close(struct p_kafka_host *kafka_host, int set_fail)
@@ -420,29 +576,38 @@ void p_kafka_close(struct p_kafka_host *kafka_host, int set_fail)
       kafka_host->topic = NULL;
     }
 
+    if (kafka_host->topic_cfg) {
+      rd_kafka_topic_conf_destroy(kafka_host->topic_cfg);
+      kafka_host->topic_cfg = NULL; 
+    }
+
     if (kafka_host->rk) {
       rd_kafka_destroy(kafka_host->rk);
       kafka_host->rk = NULL;
+    }
+
+    if (kafka_host->cfg) {
+      rd_kafka_conf_destroy(kafka_host->cfg);
+      kafka_host->cfg = NULL;
     }
   }
 }
 
 int p_kafka_check_outq_len(struct p_kafka_host *kafka_host)
 {
-  int outq_len = 0, old_outq_len = 0;
+  int outq_len = 0, old_outq_len = 0, retries = 0;
 
   if (kafka_host->rk) {
     while ((outq_len = rd_kafka_outq_len(kafka_host->rk)) > 0) {
-      if (!old_outq_len) {
-	old_outq_len = outq_len;
-      }
-      else {
-        if (outq_len == old_outq_len) {
-	  Log(LOG_ERR, "ERROR ( %s/%s ): Connection failed to Kafka: p_kafka_check_outq_len()\n", config.name, config.type);
+      if (outq_len == old_outq_len) {
+	if (retries < PM_KAFKA_OUTQ_LEN_RETRIES) retries++;
+	else {
+	  Log(LOG_ERR, "ERROR ( %s/%s ): Connection failed to Kafka: p_kafka_check_outq_len() (%u)\n", config.name, config.type, outq_len);
           p_kafka_close(kafka_host, TRUE);
 	  return outq_len; 
 	}
       }
+      else old_outq_len = outq_len;
 
       rd_kafka_poll(kafka_host->rk, 100);
       sleep(1);
@@ -473,8 +638,7 @@ int write_and_free_json_kafka(void *kafka_log, void *obj)
       p_kafka_set_topic(alog, dyn_kafka_topic);
     }
 
-    ret = p_kafka_produce_data(alog, tmpbuf, strlen(tmpbuf));
-    free(tmpbuf);
+    ret = p_kafka_produce_data_and_free(alog, tmpbuf, strlen(tmpbuf));
 
     if (alog->topic_rr.max) p_kafka_set_topic(alog, orig_kafka_topic);
   }
@@ -487,3 +651,24 @@ int write_and_free_json_kafka(void *kafka_log, void *obj)
   if (config.debug) Log(LOG_DEBUG, "DEBUG ( %s/%s ): write_and_free_json_kafka(): JSON object not created due to missing --enable-jansson\n", config.name, config.type);
 }
 #endif
+
+int write_binary_kafka(void *kafka_log, void *obj, size_t len)
+{
+  char *orig_kafka_topic = NULL, dyn_kafka_topic[SRVBUFLEN];
+  struct p_kafka_host *alog = (struct p_kafka_host *) kafka_log;
+  int ret = ERR;
+
+  if (obj && len) {
+    if (alog->topic_rr.max) {
+      orig_kafka_topic = p_kafka_get_topic(alog);
+      P_handle_table_dyn_rr(dyn_kafka_topic, SRVBUFLEN, orig_kafka_topic, &alog->topic_rr);
+      p_kafka_set_topic(alog, dyn_kafka_topic);
+    }
+
+    ret = p_kafka_produce_data(alog, obj, len);
+
+    if (alog->topic_rr.max) p_kafka_set_topic(alog, orig_kafka_topic);
+  }
+
+  return ret;
+}

@@ -22,12 +22,9 @@
  * 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 
-#define __ISIS_ROUTE_C
-
 #include "pmacct.h"
 #include "isis.h"
 
-#include "linklist.h"
 #include "dict.h"
 #include "thread.h"
 #include "prefix.h"
@@ -54,10 +51,10 @@ extern struct thread_master *master;
 static struct isis_nexthop *
 isis_nexthop_create (struct in_addr *ip, unsigned int ifindex)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop *nexthop;
 
-  for (ALL_LIST_ELEMENTS_RO (isis->nexthops, node, nexthop))
+  for (PM_ALL_LIST_ELEMENTS_RO (isis->nexthops, node, nexthop))
     {
       if (nexthop->ifindex != ifindex)
 	continue;
@@ -74,10 +71,12 @@ isis_nexthop_create (struct in_addr *ip, unsigned int ifindex)
       Log(LOG_ERR, "ERROR ( %s/core/ISIS ): ISIS-Rte: isis_nexthop_create: out of memory!\n", config.name);
     }
 
-  nexthop->ifindex = ifindex;
-  memcpy (&nexthop->ip, ip, sizeof (struct in_addr));
-  isis_listnode_add (isis->nexthops, nexthop);
-  nexthop->lock++;
+  if (nexthop) {
+    nexthop->ifindex = ifindex;
+    memcpy (&nexthop->ip, ip, sizeof (struct in_addr));
+    pm_listnode_add (isis->nexthops, nexthop);
+    nexthop->lock++;
+  }
 
   return nexthop;
 }
@@ -88,7 +87,7 @@ isis_nexthop_delete (struct isis_nexthop *nexthop)
   nexthop->lock--;
   if (nexthop->lock == 0)
     {
-      isis_listnode_delete (isis->nexthops, nexthop);
+      pm_listnode_delete (isis->nexthops, nexthop);
       free(nexthop);
     }
 
@@ -96,13 +95,13 @@ isis_nexthop_delete (struct isis_nexthop *nexthop)
 }
 
 static int
-nexthoplookup (struct list *nexthops, struct in_addr *ip,
+nexthoplookup (struct pm_list *nexthops, struct in_addr *ip,
 	       unsigned int ifindex)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop *nh;
 
-  for (ALL_LIST_ELEMENTS_RO (nexthops, node, nh))
+  for (PM_ALL_LIST_ELEMENTS_RO (nexthops, node, nh))
     {
       if (!(memcmp (ip, &nh->ip, sizeof (struct in_addr))) &&
 	  ifindex == nh->ifindex)
@@ -112,7 +111,6 @@ nexthoplookup (struct list *nexthops, struct in_addr *ip,
   return 0;
 }
 
-#ifdef ENABLE_IPV6
 static struct isis_nexthop6 *
 isis_nexthop6_new (struct in6_addr *ip6, unsigned int ifindex)
 {
@@ -134,10 +132,10 @@ isis_nexthop6_new (struct in6_addr *ip6, unsigned int ifindex)
 static struct isis_nexthop6 *
 isis_nexthop6_create (struct in6_addr *ip6, unsigned int ifindex)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop6 *nexthop6;
 
-  for (ALL_LIST_ELEMENTS_RO (isis->nexthops6, node, nexthop6))
+  for (PM_ALL_LIST_ELEMENTS_RO (isis->nexthops6, node, nexthop6))
     {
       if (nexthop6->ifindex != ifindex)
 	continue;
@@ -160,7 +158,7 @@ isis_nexthop6_delete (struct isis_nexthop6 *nexthop6)
   nexthop6->lock--;
   if (nexthop6->lock == 0)
     {
-      isis_listnode_delete (isis->nexthops6, nexthop6);
+      pm_listnode_delete (isis->nexthops6, nexthop6);
       free(nexthop6);
     }
 
@@ -168,13 +166,13 @@ isis_nexthop6_delete (struct isis_nexthop6 *nexthop6)
 }
 
 static int
-nexthop6lookup (struct list *nexthops6, struct in6_addr *ip6,
+nexthop6lookup (struct pm_list *nexthops6, struct in6_addr *ip6,
 		unsigned int ifindex)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop6 *nh6;
 
-  for (ALL_LIST_ELEMENTS_RO (nexthops6, node, nh6))
+  for (PM_ALL_LIST_ELEMENTS_RO (nexthops6, node, nh6))
     {
       if (!(memcmp (ip6, &nh6->ip6, sizeof (struct in6_addr))) &&
 	  ifindex == nh6->ifindex)
@@ -184,59 +182,55 @@ nexthop6lookup (struct list *nexthops6, struct in6_addr *ip6,
   return 0;
 }
 
-#endif /* ENABLE_IPV6 */
-
 static void
-adjinfo2nexthop (struct list *nexthops, struct isis_adjacency *adj)
+adjinfo2nexthop (struct pm_list *nexthops, struct isis_adjacency *adj)
 {
   struct isis_nexthop *nh;
-  struct listnode *node;
+  struct pm_listnode *node;
   struct in_addr *ipv4_addr;
 
   if (adj->ipv4_addrs == NULL)
     return;
 
-  for (ALL_LIST_ELEMENTS_RO (adj->ipv4_addrs, node, ipv4_addr))
+  for (PM_ALL_LIST_ELEMENTS_RO (adj->ipv4_addrs, node, ipv4_addr))
     {
       if (!nexthoplookup (nexthops, ipv4_addr, adj->circuit->interface->ifindex))
 	{
 	  nh = isis_nexthop_create (ipv4_addr, adj->circuit->interface->ifindex);
-	  isis_listnode_add (nexthops, nh);
+	  pm_listnode_add (nexthops, nh);
 	}
     }
 }
 
-#ifdef ENABLE_IPV6
 static void
-adjinfo2nexthop6 (struct list *nexthops6, struct isis_adjacency *adj)
+adjinfo2nexthop6 (struct pm_list *nexthops6, struct isis_adjacency *adj)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct in6_addr *ipv6_addr;
   struct isis_nexthop6 *nh6;
 
   if (!adj->ipv6_addrs)
     return;
 
-  for (ALL_LIST_ELEMENTS_RO (adj->ipv6_addrs, node, ipv6_addr))
+  for (PM_ALL_LIST_ELEMENTS_RO (adj->ipv6_addrs, node, ipv6_addr))
     {
       if (!nexthop6lookup (nexthops6, ipv6_addr,
 			   adj->circuit->interface->ifindex))
 	{
 	  nh6 = isis_nexthop6_create (ipv6_addr,
 				      adj->circuit->interface->ifindex);
-	  isis_listnode_add (nexthops6, nh6);
+	  pm_listnode_add (nexthops6, nh6);
 	}
     }
 }
-#endif
 
 static struct isis_route_info *
 isis_route_info_new (uint32_t cost, uint32_t depth, u_char family,
-		     struct list *adjacencies)
+		     struct pm_list *adjacencies)
 {
   struct isis_route_info *rinfo;
   struct isis_adjacency *adj;
-  struct listnode *node;
+  struct pm_listnode *node;
 
   rinfo = calloc(1, sizeof (struct isis_route_info));
   if (!rinfo)
@@ -247,19 +241,16 @@ isis_route_info_new (uint32_t cost, uint32_t depth, u_char family,
 
   if (family == AF_INET)
     {
-      rinfo->nexthops = isis_list_new ();
-      for (ALL_LIST_ELEMENTS_RO (adjacencies, node, adj))
+      rinfo->nexthops = pm_list_new ();
+      for (PM_ALL_LIST_ELEMENTS_RO (adjacencies, node, adj))
         adjinfo2nexthop (rinfo->nexthops, adj);
     }
-#ifdef ENABLE_IPV6
   if (family == AF_INET6)
     {
-      rinfo->nexthops6 = isis_list_new ();
-      for (ALL_LIST_ELEMENTS_RO (adjacencies, node, adj))
+      rinfo->nexthops6 = pm_list_new ();
+      for (PM_ALL_LIST_ELEMENTS_RO (adjacencies, node, adj))
         adjinfo2nexthop6 (rinfo->nexthops6, adj);
     }
-
-#endif
 
   rinfo->cost = cost;
   rinfo->depth = depth;
@@ -273,16 +264,14 @@ isis_route_info_delete (struct isis_route_info *route_info)
   if (route_info->nexthops)
     {
       route_info->nexthops->del = (void (*)(void *)) isis_nexthop_delete;
-      isis_list_delete (route_info->nexthops);
+      pm_list_delete (route_info->nexthops);
     }
 
-#ifdef ENABLE_IPV6
   if (route_info->nexthops6)
     {
       route_info->nexthops6->del = (void (*)(void *)) isis_nexthop6_delete;
-      isis_list_delete (route_info->nexthops6);
+      pm_list_delete (route_info->nexthops6);
     }
-#endif /* ENABLE_IPV6 */
 
   free(route_info);
 }
@@ -303,75 +292,69 @@ static int
 isis_route_info_same (struct isis_route_info *new,
 		      struct isis_route_info *old, u_char family)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop *nexthop;
-#ifdef ENABLE_IPV6
   struct isis_nexthop6 *nexthop6;
-#endif /* ENABLE_IPV6 */
   if (!isis_route_info_same_attrib (new, old))
     return 0;
 
   if (family == AF_INET)
     {
-      for (ALL_LIST_ELEMENTS_RO (new->nexthops, node, nexthop))
+      for (PM_ALL_LIST_ELEMENTS_RO (new->nexthops, node, nexthop))
         if (nexthoplookup (old->nexthops, &nexthop->ip, nexthop->ifindex) 
               == 0)
           return 0;
 
-      for (ALL_LIST_ELEMENTS_RO (old->nexthops, node, nexthop))
+      for (PM_ALL_LIST_ELEMENTS_RO (old->nexthops, node, nexthop))
         if (nexthoplookup (new->nexthops, &nexthop->ip, nexthop->ifindex) 
              == 0)
           return 0;
     }
-#ifdef ENABLE_IPV6
   else if (family == AF_INET6)
     {
-      for (ALL_LIST_ELEMENTS_RO (new->nexthops6, node, nexthop6))
+      for (PM_ALL_LIST_ELEMENTS_RO (new->nexthops6, node, nexthop6))
         if (nexthop6lookup (old->nexthops6, &nexthop6->ip6,
                             nexthop6->ifindex) == 0)
           return 0;
 
-      for (ALL_LIST_ELEMENTS_RO (old->nexthops6, node, nexthop6))
+      for (PM_ALL_LIST_ELEMENTS_RO (old->nexthops6, node, nexthop6))
         if (nexthop6lookup (new->nexthops6, &nexthop6->ip6,
                             nexthop6->ifindex) == 0)
           return 0;
     }
-#endif /* ENABLE_IPV6 */
 
   return 1;
 }
 
 static void
-isis_nexthops_merge (struct list *new, struct list *old)
+isis_nexthops_merge (struct pm_list *new, struct pm_list *old)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop *nexthop;
 
-  for (ALL_LIST_ELEMENTS_RO (new, node, nexthop))
+  for (PM_ALL_LIST_ELEMENTS_RO (new, node, nexthop))
     {
       if (nexthoplookup (old, &nexthop->ip, nexthop->ifindex))
 	continue;
-      isis_listnode_add (old, nexthop);
+      pm_listnode_add (old, nexthop);
       nexthop->lock++;
     }
 }
 
-#ifdef ENABLE_IPV6
 static void
-isis_nexthops6_merge (struct list *new, struct list *old)
+isis_nexthops6_merge (struct pm_list *new, struct pm_list *old)
 {
-  struct listnode *node;
+  struct pm_listnode *node;
   struct isis_nexthop6 *nexthop6;
 
-  for (ALL_LIST_ELEMENTS_RO (new, node, nexthop6))
+  for (PM_ALL_LIST_ELEMENTS_RO (new, node, nexthop6))
     {
       if (nexthop6lookup (old, &nexthop6->ip6, nexthop6->ifindex))
 	continue;
-      isis_listnode_add (old, nexthop6);
+      pm_listnode_add (old, nexthop6);
       nexthop6->lock++;
     }
 }
-#endif /* ENABLE_IPV6 */
 
 static void
 isis_route_info_merge (struct isis_route_info *new,
@@ -379,10 +362,8 @@ isis_route_info_merge (struct isis_route_info *new,
 {
   if (family == AF_INET)
     isis_nexthops_merge (new->nexthops, old->nexthops);
-#ifdef ENABLE_IPV6
   else if (family == AF_INET6)
     isis_nexthops6_merge (new->nexthops6, old->nexthops6);
-#endif /* ENABLE_IPV6 */
 
   return;
 }
@@ -402,7 +383,7 @@ isis_route_info_prefer_new (struct isis_route_info *new,
 
 struct isis_route_info *
 isis_route_create (struct isis_prefix *prefix, u_int32_t cost, u_int32_t depth,
-		   struct list *adjacencies, struct isis_area *area,
+		   struct pm_list *adjacencies, struct isis_area *area,
 		   int level)
 {
   struct route_node *route_node;
@@ -424,12 +405,13 @@ isis_route_create (struct isis_prefix *prefix, u_int32_t cost, u_int32_t depth,
 
   if (family == AF_INET)
     route_node = route_node_get (area->route_table[level - 1], prefix);
-#ifdef ENABLE_IPV6
   else if (family == AF_INET6)
     route_node = route_node_get (area->route_table6[level - 1], prefix);
-#endif /* ENABLE_IPV6 */
-  else
+  else {
+    if (rinfo_new) free(rinfo_new);
     return NULL;
+  }
+
   rinfo_old = route_node->info;
   if (!rinfo_old)
     {
@@ -563,7 +545,6 @@ void isis_route_validate_table (struct isis_area *area, struct route_table *tabl
 		drnode->info = NULL;
 	    }
 
-#ifdef ENABLE_IPV6
 	  if (rnode->p.family == AF_INET6)
 	    {
 	      drnode = route_node_get (area->route_table6[0], &rnode->p);
@@ -573,7 +554,6 @@ void isis_route_validate_table (struct isis_area *area, struct route_table *tabl
 	      if (drnode->info == rnode->info)
 		drnode->info = NULL;
 	    }
-#endif
 	      
 	  isis_route_delete (&rnode->p, table);
 	}
@@ -600,10 +580,8 @@ void isis_route_validate_merge (struct isis_area *area, int family)
 
   if (family == AF_INET)
     table = area->route_table[0];
-#ifdef ENABLE_IPV6
   else if (family == AF_INET6)
     table = area->route_table6[0];
-#endif
 
   for (rnode = route_top (table); rnode; rnode = route_next (rnode))
     {
@@ -615,10 +593,8 @@ void isis_route_validate_merge (struct isis_area *area, int family)
 
   if (family == AF_INET)
     table = area->route_table[1];
-#ifdef ENABLE_IPV6
   else if (family == AF_INET6)
     table = area->route_table6[1];
-#endif
 
   for (rnode = route_top (table); rnode; rnode = route_next (rnode))
     {
@@ -657,7 +633,6 @@ isis_route_validate (struct thread *thread)
   isis_route_validate_merge (area, AF_INET);
 
 validate_ipv6:
-#ifdef ENABLE_IPV6
   if (area->is_type == IS_LEVEL_1)
     {
       isis_route_validate_table (area, area->route_table6[0]);
@@ -670,7 +645,6 @@ validate_ipv6:
     }
 
   isis_route_validate_merge (area, AF_INET6);
-#endif
 
   return ISIS_OK;
 }

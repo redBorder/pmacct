@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,26 +19,69 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __UTIL_C
-
 /* includes */
 #include "pmacct.h"
-#include "addr.h"
+#include "util-data.h"
+#ifdef WITH_KAFKA
+#include "kafka_common.h"
+#endif
+#ifdef WITH_MYSQL
+#include "mysql_plugin.h"
+#endif
+#ifdef WITH_PGSQL
+#include "pgsql_plugin.h"
+#endif
+#ifdef WITH_SQLITE3
+#include "sqlite3_plugin.h"
+#endif
+#ifdef WITH_RABBITMQ
+#include "amqp_plugin.h"
+#endif
+#ifdef WITH_KAFKA
+#include "kafka_plugin.h"
+#endif
+#ifdef WITH_REDIS
+#include "hiredis/hiredis.h"
+#endif
 #include "pmacct-data.h"
 #include "ip_flow.h"
 #include "classifier.h"
 #include "plugin_hooks.h"
+#include "pkt_handlers.h"
+#include <netdb.h>
 #include <sys/file.h>
 #include <sys/utsname.h>
+
+struct _devices_struct _devices[] = {
+#if defined DLT_LOOP
+  {null_handler, DLT_LOOP},
+#endif
+  {null_handler, DLT_NULL},
+  {eth_handler, DLT_EN10MB},
+  {ppp_handler, DLT_PPP},
+#if defined DLT_IEEE802_11
+  {ieee_802_11_handler, DLT_IEEE802_11}, 
+#endif
+#if defined DLT_LINUX_SLL
+  {sll_handler, DLT_LINUX_SLL},
+#endif
+#if defined DLT_RAW
+  {raw_handler, DLT_RAW},
+#endif
+  {NULL, -1},
+};
+
+/* Global variables */
+primptrs_func primptrs_funcs[PRIMPTRS_FUNCS_N];
 
 /* functions */
 void setnonblocking(int sock)
 {
   int opts;
 
-  opts = fcntl(sock,F_GETFL);
+  opts = fcntl(sock, F_GETFL);
   opts = (opts | O_NONBLOCK);
-  fcntl(sock,F_SETFL,opts);
+  fcntl(sock, F_SETFL, opts);
 }
 
 void setblocking(int sock)
@@ -86,7 +129,7 @@ char *extract_token(char **string, int delim)
   if (!strlen(*string)) return NULL;
 
   start:
-  if (delim_ptr = strchr(*string, delim)) {
+  if ((delim_ptr = strchr(*string, delim))) {
     *delim_ptr = '\0';
     token = *string;
     *string = delim_ptr+1;
@@ -311,8 +354,7 @@ time_t roundoff_time(time_t t, char *value)
   struct tm *rounded;
   int len, j;
 
-  if (!config.timestamps_utc) rounded = localtime(&t);
-  else rounded = gmtime(&t);
+  rounded = localtime(&t);
 
   rounded->tm_sec = 0; /* default round off */
 
@@ -377,31 +419,54 @@ FILE *open_output_file(char *filename, char *mode, int lock)
   FILE *file = NULL;
   uid_t owner = -1;
   gid_t group = -1;
-  int ret;
+  struct stat st;
+  int ret, fd;
 
   if (!filename || !mode) return file;
 
   if (config.files_uid) owner = config.files_uid;
   if (config.files_gid) group = config.files_gid;
 
+  /* create dir structure to get to file, if needed */
   ret = mkdir_multilevel(filename, TRUE, owner, group);
   if (ret) {
     Log(LOG_ERR, "ERROR ( %s/%s ): [%s] open_output_file(): mkdir_multilevel() failed.\n", config.name, config.type, filename);
     return file;
   }
 
-  ret = access(filename, F_OK);
+  /* handling FIFOs */
+  if (!stat(filename, &st)) {
+    if (st.st_mode & S_IFIFO) {
+      fd = open(filename, (O_RDWR|O_NONBLOCK));
 
-  file = fopen(filename, mode); 
+      if (fd == ERR) {
+        Log(LOG_ERR, "ERROR ( %s/%s ): [%s] open_output_file(): open() failed (%s).\n", config.name, config.type, filename, strerror(errno));
+        return file;
+      }
+      else {
+	file = fdopen(fd, mode);
+
+        if (!file) {
+          Log(LOG_ERR, "ERROR ( %s/%s ): [%s] open_output_file(): fdopen() failed (%s).\n", config.name, config.type, filename, strerror(errno));
+          return file;
+        }
+      }
+    }
+  }
+
+  /* handling regular files */
+  if (!file) file = fopen(filename, mode); 
 
   if (file) {
+    fd = fileno(file);
+
     if (chown(filename, owner, group) == -1)
       Log(LOG_WARNING, "WARN ( %s/%s ): [%s] open_output_file(): chown() failed (%s).\n", config.name, config.type, filename, strerror(errno));
 
     if (lock) {
-      if (file_lock(fileno(file))) {
-        Log(LOG_ERR, "ERROR ( %s/%s ): [%s] open_output_file(): file_lock() failed.\n", config.name, config.type, filename);
-        file = NULL;
+      if (file_lock(fd)) {
+	Log(LOG_ERR, "ERROR ( %s/%s ): [%s] open_output_file(): file_lock() failed.\n", config.name, config.type, filename);
+	file = NULL;
       }
     }
   }
@@ -422,13 +487,15 @@ void link_latest_output_file(char *link_filename, char *filename_to_link)
 
   if (!link_filename || !filename_to_link) return;
 
+  buf[0] = '\0';
+
   if (config.files_uid) owner = config.files_uid;
   if (config.files_gid) group = config.files_gid;
 
   /* create dir structure to get to file, if needed */
   ret = mkdir_multilevel(link_filename, TRUE, owner, group);
   if (ret) {
-    Log(LOG_ERR, "ERROR ( %s/%s ): [%s] link_latest_output_file(): mkdir_multilevel() failed.\n", config.name, config.type, buf);
+    Log(LOG_ERR, "ERROR ( %s/%s ): [%s] link_latest_output_file(): mkdir_multilevel() failed.\n", config.name, config.type, link_filename);
     return;
   }
 
@@ -440,7 +507,7 @@ void link_latest_output_file(char *link_filename, char *filename_to_link)
 
     memset(&s1, 0, sizeof(struct stat));
     memset(&s2, 0, sizeof(struct stat));
-    readlink(link_filename, buf, SRVBUFLEN);
+    ret = readlink(link_filename, buf, SRVBUFLEN);
 
     /* filename_to_link is newer than buf or buf is un-existing */
     stat(buf, &s1);
@@ -451,16 +518,348 @@ void link_latest_output_file(char *link_filename, char *filename_to_link)
 
   if (rewrite_latest) {
     unlink(link_filename);
-    symlink(filename_to_link, link_filename);
+    ret = symlink(filename_to_link, link_filename);
 
-    if (lchown(link_filename, owner, group) == -1)
-      Log(LOG_WARNING, "WARN ( %s/%s ): link_latest_output_file(): unable to chown() '%s'.\n", config.name, config.type, link_filename);
+    if (!ret) {
+      if (lchown(link_filename, owner, group) == -1) {
+	Log(LOG_WARNING, "WARN ( %s/%s ): [%s] link_latest_output_file(): unable to chown().\n", config.name, config.type, link_filename);
+      }
+    }
   }
 }
 
 void close_output_file(FILE *f)
 {
   if (f) fclose(f);
+}
+
+void dynname_tokens_prepare(char *s, struct dynname_tokens *tokens, int type)
+{
+  char *ptr_str = NULL, *ptr_var = NULL, *ptr_text = NULL;
+  int var_mode = FALSE, var_close = FALSE, text_mode = FALSE, text_close = FALSE;
+  int token_idx = 0, rlen = 0, slen, var_len = 0, text_len = 0, dollar = FALSE, ret;
+  char var_buf[VERYSHORTBUFLEN], text_buf[VERYSHORTBUFLEN];
+
+  assert(type <= DYN_STR_MAX);
+
+  slen = strlen(s);
+
+  memset(tokens, 0, sizeof(struct dynname_tokens));
+
+  for (ptr_str = s; rlen < slen; rlen++) {
+
+    process_dollar:
+    /* Let's reckon and handle '$' signs */
+    if (ptr_str[rlen] == '\x24') {
+      dollar = TRUE;
+
+      /* if we are processing a variable, let's close it to process the upcoming one */
+      if (var_mode && var_len) {
+        var_close = TRUE;
+      }
+
+      /* if we are processing text, let's close it to process the upcoming variable */
+      if (text_mode && text_len) {
+        text_close = TRUE;
+      }
+
+      /* variable parsing */
+      if (!var_mode) {
+        var_mode = TRUE;
+        ptr_var = &ptr_str[rlen];
+      }
+    }
+    else {
+      /* Collecting text */
+      if (!var_mode && !text_mode) {
+	text_mode = TRUE;
+        ptr_text = &ptr_str[rlen];
+      }
+    }
+
+    process_closing:
+    /*
+       Let's close the current variable parsing, two cases:
+       * we were parsing a variable and found a new one starting up;
+       * separator character hit, time to switch to text mode;
+    */
+    if (var_close) {
+      if (var_len > 1 /* dollar plus at least one valid char */ && var_len < sizeof(var_buf)) {
+        int reg_idx, reg_match = FALSE;
+
+	memset(var_buf, 0, sizeof(var_buf));
+        strncpy(var_buf, ptr_var + 1, var_len - 1);
+
+	for (reg_idx = 0; dynname_token_dict_registry[reg_idx].id; reg_idx++) {
+	  if (dynname_token_dict_registry[reg_idx].id == type) {
+	    ret = dynname_token_dict_registry[reg_idx].func(tokens, var_buf, token_idx);
+	    if (ret == E_NOTFOUND) {
+	      Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): unknown variable '%s' in dictionary '%s'.\n",
+		  config.name, config.type, var_buf, dynname_token_dict_registry[reg_idx].desc);
+	      exit_gracefully(1);
+	    }
+
+	    reg_match = TRUE;
+
+	    break;
+	  }
+	}
+
+	if (!reg_match) {
+	  assert(dynname_token_dict_registry[reg_idx].id == DYN_STR_UNKNOWN);
+	  dynname_token_dict_registry[reg_idx].func(tokens, var_buf, token_idx);
+	  /* exit */
+	}
+
+	token_idx++;
+      }
+      else {
+	ptr_var[var_len] = '\0';
+        Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): invalid variable '%s' in '%s'.\n", config.name, config.type, ptr_var, s);
+	exit_gracefully(1);
+      }
+
+      ptr_var = NULL;
+      var_mode = FALSE;
+      var_close = FALSE;
+      var_len = 0;
+
+      goto process_dollar;
+    }
+
+    /* We were collecting text and found a new variable starting up:
+       Let's close text and open variable */
+    if (text_close) {
+      if (text_len && text_len < sizeof(text_buf)) {
+	memset(text_buf, 0, sizeof(text_buf));
+        strncpy(text_buf, ptr_text, text_len);
+
+	tokens->func[token_idx] = dynname_text_token_handler;
+        tokens->static_arg[token_idx] = strdup(text_buf);
+
+	token_idx++;
+      }
+      else {
+	ptr_text[text_len] = '\0';
+	Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): invalid text '%s' in '%s'.\n", config.name, config.type, ptr_text, s);
+	exit_gracefully(1);
+      }
+
+      ptr_text = NULL;
+      text_mode = FALSE;
+      text_close = FALSE;
+      text_len = 0;
+
+      goto process_dollar;
+    }
+
+    if (var_mode) {
+      if (dollar) {
+	dollar = FALSE;
+	var_len++;
+	continue;
+      }
+
+      /* valid charset for a variable: a-z, A-Z, 0-9, _ */
+      if ((ptr_str[rlen] >= '\x30' && ptr_str[rlen] <= '\x39') ||
+          (ptr_str[rlen] >= '\x41' && ptr_str[rlen] <= '\x5a') ||
+          (ptr_str[rlen] >= '\x61' && ptr_str[rlen] <= '\x7a') ||
+	  (ptr_str[rlen] == '\x5f')) {
+	var_len++;
+      }
+      else {
+	var_close = TRUE;
+	goto process_closing;
+      }
+    }
+
+    if (text_mode) {
+      text_len++;
+    }
+
+    if (token_idx == DYNNAME_TOKENS_MAX) {
+      Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): too many tokens (text / variable combination) defined in '%s'.\n",
+	  config.name, config.type, s);
+      exit_gracefully(1);
+    }
+  }
+
+  if (var_mode) {
+    if (var_len > 1 /* dollar plus at least one valid char */ && var_len < sizeof(var_buf)) {
+      int reg_idx, reg_match = FALSE;
+
+      memset(var_buf, 0, sizeof(var_buf));
+      strncpy(var_buf, ptr_var + 1, var_len - 1);
+
+      for (reg_idx = 0; dynname_token_dict_registry[reg_idx].id; reg_idx++) {
+	if (dynname_token_dict_registry[reg_idx].id == type) {
+	  tokens->type = &dynname_token_dict_registry[reg_idx];
+	  ret = dynname_token_dict_registry[reg_idx].func(tokens, var_buf, token_idx);
+	  if (ret == E_NOTFOUND) {
+	    Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): unknown variable '%s' in dictionary '%s'.\n",
+	        config.name, config.type, var_buf, dynname_token_dict_registry[reg_idx].desc);
+	    exit_gracefully(1);
+	  }
+
+	  reg_match = TRUE;
+
+	  break;
+	}
+      }
+
+      if (!reg_match) {
+	assert(dynname_token_dict_registry[reg_idx].id == DYN_STR_UNKNOWN);
+	dynname_token_dict_registry[reg_idx].func(tokens, var_buf, token_idx);
+	/* exit */
+      }
+    }
+    else {
+      ptr_var[var_len] = '\0';
+      Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): invalid variable '%s' in '%s'.\n", config.name, config.type, ptr_var, s);
+      exit_gracefully(1);
+    }
+  }
+
+  if (text_mode) {
+    if (text_len && text_len < sizeof(text_buf)) {
+      memset(text_buf, 0, sizeof(text_buf));
+      strncpy(text_buf, ptr_text, text_len);
+
+      tokens->func[token_idx] = dynname_text_token_handler;
+      tokens->static_arg[token_idx] = strdup(text_buf);
+    }
+    else {
+      ptr_text[text_len] = '\0';
+      Log(LOG_ERR, "ERROR ( %s/%s ): dynname_tokens_prepare(): invalid text '%s' in '%s'.\n", config.name, config.type, ptr_text, s);
+      exit_gracefully(1);
+    }
+  }
+}
+
+void dynname_tokens_free(struct dynname_tokens *tokens)
+{
+  int idx;
+
+  for (idx = 0; idx < DYNNAME_TOKENS_MAX; idx++) {
+    tokens->func[idx] = NULL;
+
+    if (tokens->static_arg[idx]) {
+      free(tokens->static_arg[idx]);
+      tokens->static_arg[idx] = NULL;
+    }
+  }
+}
+
+int dynname_tokens_compose(char *s, int slen, struct dynname_tokens *tokens, void *dyn_arg)
+{
+  int ret = FALSE, idx;
+
+  for (idx = 0; (idx < DYNNAME_TOKENS_MAX) && tokens->func[idx]; idx++) { 
+    ret = (*tokens->func[idx])(s, slen, tokens->static_arg[idx], dyn_arg);
+    if (ret != FALSE) {
+      Log(LOG_WARNING, "WARN ( %s/%s ): dynname_tokens_compose(): string too short when dynamic composing %s.\n", config.name, config.type, tokens->type->desc);
+      break;
+    } 
+  }
+
+  return ret;
+}
+
+int dynname_text_token_handler(char *s, int slen, char *static_arg, void *dyn_arg)
+{
+  int st_len = strlen(s);
+  int sa_len = strlen(static_arg);
+  int ret = FALSE;
+
+  if ((st_len + sa_len) < slen) {
+    strcat(s, static_arg);
+  }
+  else {
+    ret = ERR;
+  }
+
+  return ret;
+}
+
+int dwi_proc_name_handler(char *s, int slen, char *static_arg, void *dyn_arg)
+{
+  int st_len = strlen(s);
+  int ret = FALSE;
+  char *name = NULL;
+
+  if (config.type_id == PLUGIN_ID_CORE) {
+    name = config.proc_name;
+  }
+  else {
+    name = config.name;
+  }
+
+  if (strlen(name) + st_len < slen) {
+    strcat(s, name);
+  }
+  else {
+    ret = ERR;
+  }
+
+  return ret;
+}
+
+int dwi_writer_pid_handler(char *s, int slen, char *static_arg, void *dyn_arg)
+{
+  int st_len = strlen(s);
+  int ret = FALSE;
+  char pid[SUPERSHORTBUFLEN];
+
+  snprintf(pid, sizeof(pid), "%d", getpid());
+  if (strlen(pid) + st_len < slen) {
+    strcat(s, pid);
+  }
+  else {
+    ret = ERR;
+  }
+
+  return ret;
+}
+
+int dwi_pmacct_build_handler(char *s, int slen, char *static_arg, void *dyn_arg)
+{
+  int st_len = strlen(s);
+  int pb_len = strlen(PMACCT_BUILD);
+  int ret = FALSE;
+
+  if (pb_len + st_len < slen) {
+    strcat(s, PMACCT_BUILD);
+  }
+  else {
+    ret = ERR;
+  }
+
+  return ret;
+}
+
+int dtdr_writer_id(void *tkns, char *var_name, int var_idx)
+{
+  struct dynname_tokens *tokens = tkns;
+  int dindex = 0, ret = E_NOTFOUND;
+
+  for (dindex = 0; strcmp(dynname_writer_id_dictionary[dindex].key, ""); dindex++) {
+    if (!strcasecmp(dynname_writer_id_dictionary[dindex].key, var_name)) {
+      tokens->func[var_idx] = dynname_writer_id_dictionary[dindex].func;
+      tokens->static_arg[var_idx] = FALSE;
+      ret = FALSE;
+      break;
+    }
+  }
+
+  return ret;
+}
+
+int dtdr_unknown(void *tkns, char *var_name, int var_idx)
+{
+  Log(LOG_ERR, "ERROR ( %s/%s ): dtdr_unknown(): unknown dynname_tokens_prepare() type.\n", config.name, config.type);
+  exit_gracefully(1);
+
+  return FALSE;
 }
 
 /* Future: tokenization part to be moved away from runtime */
@@ -476,7 +875,7 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
   /* applies only to DYN_STR_KAFKA_PART */
   char src_host_string[] = "$src_host", dst_host_string[] = "$dst_host";
   char src_port_string[] = "$src_port", dst_port_string[] = "$dst_port";
-  char proto_string[] = "$proto";
+  char proto_string[] = "$proto", in_iface_string[] = "$in_iface";
 
   char buf[newlen], *ptr_start, *ptr_end, *ptr_var, *ptr_substr, *last_char;
   int oldlen, var_num, var_len, rem_len, sub_len; 
@@ -509,10 +908,9 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += 4;
-      len -= 4;
+      len = strlen(ptr_end);
 
       snprintf(buf, newlen, "%u", config.sql_refresh_time);
 
@@ -524,17 +922,16 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if ((type == DYN_STR_SQL_TABLE || type == DYN_STR_PRINT_FILE) &&
 	     !strncmp(ptr_var, hst_string, var_len)) {
       int len, howmany;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += 4;
-      len -= 4;
+      len = strlen(ptr_end);
 
       howmany = sql_history_to_secs(config.sql_history, config.sql_history_howmany);
       snprintf(buf, newlen, "%u", howmany);
@@ -547,7 +944,7 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if (!strncmp(ptr_var, psi_string, var_len)) {
       char empty_peer_src_ip[] = "null";
@@ -555,10 +952,9 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(psi_string);
-      len -= strlen(psi_string);
+      len = strlen(ptr_end);
 
       if (prim_ptrs && prim_ptrs->pbgp) addr_to_str(peer_src_ip, &prim_ptrs->pbgp->peer_src_ip);
       else strlcpy(peer_src_ip, empty_peer_src_ip, strlen(peer_src_ip));
@@ -574,20 +970,19 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if (!strncmp(ptr_var, tag_string, var_len)) {
       pm_id_t zero_tag = 0;
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(tag_string);
-      len -= strlen(tag_string);
+      len = strlen(ptr_end);
 
-      if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%llu", prim_ptrs->data->primitives.tag); 
-      else snprintf(buf, newlen, "%llu", zero_tag);
+      if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%" PRIu64 "", prim_ptrs->data->primitives.tag); 
+      else snprintf(buf, newlen, "%" PRIu64 "", zero_tag);
 
       sub_len = strlen(buf);
       if ((sub_len + len) >= newlen) return ERR;
@@ -597,20 +992,19 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if (!strncmp(ptr_var, tag2_string, var_len)) {
       pm_id_t zero_tag = 0;
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(tag2_string);
-      len -= strlen(tag2_string);
+      len = strlen(ptr_end);
 
-      if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%llu", prim_ptrs->data->primitives.tag2);
-      else snprintf(buf, newlen, "%llu", zero_tag);
+      if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%" PRIu64 "", prim_ptrs->data->primitives.tag2);
+      else snprintf(buf, newlen, "%" PRIu64 "", zero_tag);
 
       sub_len = strlen(buf);
       if ((sub_len + len) >= newlen) return ERR;
@@ -620,18 +1014,17 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if (!strncmp(ptr_var, post_tag_string, var_len)) {
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(post_tag_string);
-      len -= strlen(post_tag_string);
+      len = strlen(ptr_end);
 
-      snprintf(buf, newlen, "%llu", config.post_tag);
+      snprintf(buf, newlen, "%" PRIu64 "", config.post_tag);
 
       sub_len = strlen(buf);
       if ((sub_len + len) >= newlen) return ERR;
@@ -641,18 +1034,17 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if (!strncmp(ptr_var, post_tag2_string, var_len)) {
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(post_tag2_string);
-      len -= strlen(post_tag2_string);
+      len = strlen(ptr_end);
 
-      snprintf(buf, newlen, "%llu", config.post_tag2);
+      snprintf(buf, newlen, "%" PRIu64 "", config.post_tag2);
 
       sub_len = strlen(buf);
       if ((sub_len + len) >= newlen) return ERR;
@@ -662,7 +1054,7 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if ((type == DYN_STR_KAFKA_PART) && !strncmp(ptr_var, src_host_string, var_len)) {
       char empty_src_host[] = "null";
@@ -670,13 +1062,12 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(src_host_string);
-      len -= strlen(src_host_string);
+      len = strlen(ptr_end);
 
       if (prim_ptrs && prim_ptrs->data) addr_to_str(src_host, &prim_ptrs->data->primitives.src_ip);
-      else strlcpy(src_host, empty_src_host, strlen(empty_src_host));
+      else strlcpy(src_host, empty_src_host, strlen(src_host));
 
       escape_ip_uscores(src_host);
       snprintf(buf, newlen, "%s", src_host);
@@ -689,7 +1080,7 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if ((type == DYN_STR_KAFKA_PART) && !strncmp(ptr_var, dst_host_string, var_len)) {
       char empty_dst_host[] = "null";
@@ -697,13 +1088,12 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(dst_host_string);
-      len -= strlen(dst_host_string);
+      len = strlen(ptr_end);
 
       if (prim_ptrs && prim_ptrs->data) addr_to_str(dst_host, &prim_ptrs->data->primitives.dst_ip);
-      else strlcpy(dst_host, empty_dst_host, strlen(empty_dst_host));
+      else strlcpy(dst_host, empty_dst_host, strlen(dst_host));
 
       escape_ip_uscores(dst_host);
       snprintf(buf, newlen, "%s", dst_host);
@@ -716,17 +1106,16 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if ((type == DYN_STR_KAFKA_PART) && !strncmp(ptr_var, src_port_string, var_len)) {
       u_int16_t zero_port = 0;
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(src_port_string);
-      len -= strlen(src_port_string);
+      len = strlen(ptr_end);
 
       if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%hu", prim_ptrs->data->primitives.src_port);
       else snprintf(buf, newlen, "%hu", zero_port);
@@ -739,17 +1128,16 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if ((type == DYN_STR_KAFKA_PART) && !strncmp(ptr_var, dst_port_string, var_len)) {
       u_int16_t zero_port = 0;
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(dst_port_string);
-      len -= strlen(dst_port_string);
+      len = strlen(ptr_end);
 
       if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%hu", prim_ptrs->data->primitives.dst_port);
       else snprintf(buf, newlen, "%hu", zero_port);
@@ -762,17 +1150,16 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
     }
     else if ((type == DYN_STR_KAFKA_PART) && !strncmp(ptr_var, proto_string, var_len)) {
       int null_proto = -1;
       int len;
 
       ptr_start = ptr_var;
-      len = rem_len;
       ptr_end = ptr_start;
       ptr_end += strlen(proto_string);
-      len -= strlen(proto_string);
+      len = strlen(ptr_end);
 
       if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%d", prim_ptrs->data->primitives.proto);
       else snprintf(buf, newlen, "%d", null_proto);
@@ -785,7 +1172,29 @@ int handle_dynname_internal_strings(char *new, int newlen, char *old, struct pri
       *ptr_start = '\0';
 
       if (len >= rem_len) return ERR;
-      strncat(new, buf, len);
+      strncat(new, buf, rem_len);
+    }
+    else if ((type == DYN_STR_KAFKA_PART) && !strncmp(ptr_var, in_iface_string, var_len)) {
+      int null_in_iface = 0;
+      int len;
+
+      ptr_start = ptr_var;
+      ptr_end = ptr_start;
+      ptr_end += strlen(in_iface_string);
+      len = strlen(ptr_end);
+
+      if (prim_ptrs && prim_ptrs->data) snprintf(buf, newlen, "%u", prim_ptrs->data->primitives.ifindex_in);
+      else snprintf(buf, newlen, "%u", null_in_iface);
+
+      sub_len = strlen(buf);
+      if ((sub_len + len) >= newlen) return ERR;
+      strncat(buf, ptr_end, len);
+
+      len = strlen(buf);
+      *ptr_start = '\0';
+
+      if (len >= rem_len) return ERR;
+      strncat(new, buf, rem_len);
     }
 
     if (sub_len) ptr_substr = ptr_var + sub_len;
@@ -802,7 +1211,7 @@ int have_dynname_nontime(char *str)
   char tzone_string[] = "$tzone", *ptr, *newptr;
   int tzone_strlen = strlen(tzone_string);
 
-  for (newptr = ptr = str; newptr = strchr(ptr, '$'); ptr = newptr, ptr++) {
+  for (newptr = ptr = str; (newptr = strchr(ptr, '$')); ptr = newptr, ptr++) {
     if (strncmp(newptr, tzone_string, tzone_strlen)) return TRUE; 
   }
 
@@ -948,7 +1357,7 @@ int file_lock(int fd)
   ret = fcntl(fd, F_SETLK, &lock);
   return((ret == -1) ? -1 : 0);
 #else
-  ret = flock(fd, LOCK_EX);
+  ret = lockf(fd, F_LOCK, 0);
   return ret;
 #endif
 }
@@ -967,7 +1376,7 @@ int file_unlock(int fd)
   ret = fcntl(fd, F_SETLK, &lock);
   return((ret == -1) ? -1 : 0);
 #else
-  ret = flock(fd, LOCK_UN);
+  ret = lockf(fd, F_ULOCK, 0);
   return ret;
 #endif
 }
@@ -1041,9 +1450,10 @@ void mark_columns(char *buf)
   }
 }
 
-int Setsocksize(int s, int level, int optname, void *optval, int optlen)
+int Setsocksize(int s, int level, int optname, void *optval, socklen_t optlen)
 {
-  int ret, len = sizeof(int), saved, value;
+  int ret = 0, saved, value;
+  socklen_t len = sizeof(int);
 
   memcpy(&value, optval, sizeof(int));
   
@@ -1162,7 +1572,7 @@ void evaluate_sums(u_int64_t *wtc, u_int64_t *wtc_2, char *name, char *type)
 
 void stop_all_childs()
 {
-  my_sigint_handler(0); /* it does same thing */
+  PM_sigint_handler(0); /* it does same thing */
 }
 
 void pm_strftime(char *s, int max, char *format, const time_t *time_ref, int utc)
@@ -1299,7 +1709,7 @@ int check_bosbit(u_char *label)
   else return FALSE;
 }
 
-u_int32_t decode_mpls_label(char *label)
+u_int32_t decode_mpls_label(u_char *label)
 {
   u_int32_t ret = 0;
   u_char label_ttl[4];
@@ -1338,6 +1748,32 @@ int timeval_cmp(struct timeval *a, struct timeval *b)
     if (a->tv_usec < b->tv_usec) return -1;
     if (a->tv_usec == b->tv_usec) return 0;
   }
+
+  return INT_MIN; /* silence compiler warning */
+}
+
+void signal_kittens(int sig, int amicore_check)
+{
+  struct plugins_list_entry *list = plugins_list;
+  struct channels_list_entry *chptr = channels_list;
+
+  /* round #1: safety check, am i the core process? */
+  if (amicore_check) {
+    if (!chptr || chptr->core_pid != getpid()) {
+      return;
+    }
+  }
+
+  /* round #2: do it */
+  list = plugins_list;
+
+  while (list) {
+    if (memcmp(list->type.string, "core", sizeof("core"))) {
+      kill(list->pid, sig);
+    }
+
+    list = list->next;
+  }
 }
 
 /*
@@ -1346,18 +1782,13 @@ int timeval_cmp(struct timeval *a, struct timeval *b)
  */
 void exit_all(int status)
 {
-  struct plugins_list_entry *list = plugins_list;
-
-#if defined (IRIX) || (SOLARIS)
+#if defined (SOLARIS)
   signal(SIGCHLD, SIG_IGN);
 #else
   signal(SIGCHLD, ignore_falling_child);
 #endif
 
-  while (list) {
-    if (memcmp(list->type.string, "core", sizeof("core"))) kill(list->pid, SIGKILL);
-    list = list->next;
-  }
+  signal_kittens(SIGKILL, TRUE);
 
   wait(NULL);
   if (config.pidfile) remove_pid_file(config.pidfile);
@@ -1372,6 +1803,15 @@ void exit_plugin(int status)
   if (config.pidfile) remove_pid_file(config.pidfile);
 
   exit(status);
+}
+
+void exit_gracefully(int status)
+{
+  if (!config.is_forked) {
+    if (config.type_id == PLUGIN_ID_CORE) exit_all(status); 
+    else exit_plugin(status);
+  }
+  else exit(status);
 }
 
 void reset_tag_label_status(struct packet_ptrs_vector *pptrsv)
@@ -1389,7 +1829,6 @@ void reset_tag_label_status(struct packet_ptrs_vector *pptrsv)
   pretag_free_label(&pptrsv->mpls4.label);
   pretag_free_label(&pptrsv->vlanmpls4.label);
 
-#if defined ENABLE_IPV6
   pptrsv->v6.tag = FALSE;
   pptrsv->vlan6.tag = FALSE;
   pptrsv->mpls6.tag = FALSE;
@@ -1402,7 +1841,6 @@ void reset_tag_label_status(struct packet_ptrs_vector *pptrsv)
   pretag_free_label(&pptrsv->vlan6.label);
   pretag_free_label(&pptrsv->mpls6.label);
   pretag_free_label(&pptrsv->vlanmpls6.label);
-#endif
 }
 
 void reset_net_status(struct packet_ptrs *pptrs)
@@ -1432,7 +1870,6 @@ void reset_net_status_v(struct packet_ptrs_vector *pptrsv)
   pptrsv->mpls4.lm_method_dst = FALSE;
   pptrsv->vlanmpls4.lm_method_dst = FALSE;
 
-#if defined ENABLE_IPV6
   pptrsv->v6.lm_mask_src = FALSE;
   pptrsv->vlan6.lm_mask_src = FALSE;
   pptrsv->mpls6.lm_mask_src = FALSE;
@@ -1449,7 +1886,6 @@ void reset_net_status_v(struct packet_ptrs_vector *pptrsv)
   pptrsv->vlan6.lm_method_dst = FALSE;
   pptrsv->mpls6.lm_method_dst = FALSE;
   pptrsv->vlanmpls6.lm_method_dst = FALSE;
-#endif
 }
 
 void reset_shadow_status(struct packet_ptrs_vector *pptrsv)
@@ -1459,12 +1895,10 @@ void reset_shadow_status(struct packet_ptrs_vector *pptrsv)
   pptrsv->mpls4.shadow = FALSE;
   pptrsv->vlanmpls4.shadow = FALSE;
 
-#if defined ENABLE_IPV6
   pptrsv->v6.shadow = FALSE;
   pptrsv->vlan6.shadow = FALSE;
   pptrsv->mpls6.shadow = FALSE;
   pptrsv->vlanmpls6.shadow = FALSE;
-#endif
 }
 
 void reset_fallback_status(struct packet_ptrs *pptrs)
@@ -1480,14 +1914,13 @@ void set_default_preferences(struct configuration *cfg)
     if (!cfg->nfacctd_as) cfg->nfacctd_as = NF_AS_KEEP;
     set_truefalse_nonzero(&cfg->nfacctd_disable_checks);
   }
-  set_truefalse_nonzero(&cfg->pipe_check_core_pid);
-  if (!cfg->nfacctd_bgp_peer_as_src_type) cfg->nfacctd_bgp_peer_as_src_type = BGP_SRC_PRIMITIVES_KEEP;
-  if (!cfg->nfacctd_bgp_src_std_comm_type) cfg->nfacctd_bgp_src_std_comm_type = BGP_SRC_PRIMITIVES_KEEP;
-  if (!cfg->nfacctd_bgp_src_ext_comm_type) cfg->nfacctd_bgp_src_ext_comm_type = BGP_SRC_PRIMITIVES_KEEP;
-  if (!cfg->nfacctd_bgp_src_lrg_comm_type) cfg->nfacctd_bgp_src_lrg_comm_type = BGP_SRC_PRIMITIVES_KEEP;
-  if (!cfg->nfacctd_bgp_src_as_path_type) cfg->nfacctd_bgp_src_as_path_type = BGP_SRC_PRIMITIVES_KEEP;
-  if (!cfg->nfacctd_bgp_src_local_pref_type) cfg->nfacctd_bgp_src_local_pref_type = BGP_SRC_PRIMITIVES_KEEP;
-  if (!cfg->nfacctd_bgp_src_med_type) cfg->nfacctd_bgp_src_med_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_peer_as_src_type) cfg->bgp_daemon_peer_as_src_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_src_std_comm_type) cfg->bgp_daemon_src_std_comm_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_src_ext_comm_type) cfg->bgp_daemon_src_ext_comm_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_src_lrg_comm_type) cfg->bgp_daemon_src_lrg_comm_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_src_as_path_type) cfg->bgp_daemon_src_as_path_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_src_local_pref_type) cfg->bgp_daemon_src_local_pref_type = BGP_SRC_PRIMITIVES_KEEP;
+  if (!cfg->bgp_daemon_src_med_type) cfg->bgp_daemon_src_med_type = BGP_SRC_PRIMITIVES_KEEP;
 }
 
 void set_shadow_status(struct packet_ptrs *pptrs)
@@ -1502,12 +1935,10 @@ void set_sampling_table(struct packet_ptrs_vector *pptrsv, u_char *t)
   pptrsv->mpls4.sampling_table = t;
   pptrsv->vlanmpls4.sampling_table = t;
 
-#if defined ENABLE_IPV6
   pptrsv->v6.sampling_table = t;
   pptrsv->vlan6.sampling_table = t;
   pptrsv->mpls6.sampling_table = t;
   pptrsv->vlanmpls6.sampling_table = t;
-#endif
 }
 
 void *pm_malloc(size_t size)
@@ -1516,13 +1947,9 @@ void *pm_malloc(size_t size)
 
   obj = (unsigned char *) malloc(size);
   if (!obj) {
-    sbrk(size);
-    obj = (unsigned char *) malloc(size);
-    if (!obj) {
-      Log(LOG_ERR, "ERROR ( %s/%s ): Unable to grab enough memory (requested: %llu bytes). Exiting ...\n",
-      config.name, config.type, size);
-      exit_plugin(1);
-    }
+    Log(LOG_ERR, "ERROR ( %s/%s ): Unable to grab enough memory (requested: %zu bytes). Exiting ...\n",
+    config.name, config.type, size);
+    exit_gracefully(1);
   }
 
   return obj;
@@ -1600,7 +2027,7 @@ void load_allow_file(char *filename, struct hosts_table *t)
     stat(filename, &st);
     t->timestamp = st.st_mtime;
   }
-  else exit_all(1);
+  else exit_gracefully(1);
 }
 
 int check_allow(struct hosts_table *allow, struct sockaddr *sa)
@@ -1627,9 +2054,7 @@ int BTA_find_id(struct id_table *t, struct packet_ptrs *pptrs, pm_id_t *tag, pm_
 
   if (bta_map_caching && xsentry) {
     if (pptrs->l3_proto == ETHERTYPE_IP) xsmc = &xsentry->bta_v4; 
-#if defined ENABLE_IPV6
     else if (pptrs->l3_proto == ETHERTYPE_IPV6) xsmc = &xsentry->bta_v6;
-#endif
   }
 
   if (bta_map_caching && xsmc && timeval_cmp(&xsmc->stamp, &reload_map_tstamp) > 0) {
@@ -1652,9 +2077,7 @@ int BTA_find_id(struct id_table *t, struct packet_ptrs *pptrs, pm_id_t *tag, pm_
   }
 
   if (ret & PRETAG_MAP_RCODE_ID) pptrs->bta_af = ETHERTYPE_IP;
-#if defined ENABLE_IPV6
   else if (ret & BTA_MAP_RCODE_ID_ID2) pptrs->bta_af = ETHERTYPE_IPV6;
-#endif
 
   return ret;
 }
@@ -1693,7 +2116,7 @@ int load_tags(char *filename, struct pretag_filter *filter, char *value_ptr)
     else range = value;
 
     if (range_ptr && range <= value) {
-      Log(LOG_ERR, "WARN ( %s/%s ): [%s] Range value is expected in format low-high. '%llu-%llu'.\n",
+      Log(LOG_ERR, "WARN ( %s/%s ): [%s] Range value is expected in format low-high. '%" PRIu64 "-%" PRIu64 "'.\n",
 			config.name, config.type, filename, value, range);
       changes++;
       break;
@@ -1754,22 +2177,46 @@ int evaluate_tags(struct pretag_filter *filter, pm_id_t tag)
 
 int evaluate_labels(struct pretag_label_filter *filter, pt_label_t *label)
 {
-  char null_label[] = "null";
-  int index;
+  int index, ret;
+  int null_label_len = 4; /* 'null' excluding terminating zero */
+  char *null_label = "null";
 
   if (filter->num == 0) return FALSE; /* no entries in the filter array: tag filtering disabled */
-  if (!label->val) label->val = null_label; 
+  if (!label->val) {
+    label->val = null_label;
+    label->len = null_label_len;
+  }
 
   for (index = 0; index < filter->num; index++) {
-    if (!memcmp(filter->table[index].v, label->val, filter->table[index].len)) return (FALSE | filter->table[index].neg);
+    if (filter->table[index].len != label->len) {
+      ret = TRUE;
+    }
     else {
-      if (filter->table[index].neg) return FALSE;
+      ret = FALSE;
+    }
+
+    if (!ret) {
+      ret = memcmp(filter->table[index].v, label->val, filter->table[index].len);
+    }
+
+    /* cleanup */
+    if (label->val == null_label) {
+      label->val = NULL;
+      label->len = 0;
+    }
+
+    if (!ret) {
+      return (FALSE | filter->table[index].neg);
+    }
+    else {
+      if (filter->table[index].neg) {
+	return FALSE;
+      }
     }
   }
 
   return TRUE;
 }
-
 char *write_sep(char *sep, int *count)
 {
   static char empty_sep[] = "";
@@ -1781,17 +2228,18 @@ char *write_sep(char *sep, int *count)
   }
 }
 
-void version_daemon(char *header)
+void version_daemon(int acct_type, char *header)
 {
   struct utsname utsbuf;
 
-  printf("%s %s (%s)\n\n", header, PMACCT_VERSION, PMACCT_BUILD);
+  printf("%s %s [%s]\n\n", header, PMACCT_VERSION, PMACCT_BUILD);
 
   printf("Arguments:\n");
   printf("%s\n", PMACCT_COMPILE_ARGS);
   printf("\n");
 
   printf("Libs:\n");
+  printf("cdada %s\n", cdada_get_ver());
   printf("%s\n", pcap_lib_version());
 #ifdef WITH_MYSQL
   MY_mysql_get_version();
@@ -1817,6 +2265,54 @@ void version_daemon(char *header)
 #ifdef WITH_ZMQ
   printf("ZeroMQ %u.%u.%u\n", ZMQ_VERSION_MAJOR, ZMQ_VERSION_MINOR, ZMQ_VERSION_PATCH); 
 #endif
+#ifdef WITH_REDIS
+  printf("Redis %u.%u.%u\n", HIREDIS_MAJOR, HIREDIS_MINOR, HIREDIS_PATCH);
+#endif
+#ifdef WITH_GNUTLS
+  printf("GnuTLS %u.%u.%u\n", GNUTLS_VERSION_MAJOR, GNUTLS_VERSION_MINOR, GNUTLS_VERSION_PATCH);
+#endif
+#ifdef WITH_AVRO
+  printf("avro-c\n");
+#endif
+#ifdef WITH_SERDES
+  printf("serdes\n");
+#endif
+#ifdef WITH_UNYTE_UDP_NOTIF
+  printf("unyte-udp-notif\n");
+#endif
+#ifdef WITH_NDPI
+  printf("nDPI %s\n", ndpi_revision());
+#endif
+#ifdef WITH_NFLOG
+  printf("netfilter_log\n");
+#endif
+
+  if (acct_type == ACCT_NF || acct_type == ACCT_SF || acct_type == ACCT_PM) {
+    printf("\n");
+
+    printf("Plugins:\n");
+    printf("memory\n");
+    printf("print\n");
+    printf("nfprobe\n");
+    printf("sfprobe\n");
+    printf("tee\n");
+#ifdef WITH_MYSQL
+    printf("mysql\n");
+#endif
+#ifdef WITH_PGSQL
+    printf("postgresql\n");
+#endif
+#ifdef WITH_SQLITE3
+    printf("sqlite\n");
+#endif
+#ifdef WITH_RABBITMQ
+    printf("amqp\n");
+#endif
+#ifdef WITH_KAFKA
+    printf("kafka\n");
+#endif
+  }
+
   printf("\n");
 
   if (!uname(&utsbuf)) {
@@ -1825,6 +2321,30 @@ void version_daemon(char *header)
     printf("\n");
   }
 
+#if defined __clang__
+#ifndef PM_COMPILER_NAME
+#define PM_COMPILER_NAME "clang"
+#endif
+#ifndef PM_COMPILER_VERSION
+#define PM_COMPILER_VERSION __clang_major__, __clang_minor__, __clang_patchlevel__
+#endif
+#endif
+
+#if defined __GNUC__
+#ifndef PM_COMPILER_NAME
+#define PM_COMPILER_NAME "gcc"
+#endif
+#ifndef PM_COMPILER_VERSION
+#define PM_COMPILER_VERSION __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__
+#endif
+#endif
+
+#if defined PM_COMPILER_NAME && defined PM_COMPILER_VERSION
+  printf("Compiler:\n");
+  printf("%s %d.%d.%d\n", PM_COMPILER_NAME, PM_COMPILER_VERSION);
+  printf("\n");
+#endif
+
   printf("For suggestions, critics, bugs, contact me: %s.\n", MANTAINER);
 }
 
@@ -1832,7 +2352,6 @@ void version_daemon(char *header)
 char *compose_json_str(void *obj)
 {
   char *tmpbuf = NULL;
-  json_t *json_obj = (json_t *) obj;
 
   tmpbuf = json_dumps(obj, JSON_PRESERVE_ORDER);
   json_decref(obj);
@@ -1859,12 +2378,13 @@ void write_and_free_json(FILE *f, void *obj)
   }
 }
 
-void add_writer_name_and_pid_json(void *obj, char *name, pid_t writer_pid)
+void add_writer_name_and_pid_json(void *obj, struct dynname_tokens *tokens)
 {
-  char wid[SHORTSHORTBUFLEN]; 
+  char wid[SHORTSHORTBUFLEN];
   json_t *json_obj = (json_t *) obj;
 
-  snprintf(wid, SHORTSHORTBUFLEN, "%s/%u", name, writer_pid);
+  memset(wid, 0, sizeof(wid));
+  dynname_tokens_compose(wid, sizeof(wid), tokens, NULL);
   json_object_set_new_nocheck(json_obj, "writer_id", json_string(wid));
 }
 #else
@@ -1880,82 +2400,18 @@ void write_and_free_json(FILE *f, void *obj)
   if (config.debug) Log(LOG_DEBUG, "DEBUG ( %s/%s ): write_and_free_json(): JSON object not created due to missing --enable-jansson\n", config.name, config.type);
 }
 
-void add_writer_name_and_pid_json(void *obj, char *name, pid_t writer_pid)
+void add_writer_name_and_pid_json(void *obj, struct dynname_tokens *tokens)
 {
   if (config.debug) Log(LOG_DEBUG, "DEBUG ( %s/%s ): add_writer_name_and_pid_json(): JSON object not created due to missing --enable-jansson\n", config.name, config.type);
 }
 #endif
 
-#ifdef WITH_AVRO
-void write_avro_schema_to_file(char *filename, avro_schema_t schema)
+void write_file_binary(FILE *f, void *obj, size_t len)
 {
-  FILE *avro_fp;
-  avro_writer_t avro_schema_writer;
+  if (!f) return;
 
-  avro_fp = open_output_file(filename, "w", TRUE);
-
-  if (avro_fp) {
-    avro_schema_writer = avro_writer_file(avro_fp);
-
-    if (avro_schema_writer) {
-      if (avro_schema_to_json(schema, avro_schema_writer))
-	goto exit_lane;
-    }
-    else goto exit_lane;
-
-    close_output_file(avro_fp);
-  }
-  else goto exit_lane;
-
-  return;
-
-  exit_lane:
-  Log(LOG_ERR, "ERROR ( %s/%s ): write_avro_schema_to_file(): unable to dump Avro schema: %s\n", config.name, config.type, avro_strerror());
-  exit(1);
+  if (obj && len) fwrite(obj, len, 1, f);
 }
-
-char *compose_avro_purge_schema(avro_schema_t avro_schema, char *writer_name)
-{
-  avro_writer_t avro_writer;
-  char *avro_buf = NULL, *json_str = NULL;
-
-  if (!config.avro_buffer_size) config.avro_buffer_size = LARGEBUFLEN;
-
-  avro_buf = malloc(config.avro_buffer_size);
-
-  if (!avro_buf) {
-    Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (avro_buf). Exiting ..\n", config.name, config.type);
-    exit_plugin(1);
-  }
-  else memset(avro_buf, 0, config.avro_buffer_size);
-
-  avro_writer = avro_writer_memory(avro_buf, config.avro_buffer_size);
-
-  if (avro_schema_to_json(avro_schema, avro_writer)) {
-    Log(LOG_ERR, "ERROR ( %s/%s ): compose_avro_purge_schema(): unable to dump Avro schema: %s\n", config.name, config.type, avro_strerror());
-    exit_plugin(1);
-  }
-
-  if (avro_writer_tell(avro_writer)) {
-    char event_type[] = "purge_schema", wid[SHORTSHORTBUFLEN];
-    json_t *obj = json_object();
-
-    json_object_set_new_nocheck(obj, "event_type", json_string(event_type));
-
-    snprintf(wid, SHORTSHORTBUFLEN, "%s/%u", writer_name, 0);
-    json_object_set_new_nocheck(obj, "writer_id", json_string(wid));
-
-    json_object_set_new_nocheck(obj, "schema", json_string(avro_buf));
-
-    avro_writer_free(avro_writer);
-    free(avro_buf);
-
-    json_str = compose_json_str(obj);
-  }
-
-  return json_str;
-}
-#endif
 
 void compose_timestamp(char *buf, int buflen, struct timeval *tv, int usec, int since_epoch, int rfc3339, int utc)
 {
@@ -1966,18 +2422,24 @@ void compose_timestamp(char *buf, int buflen, struct timeval *tv, int usec, int 
   if (buflen < VERYSHORTBUFLEN) return; 
 
   if (since_epoch) {
-    if (usec) snprintf(buf, buflen, "%u.%u", tv->tv_sec, tv->tv_usec);
-    else snprintf(buf, buflen, "%u", tv->tv_sec);
+    if (usec) snprintf(buf, buflen, "%ld.%.6ld", tv->tv_sec, (long)tv->tv_usec);
+    else snprintf(buf, buflen, "%ld", tv->tv_sec);
   }
   else {
     time1 = tv->tv_sec;
     if (!utc) time2 = localtime(&time1);
     else time2 = gmtime(&time1);
     
-    if (!rfc3339) slen = strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", time2);
-    else slen = strftime(buf, buflen, "%Y-%m-%dT%H:%M:%S", time2);
+    if (tv->tv_sec) {
+      if (!rfc3339) slen = strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", time2);
+      else slen = strftime(buf, buflen, "%Y-%m-%dT%H:%M:%S", time2);
+    }
+    else {
+      if (!rfc3339) slen = snprintf(buf, buflen, "0000-00-00 00:00:00");
+      else slen = snprintf(buf, buflen, "0000-00-00T00:00:00");
+    }
 
-    if (usec) snprintf((buf + slen), (buflen - slen), ".%u", tv->tv_usec);
+    if (usec) snprintf((buf + slen), (buflen - slen), ".%.6ld", (long)tv->tv_usec);
     if (rfc3339) append_rfc3339_timezone(buf, buflen, time2);
   }
 }
@@ -2079,7 +2541,7 @@ void primptrs_set_tun(u_char *base, struct extra_primitives *extras, struct prim
 
 void primptrs_set_custom(u_char *base, struct extra_primitives *extras, struct primitives_ptrs *prim_ptrs)
 {
-  prim_ptrs->pcust = (char *) (base + extras->off_custom_primitives);
+  prim_ptrs->pcust = (base + extras->off_custom_primitives);
   prim_ptrs->vlen_next_off = 0;
 }
 
@@ -2141,17 +2603,17 @@ void custom_primitives_reconcile(struct custom_primitives_ptrs *cpptrs, struct c
   for (cpptrs_idx = 0; cpptrs->primitive[cpptrs_idx].name && cpptrs_idx < cpptrs->num; cpptrs_idx++) {
     if (!cpptrs->primitive[cpptrs_idx].ptr) {
       Log(LOG_ERR, "ERROR ( %s/%s ): Unknown primitive '%s'\n", config.name, config.type, cpptrs->primitive[cpptrs_idx].name);
-      exit(1);
+      exit_gracefully(1);
     }
     else {
       struct custom_primitive_entry *cpe = cpptrs->primitive[cpptrs_idx].ptr;
 
       if (cpptrs->primitive[cpptrs_idx].off != PM_VARIABLE_LENGTH) { 
-        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Custom primitive '%s': type=%llx off=%u len=%u\n", config.name, config.type,
+        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Custom primitive '%s': type=%" PRIx64 " off=%u len=%u\n", config.name, config.type,
 	  cpptrs->primitive[cpptrs_idx].name, cpe->type, cpptrs->primitive[cpptrs_idx].off, cpe->len);
       }
       else {
-        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Custom primitive '%s': type=%llx len=vlen\n", config.name, config.type,
+        Log(LOG_DEBUG, "DEBUG ( %s/%s ): Custom primitive '%s': type=%" PRIx64 " len=vlen\n", config.name, config.type,
 	  cpptrs->primitive[cpptrs_idx].name, cpe->type);
       } 
     }
@@ -2171,30 +2633,27 @@ void custom_primitive_header_print(char *out, int outlen, struct custom_primitiv
     if (cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_UINT ||
         cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_HEX) {
       if (formatted) {
-	snprintf(format, VERYSHORTBUFLEN, "%%-%u", cps_flen[cp_entry->ptr->len] > strlen(cp_entry->ptr->name) ? cps_flen[cp_entry->ptr->len] : strlen(cp_entry->ptr->name));
-	strncat(format, "s", VERYSHORTBUFLEN);
+	snprintf(format, VERYSHORTBUFLEN, "%%-%d", cps_flen[cp_entry->ptr->len] > strlen(cp_entry->ptr->name) ? cps_flen[cp_entry->ptr->len] : (int)strlen(cp_entry->ptr->name));
+	strncat(format, "s", VERYSHORTBUFLEN - 1);
       }
       else snprintf(format, VERYSHORTBUFLEN, "%s", "%s");
     }
     else if (cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_STRING ||
 	     cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_RAW) {
       if (formatted) {
-	snprintf(format, VERYSHORTBUFLEN, "%%-%u", cp_entry->ptr->len > strlen(cp_entry->ptr->name) ? cp_entry->ptr->len : strlen(cp_entry->ptr->name));
-	strncat(format, "s", VERYSHORTBUFLEN);
+	snprintf(format, VERYSHORTBUFLEN, "%%-%d", cp_entry->ptr->len > strlen(cp_entry->ptr->name) ? cp_entry->ptr->len : (int)strlen(cp_entry->ptr->name));
+	strncat(format, "s", VERYSHORTBUFLEN - 1);
       }
       else snprintf(format, VERYSHORTBUFLEN, "%s", "%s");
     }
     else if (cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_IP) {
       int len = 0;
 
-      len = INET_ADDRSTRLEN;
-#if defined ENABLE_IPV6
       len = INET6_ADDRSTRLEN;
-#endif
       	
       if (formatted) {
-        snprintf(format, VERYSHORTBUFLEN, "%%-%u", len > strlen(cp_entry->ptr->name) ? len : strlen(cp_entry->ptr->name));
-        strncat(format, "s", VERYSHORTBUFLEN);
+        snprintf(format, VERYSHORTBUFLEN, "%%-%d", len > strlen(cp_entry->ptr->name) ? len : (int)strlen(cp_entry->ptr->name));
+        strncat(format, "s", VERYSHORTBUFLEN - 1);
       }
       else snprintf(format, VERYSHORTBUFLEN, "%s", "%s");
     }
@@ -2202,8 +2661,8 @@ void custom_primitive_header_print(char *out, int outlen, struct custom_primitiv
       int len = ETHER_ADDRSTRLEN;
 
       if (formatted) {
-        snprintf(format, VERYSHORTBUFLEN, "%%-%u", len > strlen(cp_entry->ptr->name) ? len : strlen(cp_entry->ptr->name));
-        strncat(format, "s", VERYSHORTBUFLEN);
+        snprintf(format, VERYSHORTBUFLEN, "%%-%d", len > strlen(cp_entry->ptr->name) ? len : (int)strlen(cp_entry->ptr->name));
+        strncat(format, "s", VERYSHORTBUFLEN - 1);
       }
       else snprintf(format, VERYSHORTBUFLEN, "%s", "%s");
     }
@@ -2212,9 +2671,9 @@ void custom_primitive_header_print(char *out, int outlen, struct custom_primitiv
   }
 }
 
-void custom_primitive_value_print(char *out, int outlen, char *in, struct custom_primitive_ptrs *cp_entry, int formatted)
+void custom_primitive_value_print(char *out, int outlen, u_char *in, struct custom_primitive_ptrs *cp_entry, int formatted)
 {
-  char format[VERYSHORTBUFLEN];
+  char format[SHORTBUFLEN];
 
   if (in && out && cp_entry) {
     memset(out, 0, outlen); 
@@ -2229,11 +2688,11 @@ void custom_primitive_value_print(char *out, int outlen, char *in, struct custom
 	snprintf(semantics, VERYSHORTBUFLEN, "%s", cps_type[cp_entry->ptr->semantics]); 
 
       if (formatted)
-        snprintf(format, VERYSHORTBUFLEN, "%%-%u%s",
-		cps_flen[cp_entry->ptr->len] > strlen(cp_entry->ptr->name) ? cps_flen[cp_entry->ptr->len] : strlen(cp_entry->ptr->name), 
+        snprintf(format, SHORTBUFLEN, "%%-%d%s",
+		cps_flen[cp_entry->ptr->len] > strlen(cp_entry->ptr->name) ? cps_flen[cp_entry->ptr->len] : (int)strlen(cp_entry->ptr->name), 
 		semantics);
       else
-        snprintf(format, VERYSHORTBUFLEN, "%%%s", semantics);
+        snprintf(format, SHORTBUFLEN, "%%%s", semantics);
 
       if (cp_entry->ptr->len == 1) {
         u_int8_t t8;
@@ -2266,7 +2725,7 @@ void custom_primitive_value_print(char *out, int outlen, char *in, struct custom
     else if (cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_STRING ||
 	     cp_entry->ptr->semantics == CUSTOM_PRIMITIVE_TYPE_RAW) {
       if (formatted)
-	snprintf(format, VERYSHORTBUFLEN, "%%-%u%s", cp_entry->ptr->len > strlen(cp_entry->ptr->name) ? cp_entry->ptr->len : strlen(cp_entry->ptr->name),
+	snprintf(format, VERYSHORTBUFLEN, "%%-%d%s", cp_entry->ptr->len > strlen(cp_entry->ptr->name) ? cp_entry->ptr->len : (int)strlen(cp_entry->ptr->name),
 			cps_type[cp_entry->ptr->semantics]); 
       else
 	snprintf(format, VERYSHORTBUFLEN, "%%%s", cps_type[cp_entry->ptr->semantics]); 
@@ -2281,25 +2740,20 @@ void custom_primitive_value_print(char *out, int outlen, char *in, struct custom
       memset(&ip_addr, 0, sizeof(ip_addr));
       memset(ip_str, 0, sizeof(ip_str));
 
-      len = INET_ADDRSTRLEN;
-#if defined ENABLE_IPV6
       len = INET6_ADDRSTRLEN;
-#endif
 
       if (cp_entry->ptr->len == 4) { 
 	ip_addr.family = AF_INET;
 	memcpy(&ip_addr.address.ipv4, in+cp_entry->off, 4); 
       }
-#if defined ENABLE_IPV6
       else if (cp_entry->ptr->len == 16) {
 	ip_addr.family = AF_INET6;
 	memcpy(&ip_addr.address.ipv6, in+cp_entry->off, 16); 
       }
-#endif
 
       addr_to_str(ip_str, &ip_addr);
       if (formatted)
-        snprintf(format, VERYSHORTBUFLEN, "%%-%u%s", len > strlen(cp_entry->ptr->name) ? len : strlen(cp_entry->ptr->name),
+        snprintf(format, VERYSHORTBUFLEN, "%%-%d%s", len > strlen(cp_entry->ptr->name) ? len : (int)strlen(cp_entry->ptr->name),
                         cps_type[cp_entry->ptr->semantics]);
       else
         snprintf(format, VERYSHORTBUFLEN, "%%%s", cps_type[cp_entry->ptr->semantics]);
@@ -2311,15 +2765,50 @@ void custom_primitive_value_print(char *out, int outlen, char *in, struct custom
       int len = ETHER_ADDRSTRLEN;
 
       memset(eth_str, 0, sizeof(eth_str));
-      etheraddr_string(in+cp_entry->off, eth_str);
+      etheraddr_string((u_char *)(in + cp_entry->off), eth_str);
 
       if (formatted)
-        snprintf(format, VERYSHORTBUFLEN, "%%-%u%s", len > strlen(cp_entry->ptr->name) ? len : strlen(cp_entry->ptr->name),
+        snprintf(format, VERYSHORTBUFLEN, "%%-%d%s", len > strlen(cp_entry->ptr->name) ? len : (int)strlen(cp_entry->ptr->name),
                         cps_type[cp_entry->ptr->semantics]);
       else
         snprintf(format, VERYSHORTBUFLEN, "%%%s", cps_type[cp_entry->ptr->semantics]);
 
       snprintf(out, outlen, format, eth_str);
+    }
+  }
+}
+
+void custom_primitives_debug(void *pcust, void *pvlen)
+{
+  char empty_string[] = "";
+  int cp_idx;
+
+  if (!pcust) return;
+
+  for (cp_idx = 0; cp_idx < config.cpptrs.num; cp_idx++) {
+    char cph_str[SRVBUFLEN];
+
+    custom_primitive_header_print(cph_str, SRVBUFLEN, &config.cpptrs.primitive[cp_idx], TRUE);
+
+    if (config.cpptrs.primitive[cp_idx].ptr->len != PM_VARIABLE_LENGTH) {
+      char cpv_str[SRVBUFLEN];
+
+      custom_primitive_value_print(cpv_str, SRVBUFLEN, pcust, &config.cpptrs.primitive[cp_idx], TRUE);
+
+      Log(LOG_DEBUG, "DEBUG ( %s/%s ): custom_primitive_value_debug(): PCUST ARRAY: name=%s value=%s\n",
+	  config.name, config.type, cph_str, cpv_str);
+    }
+    else {
+      if (pvlen) {
+	/* vlen primitives not supported in formatted outputs: we should never get here */
+	char *label_ptr = NULL;
+
+	vlen_prims_get(pvlen, config.cpptrs.primitive[cp_idx].ptr->type, &label_ptr);
+	if (!label_ptr) label_ptr = empty_string;
+
+	Log(LOG_DEBUG, "DEBUG ( %s/%s ): custom_primitive_value_debug(): PCUST ARRAY: name=%s value=%s\n",
+	    config.name, config.type, cph_str, label_ptr);
+      }
     }
   }
 }
@@ -2355,16 +2844,29 @@ int mkdir_multilevel(const char *path, int trailing_filename, uid_t owner, gid_t
   return ret;
 }
 
-char bin_to_hex(int nib) { return (nib < 10) ? ('0' + nib) : ('A' - 10 + nib); }
+char bin_to_hex(int nib)
+{
+  return (nib < 10) ? ('0' + nib) : ('A' - 10 + nib);
+}
 
-int print_hex(const u_char *a, u_char *buf, int len)
+int hex_to_bin(int a)
+{
+  if (a >= '0' && a <= '9')
+    return a - '0';
+  else if (a >= 'a' && a <= 'f')
+    return a - 'a' + 10;
+  else if (a >= 'A' && a <= 'F')
+    return a - 'A' + 10;
+
+  return ERR;
+}
+
+int serialize_hex(const u_char *a, u_char *buf, int len)
 {
   int b = 0, i = 0;
 
   for (; i < len; i++) {
     u_char byte;
-
-    // if (a[i] == '\0') break;
 
     byte = a[i];
     buf[b++] = bin_to_hex(byte >> 4);
@@ -2382,6 +2884,23 @@ int print_hex(const u_char *a, u_char *buf, int len)
     buf[b] = '\0';
     return (b+1);
   }
+}
+
+int serialize_bin(const u_char *hex, u_char *bin, int len)
+{
+  int i = 0;
+
+  for (; i < len; i++) {
+    if (hex[0] == '-') {
+      hex++;
+      continue;
+    }
+
+    *bin++ = hex_to_bin(hex[0]) * 16 + hex_to_bin(hex[1]);
+    hex += 2;
+  }
+
+  return i;
 }
 
 unsigned char *vlen_prims_copy(struct pkt_vlen_hdr_primitives *src)
@@ -2406,6 +2925,7 @@ void vlen_prims_init(struct pkt_vlen_hdr_primitives *hdr, int add_len)
 {
   if (!hdr) return;
 
+  assert(PvhdrSz);
   memset(hdr, 0, PvhdrSz + add_len);
 }
 
@@ -2425,7 +2945,7 @@ int vlen_prims_cmp(struct pkt_vlen_hdr_primitives *src, struct pkt_vlen_hdr_prim
   return memcmp(src, dst, (src->tot_len + PvhdrSz));
 }
 
-void vlen_prims_get(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, char **res)
+int vlen_prims_get(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, char **res)
 {
   pm_label_t *label_ptr;
   char *ptr = (char *) hdr;
@@ -2433,7 +2953,7 @@ void vlen_prims_get(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, char *
 
   if (res) *res = NULL;
 
-  if (!hdr || !wtc || !res) return;
+  if (!hdr || !wtc || !res) return ERR;
 
   ptr += PvhdrSz; 
   label_ptr = (pm_label_t *) ptr; 
@@ -2445,14 +2965,16 @@ void vlen_prims_get(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, char *
         *res = ptr;
       }
 
-      return; 
+      return label_ptr->len;
     }
     else {
       ptr += (PmLabelTSz + label_ptr->len);
       rlen += (PmLabelTSz + label_ptr->len);
       label_ptr = (pm_label_t *) ptr;
     }
-  }  
+  }
+
+  return FALSE;
 }
 
 void vlen_prims_debug(struct pkt_vlen_hdr_primitives *hdr)
@@ -2469,12 +2991,12 @@ void vlen_prims_debug(struct pkt_vlen_hdr_primitives *hdr)
     label_ptr = (pm_label_t *) ptr;
     ptr += PmLabelTSz;
 
-    Log(LOG_DEBUG, "DEBUG ( %s/%s ): vlen_prims_debug(): LABEL #%u: type: %llx len: %u val: %s\n",
+    Log(LOG_DEBUG, "DEBUG ( %s/%s ): vlen_prims_debug(): LABEL #%u: type: %" PRIx64 " len: %u val: %s\n",
 	config.name, config.type, x, label_ptr->type, label_ptr->len, ptr);
   }
 }
 
-void vlen_prims_insert(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, int len, char *val, int copy_type /*, optional realloc */)
+void vlen_prims_insert(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, int len, u_char *val, int copy_type /*, optional realloc */)
 {
   pm_label_t *label_ptr;
   char *ptr = (char *) hdr;
@@ -2487,12 +3009,25 @@ void vlen_prims_insert(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc, int
   ptr += PmLabelTSz;
 
   if (len) {
-    if (PM_MSG_BIN_COPY) memcpy(ptr, val, len);
-    else if (PM_MSG_STR_COPY) strncpy(ptr, val, len);
+    switch (copy_type) {
+    case PM_MSG_BIN_COPY:
+      memcpy(ptr, val, len);
+      break;
+    case PM_MSG_STR_COPY:
+      strncpy(ptr, (char *)val, len); 
+      break;
+    case PM_MSG_STR_COPY_ZERO:
+      label_ptr->len++; /* terminating zero */
+      strncpy(ptr, (char *)val, len);
+      ptr[len] = '\0';
+      break;
+    default:
+      break;
+    }
   }
 
   hdr->num++;
-  hdr->tot_len += (PmLabelTSz + len);
+  hdr->tot_len += (PmLabelTSz + label_ptr->len);
 }
 
 int vlen_prims_delete(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc /*, optional realloc */)
@@ -2533,42 +3068,13 @@ int vlen_prims_delete(struct pkt_vlen_hdr_primitives *hdr, pm_cfgreg_t wtc /*, o
   return ret;
 }
 
-void replace_string(char *str, int string_len, char *var, char *value)
-{
-  char *ptr_start, *ptr_end;
-  char buf[string_len];
-  int ptr_len, len;
-
-  if (!str || !var || !value) return;
-
-  if (!strchr(str, '$')) return;
-
-  if (string_len < ((strlen(str) + strlen(value)) - strlen(var))) return;
-
-  ptr_start = strstr(str, var);
-  if (ptr_start) {
-    len = strlen(ptr_start);
-    ptr_end = ptr_start;
-    ptr_len = strlen(var);
-    ptr_end += ptr_len;
-    len -= ptr_len;
-
-    snprintf(buf, string_len, "%s", value);
-    strncat(buf, ptr_end, len);
-
-    len = strlen(buf);
-    *ptr_start = '\0';
-    strncat(str, buf, len);
-  }
-}
-
 int delete_line_from_file(int index, char *path)
 {
   int len = strlen(path) + 5;
   int line_idx;
   char tmpbuf[LARGEBUFLEN];
   char *copy_path;
-  FILE *file = fopen(path, "r");
+  FILE *file = fopen(path, "r+");
   FILE *file_copy;
 
   copy_path = malloc(len);
@@ -2663,11 +3169,10 @@ void hash_destroy_key(pm_hash_key_t *key)
 
 int hash_init_serial(pm_hash_serial_t *serial, u_int16_t key_len)
 {
-  int ret;
-
   if (!serial || !key_len) return ERR;
 
   memset(serial, 0, sizeof(pm_hash_serial_t));
+
   return hash_alloc_key(&serial->key, key_len);
 }
 
@@ -2707,7 +3212,7 @@ u_int16_t hash_key_get_len(pm_hash_key_t *key)
   return key->len;
 }
 
-char *hash_key_get_val(pm_hash_key_t *key)
+u_char *hash_key_get_val(pm_hash_key_t *key)
 {
   if (!key) return NULL;
 
@@ -2879,14 +3384,19 @@ void generate_random_string(char *s, const int len)
   s[len] = '\0';
 }
 
-void open_pcap_savefile(struct pcap_device *dev_ptr, char *file)
+void pm_pcap_device_initialize(struct pm_pcap_devices *map)
+{
+  memset(map, 0, sizeof(struct pm_pcap_devices));
+}
+
+void open_pcap_savefile(struct pm_pcap_device *dev_ptr, char *file)
 {
   char errbuf[PCAP_ERRBUF_SIZE];
   int idx;
 
   if ((dev_ptr->dev_desc = pcap_open_offline(file, errbuf)) == NULL) {
     Log(LOG_ERR, "ERROR ( %s/core ): pcap_open_offline(): %s\n", config.name, errbuf);
-    exit(1);
+    exit_gracefully(1);
   }
 
   dev_ptr->link_type = pcap_datalink(dev_ptr->dev_desc);
@@ -2895,10 +3405,352 @@ void open_pcap_savefile(struct pcap_device *dev_ptr, char *file)
       dev_ptr->data = &_devices[idx];
   }
 
-  if (!dev_ptr->data->handler) {
+  if (!dev_ptr->data || !dev_ptr->data->handler) {
     Log(LOG_ERR, "ERROR ( %s/core ): pcap_savefile: unsupported link layer.\n", config.name);
-    exit(1);
+    exit_gracefully(1);
   }
 
   dev_ptr->active = TRUE;
+}
+
+void P_broker_timers_set_last_fail(struct p_broker_timers *btimers, time_t timestamp)
+{
+  if (btimers) btimers->last_fail = timestamp;
+}
+
+time_t P_broker_timers_get_last_fail(struct p_broker_timers *btimers)
+{
+  if (btimers) return btimers->last_fail;
+
+  return FALSE;
+}
+
+void P_broker_timers_unset_last_fail(struct p_broker_timers *btimers)
+{
+  if (btimers) btimers->last_fail = FALSE;
+}
+
+void P_broker_timers_set_retry_interval(struct p_broker_timers *btimers, int interval)
+{
+  if (btimers) btimers->retry_interval = interval;
+}
+
+int P_broker_timers_get_retry_interval(struct p_broker_timers *btimers)
+{
+  if (btimers) return btimers->retry_interval;
+
+  return ERR;
+}
+
+char *ip_proto_print(u_int8_t ip_proto_id, char *str, int len)
+{
+  char *ret = NULL;
+
+  if (!config.num_protos && (ip_proto_id < protocols_number)) {
+    ret = (char *) _protocols[ip_proto_id].name;
+  }
+  else {
+    snprintf(str, len, "%u", ip_proto_id);
+    ret = str;
+  }
+
+  return ret;
+}
+
+void parse_hostport(const char *s, struct sockaddr *addr, socklen_t *len)
+{
+  char *orig, *host, *port;
+  struct addrinfo hints, *res;
+  int herr;
+
+  if ((host = orig = strdup(s)) == NULL) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): parse_hostport(), strdup() out of memory\n", config.name, config.type);
+    exit_gracefully(1);
+  }
+
+  trim_spaces(host);
+  trim_spaces(orig);
+
+  if ((port = strrchr(host, ':')) == NULL || *(++port) == '\0' || *host == '\0') {
+    Log(LOG_ERR, "ERROR ( %s/%s ): parse_hostport(), invalid '%s' argument\n", config.name, config.type, orig);
+    exit_gracefully(1);
+  }
+  *(port - 1) = '\0';
+	
+  /* Accept [host]:port for numeric IPv6 addresses */
+  if (*host == '[' && *(port - 2) == ']') {
+    host++;
+    *(port - 2) = '\0';
+  }
+
+  memset(&hints, '\0', sizeof(hints));
+  hints.ai_socktype = SOCK_DGRAM;
+
+  if ((herr = getaddrinfo(host, port, &hints, &res)) == -1) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): parse_hostport(), address lookup failed\n", config.name, config.type);
+    exit_gracefully(1);
+  }
+
+  if (res == NULL || res->ai_addr == NULL) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): parse_hostport(), no addresses found for [%s]:%s\n", config.name, config.type, host, port);
+    exit_gracefully(1);
+  }
+
+  if (res->ai_addrlen > *len) {
+    Log(LOG_ERR, "ERROR ( %s/%s ): parse_hostport(), address too long.\n", config.name, config.type);
+    exit_gracefully(1);
+  }
+
+  memcpy(addr, res->ai_addr, res->ai_addrlen);
+  free(orig);
+  *len = res->ai_addrlen;
+}
+
+bool is_prime(u_int32_t num)
+{
+  int div = 6;
+
+  if (num == 2 || num == 3) return TRUE;
+  if (num % 2 == 0 || num % 3 == 0) return FALSE;
+
+  while (div * div - 2 * div + 1 <= num) {
+    if (num % (div - 1) == 0) return FALSE;
+    if (num % (div + 1) == 0) return FALSE;
+
+    div += 6;
+  }
+
+  return TRUE;
+}
+
+u_int32_t next_prime(u_int32_t num)
+{
+  u_int32_t orig = num;
+
+  while (!is_prime(++num)); 
+
+  if (num < orig) return 0; /* it wrapped */
+  else return num;
+}
+
+char *null_terminate(char *str, int len)
+{
+  char *loc = NULL;
+
+  if (str[len - 1] == '\0') loc = strdup(str);
+  else {
+    loc = malloc(len + 1);
+    memcpy(loc, str, len);
+    loc[len] = '\0';
+  }
+
+  return loc;
+}
+
+char *uint_print(void *value, int len, int flip)
+{
+  char *buf = NULL;
+  ssize_t buflen = 0;
+
+  switch(len) {
+  case 1:
+    {
+      u_int8_t *u8 = (u_int8_t *) value;
+
+      buflen = snprintf(NULL, 0, "%u", (*u8)); 
+      buf = malloc(buflen + 1);
+      snprintf(buf, (buflen + 1), "%u", (*u8));
+    }
+    break;
+  case 2:
+    {
+      u_int16_t u16h, *u16 = (u_int16_t *) value;
+
+      if (flip) u16h = ntohs((*u16));
+      else u16h = (*u16);
+
+      buflen = snprintf(NULL, 0, "%u", u16h);
+      buf = malloc(buflen + 1);
+      snprintf(buf, (buflen + 1), "%u", u16h);
+    }
+    break;
+  case 4:
+    {
+      u_int32_t u32h, *u32 = (u_int32_t *) value;
+
+      if (flip) u32h = ntohl((*u32));
+      else u32h = (*u32);
+
+      buflen = snprintf(NULL, 0, "%u", u32h);
+      buf = malloc(buflen + 1);
+      snprintf(buf, (buflen + 1), "%u", u32h);
+    }
+    break;
+  case 8:
+    {
+      u_int64_t u64h, *u64 = (u_int64_t *) value;
+
+      if (flip) u64h = pm_ntohll((*u64));
+      else u64h = (*u64);
+
+      buflen = snprintf(NULL, 0, "%"PRIu64, u64h);
+      buf = malloc(buflen + 1);
+      snprintf(buf, (buflen + 1), "%"PRIu64, u64h);
+    }
+    break;
+  }
+
+  return buf;
+}
+
+void reload_logs(char *header)
+{
+  int logf;
+
+  if (config.syslog) {
+    closelog();
+    logf = parse_log_facility(config.syslog);
+    if (logf == ERR) {
+      config.syslog = NULL;
+      Log(LOG_WARNING, "WARN ( %s/%s ): specified syslog facility is not supported; logging to console.\n", config.name, config.type);
+    }
+    openlog(NULL, LOG_PID, logf);
+    Log(LOG_INFO, "INFO ( %s/%s ): Start logging ...\n", config.name, config.type);
+  }
+
+  if (config.logfile) {
+    fclose(config.logfile_fd);
+    config.logfile_fd = open_output_file(config.logfile, "a", FALSE);
+  }
+
+  if (config.type_id == PLUGIN_ID_CORE) {
+    Log(LOG_INFO, "INFO ( %s/core ): %s %s (%s)\n", config.name, header, PMACCT_VERSION, PMACCT_BUILD);
+    Log(LOG_INFO, "INFO ( %s/core ): %s\n", config.name, PMACCT_COMPILE_ARGS);
+  }
+}
+
+int is_empty_256b(void *area, int len)
+{
+  if (len <= SRVBUFLEN) {
+    if (!memcmp(area, empty_mem_area_256b, len)) {
+      return TRUE;
+    }
+    else {
+      return FALSE;
+    } 
+  }
+
+  return ERR;
+}
+
+ssize_t pm_recv(int sockfd, void *buf, size_t len, int flags, unsigned int seconds)
+{
+  ssize_t ret;
+
+  if (flags == MSG_WAITALL) {
+    alarm(seconds);
+  }
+
+  ret = recv(sockfd, buf, len, flags);
+
+  alarm(0);
+
+  return ret;
+}
+
+/* flow type to address family */
+int ft2af(u_int8_t ft)
+{
+  if (ft == PM_FTYPE_IPV4 || ft == PM_FTYPE_VLAN_IPV4 ||
+      ft == PM_FTYPE_MPLS_IPV4 || ft == PM_FTYPE_VLAN_MPLS_IPV4) {
+    return AF_INET;
+  }
+  else if (ft == PM_FTYPE_IPV6 || ft == PM_FTYPE_VLAN_IPV6 ||
+           ft == PM_FTYPE_MPLS_IPV6 || ft == PM_FTYPE_VLAN_MPLS_IPV6) {
+    return AF_INET6;
+  }
+
+  return ERR;
+}
+
+void distribute_work(struct pm_dump_runner *pdr, u_int64_t seqno, int workers, u_int64_t last_elem) 
+{
+  int id, idx;
+
+  if (!pdr) return;
+
+  memset(pdr, 0, (workers * sizeof(struct pm_dump_runner)));
+
+  for (idx = 0, id = 1; idx < workers; idx++, id++) {
+    struct pm_dump_runner *worker = &pdr[idx];
+
+    worker->id = id;
+    worker->seq = seqno;
+    worker->noop = FALSE;
+
+    if (workers <= last_elem) {
+      int ratio = last_elem / workers;
+
+      if (idx < (workers - 1)) {
+	worker->first = idx * ratio;
+	worker->last = (((idx * ratio) + ratio) - 1);
+      }
+      else {
+	worker->first = idx * ratio;
+	worker->last = (last_elem - 1);
+      }
+    }
+    else {
+      if (idx < last_elem) {
+	worker->first = idx;
+	worker->last = idx;
+      }
+      else {
+	worker->noop = TRUE;
+	worker->first = FALSE;
+	worker->last = FALSE;
+      }
+    }
+  }
+}
+
+// Dan Bernstein's hash variant 2 (XOR)
+unsigned long pm_djb2_string_hash(unsigned char *str)
+{
+  unsigned long hash = 5381;
+
+  while (*str){
+    hash = hash * 33 ^ ((int) *str);
+    str++;
+  }
+
+  return hash;
+}
+
+char *lookup_id_to_string_struct(const struct _id_to_string_struct *table, u_int64_t value)
+{
+  int index;
+
+  for (index = 0; table[index].id; index++) {
+    if (table[index].id == value) {
+      return (char * const) table[index].str;
+    }
+  }
+
+  return NULL;
+}
+
+const char *sampling_direction_print(u_int8_t sd_id)
+{
+  if (sd_id <= SAMPLING_DIRECTION_MAX) return sampling_direction[sd_id];
+  else return sampling_direction[SAMPLING_DIRECTION_UNKNOWN];
+}
+
+u_int8_t sampling_direction_str2id(char *sd_str)
+{
+  if (!strcmp(sd_str, "u")) return SAMPLING_DIRECTION_UNKNOWN;
+  else if (!strcmp(sd_str, "i")) return SAMPLING_DIRECTION_INGRESS;
+  else if (!strcmp(sd_str, "e")) return SAMPLING_DIRECTION_EGRESS;
+
+  return SAMPLING_DIRECTION_UNKNOWN;
 }

@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,15 +19,23 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __IMT_PLUGIN_C
-
 /* includes */
 #include "pmacct.h"
 #include "plugin_hooks.h"
+#include "plugin_common.h"
 #include "imt_plugin.h"
-#include "net_aggr.h"
-#include "ports_aggr.h"
 #include "bgp/bgp.h"
+#include "net_aggr.h"
+
+//Global variables
+void (*imt_insert_func)(struct primitives_ptrs *);
+unsigned char *mpd;
+unsigned char *a;
+struct memory_pool_desc *current_pool;
+struct acc **lru_elem_ptr;
+int no_more_space;
+struct timeval cycle_stamp;
+struct timeval table_reset_stamp;
 
 /* Functions */
 void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr) 
@@ -36,6 +44,7 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   struct sockaddr cAddr;
   struct pkt_data *data;
   struct ports_table pt;
+  struct protos_table prt, tost;
   unsigned char srvbuf[maxqsize];
   unsigned char *srvbufptr;
   struct query_header *qh;
@@ -51,17 +60,17 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   int pollagain = 0;
   u_int32_t seq = 0;
   int rg_err_count = 0;
-  int ret, lock = FALSE, cLen, num, sd, sd2;
+  int ret, lock = FALSE, num, sd, sd2;
   struct pkt_bgp_primitives *pbgp, empty_pbgp;
   struct pkt_legacy_bgp_primitives *plbgp, empty_plbgp;
   struct pkt_nat_primitives *pnat, empty_pnat;
   struct pkt_mpls_primitives *pmpls, empty_pmpls;
   struct pkt_tunnel_primitives *ptun, empty_ptun;
-  char *pcust, empty_pcust[] = "";
+  unsigned char *pcust, empty_pcust[] = "";
   struct pkt_vlen_hdr_primitives *pvlen, empty_pvlen;
   struct networks_file_data nfd;
   struct primitives_ptrs prim_ptrs;
-  struct plugins_list_entry *plugin_data = ((struct channels_list_entry *)ptr)->plugin;
+  socklen_t cLen;
 
   /* poll() stuff */
   struct pollfd poll_fd[2]; /* pipe + server */
@@ -73,14 +82,16 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   void *zmq_host = NULL;
 #endif
 
+#ifdef WITH_REDIS
+  struct p_redis_host redis_host;
+#endif
+
   memcpy(&config, cfgptr, sizeof(struct configuration));
   memcpy(&extras, &((struct channels_list_entry *)ptr)->extras, sizeof(struct extra_primitives));
   recollect_pipe_memory(ptr);
   pm_setproctitle("%s [%s]", "IMT Plugin", config.name);
 
   if (config.proc_priority) {
-    int ret;
-
     ret = setpriority(PRIO_PROCESS, 0, config.proc_priority);
     if (ret) Log(LOG_WARNING, "WARN ( %s/%s ): proc_priority failed (errno: %d)\n", config.name, config.type, errno);
     else Log(LOG_INFO, "INFO ( %s/%s ): proc_priority set to %d\n", config.name, config.type, getpriority(PRIO_PROCESS, 0));
@@ -92,9 +103,9 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
     config.logfile_fd = open_output_file(config.logfile, "a", FALSE);
   }
 
-  if (extras.off_pkt_vlen_hdr_primitives) {
+  if (extras.off_pkt_vlen_hdr_primitives || config.what_to_count_2 & COUNT_MPLS_LABEL_STACK) {
     Log(LOG_ERR, "ERROR ( %s/%s ): variable-length primitives, ie. label, are not supported in IMT plugin. Exiting ..\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   reload_map = FALSE;
@@ -104,7 +115,7 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   pipebuf = (unsigned char *) malloc(config.buffer_size);
   if (!pipebuf) {
     Log(LOG_ERR, "ERROR ( %s/%s ): malloc() failed (pipebuf). Exiting ..\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   if (config.pipe_zmq) P_zmq_pipe_init(zmq_host, &pipe_fd, &seq);
@@ -125,17 +136,21 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   memset(&nt, 0, sizeof(nt));
   memset(&nc, 0, sizeof(nc));
   memset(&pt, 0, sizeof(pt));
+  memset(&prt, 0, sizeof(prt));
+  memset(&tost, 0, sizeof(tost));
 
   load_networks(config.networks_file, &nt, &nc);
   set_net_funcs(&nt);
 
   if (config.ports_file) load_ports(config.ports_file, &pt);
+  if (config.protos_file) load_protos(config.protos_file, &prt);
+  if (config.tos_file) load_tos(config.tos_file, &tost);
 
   if (!config.num_memory_pools) config.num_memory_pools = NUM_MEMORY_POOLS;
   if (!config.memory_pool_size) config.memory_pool_size = MEMORY_POOL_SIZE;  
   else {
     if (config.memory_pool_size < sizeof(struct acc)) {
-      Log(LOG_WARNING, "WARN ( %s/%s ): enforcing memory pool's minimum size, %d bytes.\n", config.name, config.type, sizeof(struct acc));
+      Log(LOG_WARNING, "WARN ( %s/%s ): enforcing memory pool's minimum size, %d bytes.\n", config.name, config.type, (int)sizeof(struct acc));
       config.memory_pool_size = MEMORY_POOL_SIZE;
     }
   }
@@ -146,27 +161,27 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   init_memory_pool_table(config);
   if (mpd == NULL) {
     Log(LOG_ERR, "ERROR ( %s/%s ): unable to allocate memory pools table\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   current_pool = request_memory_pool(config.buckets*sizeof(struct acc));
   if (current_pool == NULL) {
     Log(LOG_ERR, "ERROR ( %s/%s ): unable to allocate first memory pool, try with larger value.\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
   a = current_pool->base_ptr;
 
   lru_elem_ptr = malloc(config.buckets*sizeof(struct acc *));
   if (lru_elem_ptr == NULL) {
     Log(LOG_ERR, "ERROR ( %s/%s ): unable to allocate LRU element pointers.\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
   else memset(lru_elem_ptr, 0, config.buckets*sizeof(struct acc *));
 
   current_pool = request_memory_pool(config.memory_pool_size);
   if (current_pool == NULL) {
     Log(LOG_ERR, "ERROR ( %s/%s ): unable to allocate more memory pools, try with larger value.\n", config.name, config.type);
-    exit_plugin(1);
+    exit_gracefully(1);
   }
 
   signal(SIGHUP, reload); /* handles reopening of syslog channel */
@@ -191,6 +206,15 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 
   qh = (struct query_header *) srvbuf;
 
+#ifdef WITH_REDIS
+  if (config.redis_host) {
+    char log_id[SHORTBUFLEN];
+
+    snprintf(log_id, sizeof(log_id), "%s/%s", config.name, config.type);
+    p_redis_init(&redis_host, log_id, p_redis_thread_produce_common_plugin_handler);
+  }
+#endif
+
   /* plugin main loop */
   for(;;) {
     poll_again:
@@ -209,7 +233,7 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
     if (num <= 0) {
       if (getppid() != core_pid) {
 	Log(LOG_ERR, "ERROR ( %s/%s ): Core process *seems* gone. Exiting.\n", config.name, config.type);
-	exit_plugin(1);
+	exit_gracefully(1);
       } 
 
       if (num < 0) goto poll_again;  
@@ -218,7 +242,6 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
     /* doing server tasks */
     if (poll_fd[1].revents & POLLIN) {
       struct pollfd pfd;
-      int ret;
 
       sd2 = accept(sd, &cAddr, &cLen);
       setblocking(sd2);
@@ -304,12 +327,17 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 	    break;
           case 0: /* Child */
             close(sd);
+
 	    pm_setproctitle("%s [%s]", "IMT Plugin -- serving client", config.name);
+	    config.is_forked = TRUE;
+
             if (num > 0) process_query_data(sd2, srvbuf, num, &extras, datasize, TRUE);
 	    else Log(LOG_DEBUG, "DEBUG ( %s/%s ): %d incoming bytes. Errno: %d\n", config.name, config.type, num, errno);
+
             Log(LOG_DEBUG, "DEBUG ( %s/%s ): Closing connection with client ...\n", config.name, config.type);
             close(sd2);
-            exit(0);
+
+            exit_gracefully(0);
           default: /* Parent */
             break;
           } 
@@ -330,14 +358,14 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
       current_pool = request_memory_pool(config.buckets*sizeof(struct acc));
       if (current_pool == NULL) {
         Log(LOG_ERR, "ERROR ( %s/%s ): Cannot allocate my first memory pool, try with larger value.\n", config.name, config.type);
-        exit_plugin(1);
+        exit_gracefully(1);
       }
       a = current_pool->base_ptr;
 
       current_pool = request_memory_pool(config.memory_pool_size);
       if (current_pool == NULL) {
         Log(LOG_ERR, "ERROR ( %s/%s ): Cannot allocate more memory pools, try with larger value.\n", config.name, config.type);
-        exit_plugin(1);
+        exit_gracefully(1);
       }
       go_to_clear = FALSE;
       no_more_space = FALSE;
@@ -347,11 +375,21 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
     if (reload_map) {
       load_networks(config.networks_file, &nt, &nc);
       load_ports(config.ports_file, &pt);
+      load_protos(config.protos_file, &prt);
+      load_tos(config.tos_file, &tost);
+
       reload_map = FALSE;
     }
 
+    if (reload_log) {
+      reload_logs(NULL);
+      reload_log = FALSE;
+    }
+
     if (poll_fd[0].revents & POLLIN) {
+#ifdef WITH_ZMQ
       read_data:
+#endif
       if (config.pipe_homegrown) {
         if (!pollagain) {
           seq++;
@@ -360,7 +398,7 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 
         pollagain = FALSE;
         if ((num = read(pipe_fd, &rgptr, sizeof(rgptr))) == 0)
-          exit_plugin(1); /* we exit silently; something happened at the write end */
+          exit_gracefully(1); /* we exit silently; something happened at the write end */
 
         if (num < 0) {
           pollagain = TRUE;
@@ -371,7 +409,7 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
         if (((struct ch_buf_hdr *)pipebuf)->seq != seq) {
           rg_err_count++;
           if (config.debug || (rg_err_count > MAX_RG_COUNT_ERR)) {
-	    Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected (plugin_buffer_size=%llu plugin_pipe_size=%llu).\n",
+	    Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected (plugin_buffer_size=%" PRIu64 " plugin_pipe_size=%" PRIu64 ").\n",
 		config.name, config.type, config.buffer_size, config.pipe_size);
 	    Log(LOG_WARNING, "WARN ( %s/%s ): Increase values or look for plugin_buffer_size, plugin_pipe_size in CONFIG-KEYS document.\n\n",
 		config.name, config.type);
@@ -382,7 +420,7 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
       }
 #ifdef WITH_ZMQ
       else if (config.pipe_zmq) {
-	ret = p_zmq_plugin_pipe_recv(zmq_host, pipebuf, config.buffer_size);
+	ret = p_zmq_topic_recv(zmq_host, pipebuf, config.buffer_size);
 	if (ret > 0) {
 	  if (((struct ch_buf_hdr *)pipebuf)->seq != ((seq + 1) % MAX_SEQNUM)) {
 	    Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected. Sequence received=%u expected=%u\n",
@@ -399,11 +437,10 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 	data = (struct pkt_data *) (pipebuf+sizeof(struct ch_buf_hdr));
 
 	if (config.debug_internal_msg) 
-	  Log(LOG_DEBUG, "DEBUG ( %s/%s ): buffer received cpid=%u len=%llu seq=%u num_entries=%u\n",
-		config.name, config.type, core_pid, ((struct ch_buf_hdr *)pipebuf)->len,
-		seq, ((struct ch_buf_hdr *)pipebuf)->num);
+	  Log(LOG_DEBUG, "DEBUG ( %s/%s ): buffer received len=%" PRIu64 " seq=%u num_entries=%u\n",
+		config.name, config.type, ((struct ch_buf_hdr *)pipebuf)->len, seq,
+		((struct ch_buf_hdr *)pipebuf)->num);
 
-	if (!config.pipe_check_core_pid || ((struct ch_buf_hdr *)pipebuf)->core_pid == core_pid) {
 	while (((struct ch_buf_hdr *)pipebuf)->num > 0) {
 
           if (extras.off_pkt_bgp_primitives)
@@ -432,8 +469,16 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 	    (*net_funcs[num])(&nt, &nc, &data->primitives, pbgp, &nfd);
 
 	  if (config.ports_file) {
-	    if (!pt.table[data->primitives.src_port]) data->primitives.src_port = 0;
-	    if (!pt.table[data->primitives.dst_port]) data->primitives.dst_port = 0;
+	    if (!pt.table[data->primitives.src_port]) data->primitives.src_port = PM_L4_PORT_OTHERS;
+	    if (!pt.table[data->primitives.dst_port]) data->primitives.dst_port = PM_L4_PORT_OTHERS;
+	  }
+
+	  if (config.protos_file) {
+	    if (!prt.table[data->primitives.proto]) data->primitives.proto = PM_IP_PROTO_OTHERS;
+	  }
+
+	  if (config.tos_file) {
+	    if (!tost.table[data->primitives.tos]) data->primitives.tos = PM_IP_TOS_OTHERS;
 	  }
 
 	  prim_ptrs.data = data; 
@@ -454,7 +499,6 @@ void imt_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
             data = (struct pkt_data *) dataptr;
 	  }
         }
-	}
       }
 
 #ifdef WITH_ZMQ
@@ -468,7 +512,7 @@ void exit_now(int signum)
 {
   if (config.imt_plugin_path) unlink(config.imt_plugin_path);
   if (config.pidfile) remove_pid_file(config.pidfile);
-  exit_plugin(0);
+  exit_gracefully(0);
 }
 
 void sum_host_insert(struct primitives_ptrs *prim_ptrs)

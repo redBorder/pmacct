@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -18,9 +18,6 @@
     along with this program; if not, write to the Free Software
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
-
-/* defines */
-#define __NL_C
 
 /* includes */
 #include "pmacct.h"
@@ -40,12 +37,23 @@
 #include "ndpi/ndpi.h"
 #endif
 
-void pcap_cb(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *buf)
+struct tunnel_entry tunnel_handlers_list[] = {
+  {"gtp", 	gtp_tunnel_func, 	gtp_tunnel_configurator},
+  {"", 		NULL,			NULL},
+};
+
+void pm_pcap_cb(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *buf)
 {
   struct packet_ptrs pptrs;
-  struct pcap_callback_data *cb_data = (struct pcap_callback_data *) user;
-  struct pcap_device *device = cb_data->device;
+  struct pm_pcap_callback_data *cb_data = (struct pm_pcap_callback_data *) user;
+  struct pm_pcap_device *device = cb_data->device;
   struct plugin_requests req;
+  u_int32_t iface32 = 0;
+  u_int32_t ifacePresent = 0;
+
+  memset(&req, 0, sizeof(req));
+
+  if (cb_data->sig.is_set) sigprocmask(SIG_BLOCK, &cb_data->sig.set, NULL);
 
   /* We process the packet with the appropriate
      data link layer function */
@@ -59,29 +67,77 @@ void pcap_cb(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *buf)
     pptrs.blp_table = cb_data->blp_table;
     pptrs.bmed_table = cb_data->bmed_table;
     pptrs.bta_table = cb_data->bta_table;
-    pptrs.flow_type = NF9_FTYPE_TRAFFIC;
+    pptrs.flow_type.traffic_type = PM_FTYPE_TRAFFIC;
 
-    if (cb_data->ifindex_in)
-      pptrs.ifindex_in = cb_data->ifindex_in;
-    else if (cb_data->device->id && cb_data->device->pcap_if &&
-	     cb_data->device->pcap_if->direction) {
-      if (cb_data->device->pcap_if->direction == PCAP_D_IN)
-        pptrs.ifindex_in = cb_data->device->id;
+    assert(cb_data);
+
+    if (cb_data->has_tun_prims) {
+      struct packet_ptrs *tpptrs;
+ 
+      pptrs.tun_pptrs = malloc(sizeof(struct packet_ptrs));
+      memset(pptrs.tun_pptrs, 0, sizeof(struct packet_ptrs));
+      tpptrs = (struct packet_ptrs *) pptrs.tun_pptrs;
+
+      tpptrs->pkthdr = malloc(sizeof(struct pcap_pkthdr));
+      memcpy(&tpptrs->pkthdr, &pptrs.pkthdr, sizeof(struct pcap_pkthdr));
+
+      tpptrs->packet_ptr = (u_char *) buf;
+      tpptrs->flow_type.traffic_type = PM_FTYPE_TRAFFIC;
     }
-    else if (cb_data->device->id && config.pcap_direction == PCAP_D_IN)
+
+    /* direction */
+    if (cb_data->device &&
+	cb_data->device->pcap_if &&
+	cb_data->device->pcap_if->direction) {
+      pptrs.direction = cb_data->device->pcap_if->direction;
+    }
+    else if (config.pcap_direction) {
+      pptrs.direction = config.pcap_direction;
+    }
+    else pptrs.direction = FALSE;
+
+    /* input interface */
+    if (cb_data->ifindex_in) {
+      pptrs.ifindex_in = cb_data->ifindex_in;
+    }
+    else if (cb_data->device &&
+	     cb_data->device->id &&
+	     cb_data->device->pcap_if &&
+	     cb_data->device->pcap_if->direction) {
+      if (cb_data->device->pcap_if->direction == PCAP_D_IN) {
+        pptrs.ifindex_in = cb_data->device->id;
+      }
+    }
+    else if (cb_data->device->id &&
+	     config.pcap_direction == PCAP_D_IN) {
       pptrs.ifindex_in = cb_data->device->id;
+    }
     else pptrs.ifindex_in = 0;
 
-    if (cb_data->ifindex_out)
+    /* output interface */
+    if (cb_data->ifindex_out) {
       pptrs.ifindex_out = cb_data->ifindex_out;
-    else if (cb_data->device->id && cb_data->device->pcap_if &&
-             cb_data->device->pcap_if->direction) { 
-      if (cb_data->device->pcap_if->direction == PCAP_D_OUT)
-        pptrs.ifindex_out = cb_data->device->id;
     }
-    else if (cb_data->device->id && config.pcap_direction == PCAP_D_OUT)
+    else if (cb_data->device &&
+	     cb_data->device->id &&
+	     cb_data->device->pcap_if &&
+             cb_data->device->pcap_if->direction) { 
+      if (cb_data->device->pcap_if->direction == PCAP_D_OUT) {
+        pptrs.ifindex_out = cb_data->device->id;
+      }
+    }
+    else if (cb_data->device->id && config.pcap_direction == PCAP_D_OUT) {
       pptrs.ifindex_out = cb_data->device->id;
+    }
     else pptrs.ifindex_out = 0;
+
+    if (config.pcap_arista_trailer_offset) {
+      memcpy(&ifacePresent, buf + pkthdr->len - config.pcap_arista_trailer_offset, 4);
+      if (ifacePresent == config.pcap_arista_trailer_flag_value) {
+        memcpy(&iface32, buf + pkthdr->len - (config.pcap_arista_trailer_offset - 4), 4);
+        pptrs.ifindex_out = iface32;
+      }
+    }
 
     (*device->data->handler)(pkthdr, &pptrs);
     if (pptrs.iph_ptr) {
@@ -96,19 +152,20 @@ void pcap_cb(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *buf)
         if (config.nfacctd_isis) {
           isis_srcdst_lookup(&pptrs);
         }
-        if (config.nfacctd_bgp) {
+        if (config.bgp_daemon) {
           BTA_find_id((struct id_table *)pptrs.bta_table, &pptrs, &pptrs.bta, &pptrs.bta2);
           bgp_srcdst_lookup(&pptrs, FUNC_TYPE_BGP);
         }
-        if (config.nfacctd_bgp_peer_as_src_map) PM_find_id((struct id_table *)pptrs.bpas_table, &pptrs, &pptrs.bpas, NULL);
-        if (config.nfacctd_bgp_src_local_pref_map) PM_find_id((struct id_table *)pptrs.blp_table, &pptrs, &pptrs.blp, NULL);
-        if (config.nfacctd_bgp_src_med_map) PM_find_id((struct id_table *)pptrs.bmed_table, &pptrs, &pptrs.bmed, NULL);
-        if (config.nfacctd_bmp) {
+        if (config.bgp_daemon_peer_as_src_map) PM_find_id((struct id_table *)pptrs.bpas_table, &pptrs, &pptrs.bpas, NULL);
+        if (config.bgp_daemon_src_local_pref_map) PM_find_id((struct id_table *)pptrs.blp_table, &pptrs, &pptrs.blp, NULL);
+        if (config.bgp_daemon_src_med_map) PM_find_id((struct id_table *)pptrs.bmed_table, &pptrs, &pptrs.bmed, NULL);
+        if (config.bmp_daemon) {
           BTA_find_id((struct id_table *)pptrs.bta_table, &pptrs, &pptrs.bta, &pptrs.bta2);
 	  bmp_srcdst_lookup(&pptrs);
 	}
 
 	set_index_pkt_ptrs(&pptrs);
+        PM_evaluate_flow_type(&pptrs);
         exec_plugins(&pptrs, &req);
       }
     }
@@ -120,18 +177,32 @@ void pcap_cb(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *buf)
 
     load_networks(config.networks_file, &nt, &nc);
 
-    if (config.nfacctd_bgp && config.nfacctd_bgp_peer_as_src_map)
-      load_id_file(MAP_BGP_PEER_AS_SRC, config.nfacctd_bgp_peer_as_src_map, (struct id_table *)cb_data->bpas_table, &req, &bpas_map_allocated);
-    if (config.nfacctd_bgp && config.nfacctd_bgp_src_local_pref_map)
-      load_id_file(MAP_BGP_SRC_LOCAL_PREF, config.nfacctd_bgp_src_local_pref_map, (struct id_table *)cb_data->blp_table, &req, &blp_map_allocated);
-    if (config.nfacctd_bgp && config.nfacctd_bgp_src_med_map)
-      load_id_file(MAP_BGP_SRC_MED, config.nfacctd_bgp_src_med_map, (struct id_table *)cb_data->bmed_table, &req, &bmed_map_allocated);
-    if (config.nfacctd_bgp)
-      load_id_file(MAP_BGP_TO_XFLOW_AGENT, config.nfacctd_bgp_to_agent_map, (struct id_table *)cb_data->bta_table, &req, &bta_map_allocated);
+    if (config.bgp_daemon && config.bgp_daemon_peer_as_src_map)
+      load_id_file(MAP_BGP_PEER_AS_SRC, config.bgp_daemon_peer_as_src_map, (struct id_table *)cb_data->bpas_table, &req, &bpas_map_allocated);
+    if (config.bgp_daemon && config.bgp_daemon_src_local_pref_map)
+      load_id_file(MAP_BGP_SRC_LOCAL_PREF, config.bgp_daemon_src_local_pref_map, (struct id_table *)cb_data->blp_table, &req, &blp_map_allocated);
+    if (config.bgp_daemon && config.bgp_daemon_src_med_map)
+      load_id_file(MAP_BGP_SRC_MED, config.bgp_daemon_src_med_map, (struct id_table *)cb_data->bmed_table, &req, &bmed_map_allocated);
+    if (config.bgp_daemon)
+      load_id_file(MAP_BGP_TO_XFLOW_AGENT, config.bgp_daemon_to_xflow_agent_map, (struct id_table *)cb_data->bta_table, &req, &bta_map_allocated);
 
     reload_map = FALSE;
     gettimeofday(&reload_map_tstamp, NULL);
   }
+
+  if (reload_log) {
+    reload_logs(PMACCTD_USAGE_HEADER);
+    reload_log = FALSE;
+  }
+
+  if (cb_data->has_tun_prims && pptrs.tun_pptrs) {
+    struct packet_ptrs *tpptrs = (struct packet_ptrs *) pptrs.tun_pptrs;
+
+    if (tpptrs->pkthdr) free(tpptrs->pkthdr);
+    free(pptrs.tun_pptrs);
+  }
+
+  if (cb_data->sig.is_set) sigprocmask(SIG_UNBLOCK, &cb_data->sig.set, NULL);
 }
 
 int ip_handler(register struct packet_ptrs *pptrs)
@@ -158,10 +229,13 @@ int ip_handler(register struct packet_ptrs *pptrs)
   if (config.handle_fragments) {
     if (pptrs->l4_proto == IPPROTO_TCP || pptrs->l4_proto == IPPROTO_UDP) {
       if (off+MyTLHdrSz > caplen) {
-        Log(LOG_INFO, "INFO ( %s/core ): short IPv4 packet read (%u/%u/frags). Snaplen issue ?\n",
-			config.name, caplen, off+MyTLHdrSz);
-        return FALSE;
+	if (!log_notification_isset(&log_notifications.snaplen_issue, ((struct pcap_pkthdr *)pptrs->pkthdr)->ts.tv_sec)) {
+          Log(LOG_INFO, "INFO ( %s/core ): short IPv4 packet read (%u/%u/frags). Snaplen issue ?\n", config.name, caplen, off+MyTLHdrSz);
+	  log_notification_set(&log_notifications.max_classifiers, ((struct pcap_pkthdr *)pptrs->pkthdr)->ts.tv_sec, 180);
+          return FALSE;
+	}
       }
+
       pptrs->tlh_ptr = ptr;
 
       if (((struct pm_iphdr *)pptrs->iph_ptr)->ip_off & htons(IP_MF|IP_OFFMASK)) {
@@ -191,7 +265,31 @@ int ip_handler(register struct packet_ptrs *pptrs)
         ptr += ((struct pm_tcphdr *)pptrs->tlh_ptr)->th_off << 2;
         off += ((struct pm_tcphdr *)pptrs->tlh_ptr)->th_off << 2;
       }
-      if (off < caplen) pptrs->payload_ptr = ptr;
+
+      if (off < caplen) {
+	pptrs->payload_ptr = ptr;
+
+	if (pptrs->l4_proto == IPPROTO_UDP) {
+	  u_int16_t dst_port = ntohs(((struct pm_udphdr *)pptrs->tlh_ptr)->uh_dport);
+
+	  if (dst_port == UDP_PORT_VXLAN && (off + sizeof(struct vxlan_hdr) <= caplen)) {
+	    struct vxlan_hdr *vxhdr = (struct vxlan_hdr *) pptrs->payload_ptr; 
+
+	    if (vxhdr->flags & VXLAN_FLAG_I) pptrs->vxlan_ptr = vxhdr->vni; 
+	    pptrs->payload_ptr += sizeof(struct vxlan_hdr);
+
+	    if (pptrs->tun_pptrs) {
+	      struct packet_ptrs *tpptrs = (struct packet_ptrs *) pptrs->tun_pptrs;
+
+	      tpptrs->pkthdr->caplen = (pptrs->pkthdr->caplen - (pptrs->payload_ptr - pptrs->packet_ptr)); 
+	      tpptrs->packet_ptr = pptrs->payload_ptr;
+
+	      eth_handler(tpptrs->pkthdr, tpptrs);
+	      if (tpptrs->iph_ptr) ((*tpptrs->l3_handler)(tpptrs));
+	    }
+	  }
+	}
+      }
     }
     else {
       pptrs->tlh_ptr = dummy_tlhdr;
@@ -241,25 +339,39 @@ int ip_handler(register struct packet_ptrs *pptrs)
     }
   }
 
+  pptrs->icmp_type = FALSE;
+  pptrs->icmp_code = FALSE;
+
+  if (pptrs->l4_proto == IPPROTO_ICMP) {
+    pptrs->tlh_ptr = ptr;
+
+    pptrs->icmp_type = ((struct pm_icmphdr *)pptrs->tlh_ptr)->type;
+    pptrs->icmp_code = ((struct pm_icmphdr *)pptrs->tlh_ptr)->code;
+  }
+
   quit:
+
+  if (ret) {
+    pptrs->flow_type.traffic_type = PM_FTYPE_IPV4;
+  }
+ 
   return ret;
 }
 
-#if defined ENABLE_IPV6
 int ip6_handler(register struct packet_ptrs *pptrs)
 {
   struct ip6_frag *fhdr = NULL;
   register u_int16_t caplen = ((struct pcap_pkthdr *)pptrs->pkthdr)->caplen;
-  u_int16_t len = 0, plen = ntohs(((struct ip6_hdr *)pptrs->iph_ptr)->ip6_plen);
+  u_int16_t plen = ntohs(((struct ip6_hdr *)pptrs->iph_ptr)->ip6_plen);
   u_int16_t off = pptrs->iph_ptr-pptrs->packet_ptr, off_l4;
   u_int32_t advance;
-  u_int8_t nh, fragmented = 0;
+  u_int8_t nh;
   u_char *ptr = pptrs->iph_ptr;
   int ret = TRUE;
 
   /* length checks */
   if (off+IP6HdrSz > caplen) return FALSE; /* IP packet truncated */
-  if (plen == 0 && ((struct ip6_hdr *)pptrs->iph_ptr)->ip6_nxt != IPPROTO_NONE) {
+  if (plen == 0 && ((struct ip6_hdr *)pptrs->iph_ptr)->ip6_nxt == IPPROTO_HOPOPTS) {
     Log(LOG_INFO, "INFO ( %s/core ): NULL IPv6 payload length. Jumbo packets are currently not supported.\n", config.name);
     return FALSE;
   }
@@ -336,7 +448,31 @@ int ip6_handler(register struct packet_ptrs *pptrs)
         ptr += ((struct pm_tcphdr *)pptrs->tlh_ptr)->th_off << 2;
         off += ((struct pm_tcphdr *)pptrs->tlh_ptr)->th_off << 2;
       }
-      if (off < caplen) pptrs->payload_ptr = ptr;
+
+      if (off < caplen) {
+	pptrs->payload_ptr = ptr;
+
+	if (pptrs->l4_proto == IPPROTO_UDP) {
+	  u_int16_t dst_port = ntohs(((struct pm_udphdr *)pptrs->tlh_ptr)->uh_dport);
+
+	  if (dst_port == UDP_PORT_VXLAN && (off + sizeof(struct vxlan_hdr) <= caplen)) {
+	    struct vxlan_hdr *vxhdr = (struct vxlan_hdr *) pptrs->payload_ptr;
+
+	    if (vxhdr->flags & VXLAN_FLAG_I) pptrs->vxlan_ptr = vxhdr->vni;
+	    pptrs->payload_ptr += sizeof(struct vxlan_hdr);
+
+	    if (pptrs->tun_pptrs) {
+	      struct packet_ptrs *tpptrs = (struct packet_ptrs *) pptrs->tun_pptrs;
+
+	      tpptrs->pkthdr->caplen = (pptrs->pkthdr->caplen - (pptrs->payload_ptr - pptrs->packet_ptr));
+	      tpptrs->packet_ptr = pptrs->payload_ptr;
+
+	      eth_handler(tpptrs->pkthdr, tpptrs);
+	      if (tpptrs->iph_ptr) ((*tpptrs->l3_handler)(tpptrs));
+            }
+	  }
+	}
+      }
     }
     else {
       pptrs->tlh_ptr = dummy_tlhdr;
@@ -367,14 +503,32 @@ int ip6_handler(register struct packet_ptrs *pptrs)
       pptrs->tcp_flags = ((struct pm_tcphdr *)pptrs->tlh_ptr)->th_flags;
   }
 
+  pptrs->icmp_type = FALSE;
+  pptrs->icmp_code = FALSE;
+
+  if (pptrs->l4_proto == IPPROTO_ICMPV6) {
+    pptrs->icmp_type = ((struct pm_icmphdr *)pptrs->tlh_ptr)->type;
+    pptrs->icmp_code = ((struct pm_icmphdr *)pptrs->tlh_ptr)->code;
+  }
+
   quit:
+
+  if (ret) {
+    pptrs->flow_type.traffic_type = PM_FTYPE_IPV6;
+  }
+
+  return ret;
+}
+
+int unknown_etype_handler(register struct packet_ptrs *pptrs)
+{
+  /* NO-OP - just return TRUE so packet is counted */
   return TRUE;
 }
-#endif
 
 int PM_find_id(struct id_table *t, struct packet_ptrs *pptrs, pm_id_t *tag, pm_id_t *tag2)
 {
-  int x, j;
+  int x;
   pm_id_t ret = 0;
 
   if (!t) return 0;
@@ -387,19 +541,20 @@ int PM_find_id(struct id_table *t, struct packet_ptrs *pptrs, pm_id_t *tag, pm_i
     pptrs->have_tag2 = FALSE;
   }
 
-  /* Giving a first try with index(es) */
+  /* If we have any index defined, let's use it */
   if (config.maps_index && pretag_index_have_one(t)) {
     struct id_entry *index_results[ID_TABLE_INDEX_RESULTS];
     u_int32_t iterator;
+    int num_results;
 
-    pretag_index_lookup(t, pptrs, index_results, ID_TABLE_INDEX_RESULTS);
+    num_results = pretag_index_lookup(t, pptrs, index_results, ID_TABLE_INDEX_RESULTS);
 
-    for (iterator = 0; index_results[iterator] && iterator < ID_TABLE_INDEX_RESULTS; iterator++) {
+    for (iterator = 0; index_results[iterator] && iterator < num_results; iterator++) {
       ret = pretag_entry_process(index_results[iterator], pptrs, tag, tag2);
       if (!(ret & PRETAG_MAP_RCODE_JEQ)) return ret;
     }
 
-    /* if we have at least one index we trust we did a good job */
+    /* done */
     return ret;
   }
 
@@ -416,6 +571,29 @@ int PM_find_id(struct id_table *t, struct packet_ptrs *pptrs, pm_id_t *tag, pm_i
   }
 
   return ret;
+}
+
+void PM_print_stats(time_t now)
+{
+  int device_idx;
+
+  Log(LOG_NOTICE, "NOTICE ( %s/%s ): +++\n", config.name, config.type);
+
+  if (config.pcap_if || config.pcap_interfaces_map) {
+    for (device_idx = 0; device_idx < devices.num; device_idx++) {
+      if (pcap_stats(devices.list[device_idx].dev_desc, &ps) < 0) {
+	Log(LOG_INFO, "INFO ( %s/%s ): stats [%s,%u] time=%ld error='pcap_stats(): %s'\n",
+	    config.name, config.type, devices.list[device_idx].str, devices.list[device_idx].id,
+	    (long)now, pcap_geterr(devices.list[device_idx].dev_desc));
+      }
+
+      Log(LOG_NOTICE, "NOTICE ( %s/%s ): stats [%s,%u] time=%ld received_packets=%u dropped_packets=%u\n",
+	  config.name, config.type, devices.list[device_idx].str, devices.list[device_idx].id,
+	  (long)now, ps.ps_recv, ps.ps_drop);
+    }
+  }
+
+  Log(LOG_NOTICE, "NOTICE ( %s/%s ): ---\n", config.name, config.type);
 }
 
 void compute_once()
@@ -442,13 +620,10 @@ void compute_once()
   MyTCPHdrSz = TCPFlagOff+1;
   PptrsSz = sizeof(struct packet_ptrs);
   UDPHdrSz = 8;
-  CSSz = sizeof(struct class_st);
   IpFlowCmnSz = sizeof(struct ip_flow_common);
   HostAddrSz = sizeof(struct host_addr);
-#if defined ENABLE_IPV6
   IP6HdrSz = sizeof(struct ip6_hdr);
   IP6AddrSz = sizeof(struct in6_addr);
-#endif
 }
 
 void tunnel_registry_init()
@@ -456,9 +631,8 @@ void tunnel_registry_init()
   if (config.tunnel0) {
     char *tun_string = config.tunnel0, *tun_entry = NULL, *tun_type = NULL;
     int th_index = 0 /* tunnel handler index */, tr_index = 0 /* tunnel registry index */;
-    int ret;
 
-    while (tun_entry = extract_token(&tun_string, ';')) {
+    while ((tun_entry = extract_token(&tun_string, ';'))) {
       tun_type = extract_token(&tun_entry, ',');
 
       for (th_index = 0; strcmp(tunnel_handlers_list[th_index].type, ""); th_index++) {
@@ -494,11 +668,9 @@ int gtp_tunnel_func(register struct packet_ptrs *pptrs)
 {
   register u_int16_t caplen = ((struct pcap_pkthdr *)pptrs->pkthdr)->caplen;
   struct pm_gtphdr_v0 *gtp_hdr_v0 = (struct pm_gtphdr_v0 *) pptrs->payload_ptr;
-  struct pm_gtphdr_v1 *gtp_hdr_v1 = (struct pm_gtphdr_v1 *) pptrs->payload_ptr;
-  struct pm_udphdr *udp_hdr = (struct pm_udphdr *) pptrs->tlh_ptr;
   u_int16_t off = pptrs->payload_ptr-pptrs->packet_ptr;
-  u_int16_t gtp_hdr_len, gtp_opt_len, gtp_version;
-  char *ptr = pptrs->payload_ptr;
+  u_int16_t gtp_hdr_len, gtp_version;
+  u_char *ptr = pptrs->payload_ptr;
   int ret, trial;
 
   gtp_version = (gtp_hdr_v0->flags >> 5) & 0x07;
@@ -542,7 +714,6 @@ int gtp_tunnel_func(register struct packet_ptrs *pptrs)
 	pptrs->tun_layer++;
 	ret = ip_handler(pptrs);
 	break;
-#if defined ENABLE_IPV6
       case 0x60:
       case 0x61:
       case 0x62:
@@ -562,7 +733,6 @@ int gtp_tunnel_func(register struct packet_ptrs *pptrs)
 	pptrs->tun_layer++;
 	ret = ip6_handler(pptrs);
 	break;
-#endif
       default:
         ret = FALSE;
 	break;
@@ -581,6 +751,20 @@ int gtp_tunnel_func(register struct packet_ptrs *pptrs)
   return ret;
 }
 
+void reset_index_pkt_ptrs(struct packet_ptrs *pptrs)
+{
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_PACKET_PTR] = NULL;
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_MAC_PTR] = NULL;
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_VLAN_PTR] = NULL;
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_MPLS_PTR] = NULL;
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_L3_PTR] = NULL;
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_L4_PTR] = NULL;
+  pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_PAYLOAD_PTR] = NULL;
+
+  pptrs->pkt_proto[CUSTOM_PRIMITIVE_L3_PTR] = FALSE;
+  pptrs->pkt_proto[CUSTOM_PRIMITIVE_L4_PTR] = FALSE;
+}
+
 void set_index_pkt_ptrs(struct packet_ptrs *pptrs)
 {
   pptrs->pkt_data_ptrs[CUSTOM_PRIMITIVE_PACKET_PTR] = pptrs->packet_ptr;
@@ -595,61 +779,131 @@ void set_index_pkt_ptrs(struct packet_ptrs *pptrs)
   pptrs->pkt_proto[CUSTOM_PRIMITIVE_L4_PTR] = pptrs->l4_proto;
 }
 
-ssize_t recvfrom_savefile(struct pcap_device *device, void **buf, struct sockaddr *src_addr, struct timeval **ts)
+void PM_evaluate_flow_type(struct packet_ptrs *pptrs)
 {
-  struct packet_ptrs savefile_pptrs;
+  if (pptrs->l3_proto == ETHERTYPE_IP) {
+    pptrs->flow_type.traffic_type = PM_FTYPE_IPV4;
+  }
+  else if (pptrs->l3_proto == ETHERTYPE_IPV6) {
+    pptrs->flow_type.traffic_type = PM_FTYPE_IPV6;
+  }
+}
+
+ssize_t recvfrom_savefile(struct pm_pcap_device *device, void **buf, struct sockaddr *src_addr, struct timeval **ts, int *round, struct packet_ptrs *savefile_pptrs)
+{
   ssize_t ret = 0;
-  int pcap_ret;
+  int pm_pcap_ret;
 
-  pcap_ret = pcap_next_ex(device->dev_desc, &savefile_pptrs.pkthdr, (const u_char **)&savefile_pptrs.packet_ptr);
+  read_packet:
+  pm_pcap_ret = pcap_next_ex(device->dev_desc, &savefile_pptrs->pkthdr, (const u_char **)&savefile_pptrs->packet_ptr);
 
-  if (pcap_ret == 1 /* all good */) device->errors = FALSE;
-  else if (pcap_ret == -1 /* failed reading next packet */) {
+  if (pm_pcap_ret == 1 /* all good */) device->errors = FALSE;
+  else if (pm_pcap_ret == -1 /* failed reading next packet */) {
     device->errors++;
     if (device->errors == PCAP_SAVEFILE_MAX_ERRORS) {
       Log(LOG_ERR, "ERROR ( %s/core ): pcap_ext_ex() max errors reached (%u). Exiting.\n", config.name, PCAP_SAVEFILE_MAX_ERRORS);
-      exit(1);
+      exit_gracefully(1);
     }
     else {
       Log(LOG_WARNING, "WARN ( %s/core ): pcap_ext_ex() failed: %s. Skipping packet.\n", config.name, pcap_geterr(device->dev_desc));
       return 0;
     }
   }
-  else if (pcap_ret == -2 /* last packet in a pcap_savefile */) {
+  else if (pm_pcap_ret == -2 /* last packet in a pcap_savefile */) {
+    pcap_close(device->dev_desc);
+
+    if (config.pcap_sf_replay < 0 ||
+	(config.pcap_sf_replay > 0 && (*round) < config.pcap_sf_replay)) {
+      (*round)++;
+      open_pcap_savefile(device, config.pcap_savefile);
+      if (config.pcap_sf_delay) sleep(config.pcap_sf_delay);
+
+      goto read_packet;
+    }
+
     if (config.pcap_sf_wait) {
       fill_pipe_buffer();
       Log(LOG_INFO, "INFO ( %s/core ): finished reading PCAP capture file\n", config.name);
       wait(NULL);
     }
-    else stop_all_childs();
+
+    stop_all_childs();
   }
   else {
     Log(LOG_ERR, "ERROR ( %s/core ): unexpected return code from pcap_next_ex(). Exiting.\n", config.name);
-    exit(1);
+    exit_gracefully(1);
   }
 
-  (*device->data->handler)(savefile_pptrs.pkthdr, &savefile_pptrs);
-  if (savefile_pptrs.iph_ptr) {
-    (*savefile_pptrs.l3_handler)(&savefile_pptrs);
-    if (savefile_pptrs.payload_ptr) {
-      if (ts) (*ts) = &savefile_pptrs.pkthdr->ts; 
-      (*buf) = savefile_pptrs.payload_ptr;
-      ret = savefile_pptrs.pkthdr->caplen - (savefile_pptrs.payload_ptr - savefile_pptrs.packet_ptr);
+  (*device->data->handler)(savefile_pptrs->pkthdr, savefile_pptrs);
+  if (savefile_pptrs->iph_ptr) {
+    (*savefile_pptrs->l3_handler)(savefile_pptrs);
+    if (savefile_pptrs->payload_ptr) {
+      if (ts) (*ts) = &savefile_pptrs->pkthdr->ts; 
+      (*buf) = savefile_pptrs->payload_ptr;
+      ret = savefile_pptrs->pkthdr->caplen - (savefile_pptrs->payload_ptr - savefile_pptrs->packet_ptr);
 
-      if (savefile_pptrs.l4_proto == IPPROTO_UDP) {
-	if (savefile_pptrs.l3_proto == ETHERTYPE_IP) {
-	  raw_to_sa((struct sockaddr *)src_addr, (char *) &((struct pm_iphdr *)savefile_pptrs.iph_ptr)->ip_src.s_addr,
-		    (u_int16_t) ((struct pm_udphdr *)savefile_pptrs.tlh_ptr)->uh_sport, AF_INET);
+      if (savefile_pptrs->l4_proto == IPPROTO_UDP || savefile_pptrs->l4_proto == IPPROTO_TCP) {
+	if (savefile_pptrs->l3_proto == ETHERTYPE_IP) {
+	  raw_to_sa((struct sockaddr *)src_addr, (u_char *) &((struct pm_iphdr *)savefile_pptrs->iph_ptr)->ip_src.s_addr,
+		    (u_int16_t) ((struct pm_udphdr *)savefile_pptrs->tlh_ptr)->uh_sport, AF_INET);
 	}
-#if defined ENABLE_IPV6
-	else if (savefile_pptrs.l3_proto == ETHERTYPE_IPV6) {
-	  raw_to_sa((struct sockaddr *)src_addr, (char *) &((struct ip6_hdr *)savefile_pptrs.iph_ptr)->ip6_src,
-		    (u_int16_t) ((struct pm_udphdr *)savefile_pptrs.tlh_ptr)->uh_sport, AF_INET6);
+	else if (savefile_pptrs->l3_proto == ETHERTYPE_IPV6) {
+	  raw_to_sa((struct sockaddr *)src_addr, (u_char *) &((struct ip6_hdr *)savefile_pptrs->iph_ptr)->ip6_src,
+		    (u_int16_t) ((struct pm_udphdr *)savefile_pptrs->tlh_ptr)->uh_sport, AF_INET6);
 	}
-#endif
       }
     }
   }
 
   return ret;
+}
+
+ssize_t recvfrom_rawip(unsigned char *buf, size_t len, struct sockaddr *src_addr, struct packet_ptrs *local_pptrs)
+{
+  ssize_t ret = 0;
+
+  local_pptrs->packet_ptr = buf;
+  local_pptrs->pkthdr->caplen = len;
+
+  raw_handler(local_pptrs->pkthdr, local_pptrs);
+
+  if (local_pptrs->iph_ptr) {
+    (*local_pptrs->l3_handler)(local_pptrs);
+    if (local_pptrs->payload_ptr) {
+      ret = local_pptrs->pkthdr->caplen - (local_pptrs->payload_ptr - local_pptrs->packet_ptr);
+
+      if (local_pptrs->l4_proto == IPPROTO_UDP) {
+        if (local_pptrs->l3_proto == ETHERTYPE_IP) {
+          raw_to_sa((struct sockaddr *)src_addr, (u_char *) &((struct pm_iphdr *)local_pptrs->iph_ptr)->ip_src.s_addr,
+                    (u_int16_t) ((struct pm_udphdr *)local_pptrs->tlh_ptr)->uh_sport, AF_INET);
+        }
+        else if (local_pptrs->l3_proto == ETHERTYPE_IPV6) {
+          raw_to_sa((struct sockaddr *)src_addr, (u_char *) &((struct ip6_hdr *)local_pptrs->iph_ptr)->ip6_src,
+                    (u_int16_t) ((struct pm_udphdr *)local_pptrs->tlh_ptr)->uh_sport, AF_INET6);
+        }
+      }
+
+      /* last action: cut L3 and L4 off the packet */
+      memmove(buf, local_pptrs->payload_ptr, ret);
+    }
+  }
+
+  return ret;
+}
+
+void pm_pcap_add_filter(struct pm_pcap_device *dev_ptr)
+{
+  /* pcap library stuff */
+  struct bpf_program filter;
+
+  memset(&filter, 0, sizeof(filter));
+  if (pcap_compile(dev_ptr->dev_desc, &filter, config.clbuf, 0, PCAP_NETMASK_UNKNOWN) < 0) {
+    Log(LOG_WARNING, "WARN ( %s/core ): %s (going on without a filter)\n", config.name, pcap_geterr(dev_ptr->dev_desc));
+  }
+  else {
+    if (pcap_setfilter(dev_ptr->dev_desc, &filter) < 0) {
+      Log(LOG_WARNING, "WARN ( %s/core ): %s (going on without a filter)\n", config.name, pcap_geterr(dev_ptr->dev_desc));
+    }
+    else pcap_freecode(&filter);
+  }
 }

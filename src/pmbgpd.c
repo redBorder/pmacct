@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,25 +19,18 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-/* defines */
-#define __PMBGPD_C
-
 /* includes */
 #include "pmacct.h"
-#include "bgp/bgp.h"
 #include "plugin_hooks.h"
+#include "bgp/bgp.h"
+#include "bgp/bgp_lg.h"
 #include "pmbgpd.h"
 #include "pretag_handlers.h"
 #include "pmacct-data.h"
 #include "pkt_handlers.h"
 #include "ip_flow.h"
-#include "classifier.h"
 #include "net_aggr.h"
 #include "thread_pool.h"
-
-/* global var */
-struct channels_list_entry channels_list[MAX_N_PLUGINS]; /* communication channels: core <-> plugins */
-thread_pool_t *bgp_lg_pool;
 
 /* Functions */
 void usage_daemon(char *prog_name)
@@ -80,6 +73,10 @@ int main(int argc,char **argv, char **envp)
   extern int optind, opterr, optopt;
   int errflag, cp;
 
+#ifdef WITH_REDIS
+  struct p_redis_host redis_host;
+#endif
+
 #if defined HAVE_MALLOPT
   mallopt(M_CHECK_ACTION, 0);
 #endif
@@ -89,14 +86,21 @@ int main(int argc,char **argv, char **envp)
   memset(cfg_cmdline, 0, sizeof(cfg_cmdline));
   memset(&config, 0, sizeof(struct configuration));
   memset(&config_file, 0, sizeof(config_file));
+  memset(empty_mem_area_256b, 0, sizeof(empty_mem_area_256b));
 
   log_notifications_init(&log_notifications);
   config.acct_type = ACCT_PMBGP;
+  config.progname = pmbgpd_globstr;
 
   find_id_func = NULL;
   plugins_list = NULL;
   errflag = 0;
   rows = 0;
+
+  /* needed for pre_tag_map support */
+  PvhdrSz = sizeof(struct pkt_vlen_hdr_primitives);
+  PmLabelTSz = sizeof(pm_label_t);
+  PtLabelTSz = sizeof(pt_label_t);
 
   /* getting commandline values */
   while (!errflag && ((cp = getopt(argc, argv, ARGS_PMBGPD)) != -1)) {
@@ -163,7 +167,7 @@ int main(int argc,char **argv, char **envp)
       exit(0);
       break;
     case 'V':
-      version_daemon(PMBGPD_USAGE_HEADER);
+      version_daemon(config.acct_type, PMBGPD_USAGE_HEADER);
       exit(0);
       break;
     default:
@@ -186,6 +190,7 @@ int main(int argc,char **argv, char **envp)
   list = plugins_list;
   while (list) {
     list->cfg.acct_type = ACCT_PMBGP;
+    list->cfg.progname = pmbgpd_globstr;
     set_default_preferences(&list->cfg);
     if (!strcmp(list->type.string, "core")) {
       memcpy(&config, &list->cfg, sizeof(struct configuration));
@@ -197,13 +202,8 @@ int main(int argc,char **argv, char **envp)
 
   if (config.files_umask) umask(config.files_umask);
 
-  if (config.daemon) {
-    if (debug || config.debug)
-      printf("WARN ( %s/core ): debug is enabled; forking in background. Logging to standard error (stderr) will get lost.\n", config.name);
-    daemonize();
-  }
-
   initsetproctitle(argc, argv, envp);
+
   if (config.syslog) {
     logf = parse_log_facility(config.syslog);
     if (logf == ERR) {
@@ -214,13 +214,22 @@ int main(int argc,char **argv, char **envp)
     Log(LOG_INFO, "INFO ( %s/core ): Start logging ...\n", config.name);
   }
 
-  if (config.logfile)
-  {
+  if (config.logfile) {
     config.logfile_fd = open_output_file(config.logfile, "a", FALSE);
     while (list) {
       list->cfg.logfile_fd = config.logfile_fd ;
       list = list->next;
     }
+  }
+
+  if (config.daemon) {
+    if (!config.syslog && !config.logfile) {
+      if (debug || config.debug) {
+	printf("WARN ( %s/core ): debug is enabled; forking in background. Logging to standard error (stderr) will get lost.\n", config.name);
+      }
+    }
+
+    daemonize();
   }
 
   if (config.proc_priority) {
@@ -230,6 +239,9 @@ int main(int argc,char **argv, char **envp)
     if (ret) Log(LOG_WARNING, "WARN ( %s/core ): proc_priority failed (errno: %d)\n", config.name, errno);
     else Log(LOG_INFO, "INFO ( %s/core ): proc_priority set to %d\n", config.name, getpriority(PRIO_PROCESS, 0));
   }
+
+  Log(LOG_INFO, "INFO ( %s/core ): %s %s (%s)\n", config.name, PMBGPD_USAGE_HEADER, PMACCT_VERSION, PMACCT_BUILD);
+  Log(LOG_INFO, "INFO ( %s/core ): %s\n", config.name, PMACCT_COMPILE_ARGS);
 
   if (strlen(config_file)) {
     char canonical_path[PATH_MAX], *canonical_path_ptr;
@@ -243,445 +255,61 @@ int main(int argc,char **argv, char **envp)
   if (config.pidfile) write_pid_file(config.pidfile);
 
   /* signal handling we want to inherit to plugins (when not re-defined elsewhere) */
-  signal(SIGCHLD, startup_handle_falling_child); /* takes note of plugins failed during startup phase */
-  signal(SIGHUP, reload); /* handles reopening of syslog channel */
-  signal(SIGUSR1, SIG_IGN);
-  signal(SIGUSR2, reload_maps); /* sets to true the reload_maps flag */
-  signal(SIGPIPE, SIG_IGN); /* we want to exit gracefully when a pipe is broken */
-  signal(SIGINT, my_sigint_handler);
-  signal(SIGTERM, my_sigint_handler);
+  memset(&sighandler_action, 0, sizeof(sighandler_action)); /* To ensure the struct holds no garbage values */
+  sigemptyset(&sighandler_action.sa_mask);  /* Within a signal handler all the signals are enabled */
+  sighandler_action.sa_flags = SA_RESTART;  /* To enable re-entering a system call afer done with signal handling */
 
-  if (!config.nfacctd_bgp) config.nfacctd_bgp = BGP_DAEMON_ONLINE;
-  if (!config.nfacctd_bgp_port) config.nfacctd_bgp_port = BGP_TCP_PORT;
+  /* handles reopening of syslog channel */
+  sighandler_action.sa_handler = reload;
+  sigaction(SIGHUP, &sighandler_action, NULL);
+
+  /* logs various statistics via Log() calls */
+  sighandler_action.sa_handler = SIG_IGN;
+  sigaction(SIGUSR1, &sighandler_action, NULL);
+
+  /* sets to true the reload_maps flag */
+  sighandler_action.sa_handler = reload_maps;
+  sigaction(SIGUSR2, &sighandler_action, NULL);
+
+  /* we want to exit gracefully when a pipe is broken */
+  sighandler_action.sa_handler = SIG_IGN;
+  sigaction(SIGPIPE, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = PM_sigint_handler;
+  sigaction(SIGINT, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = PM_sigint_handler;
+  sigaction(SIGTERM, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = SIG_IGN;
+  sigaction(SIGCHLD, &sighandler_action, NULL);
+
+  sighandler_action.sa_handler = PM_sigalrm_noop_handler;
+  sigaction(SIGALRM, &sighandler_action, NULL);
+
+  if (!config.bgp_daemon) config.bgp_daemon = BGP_DAEMON_ONLINE;
+  if (!config.bgp_daemon_port) config.bgp_daemon_port = BGP_TCP_PORT;
 
 #if defined WITH_ZMQ
   if (config.bgp_lg) bgp_lg_wrapper();
+#else
+  if (config.bgp_lg) {
+    Log(LOG_ERR, "ERROR ( %s/core/lg ): 'bgp_daemon_lg' requires --enable-zmq. Exiting.\n", config.name);
+    exit_gracefully(1);
+  }
+#endif
+
+#ifdef WITH_REDIS
+  if (config.redis_host) {
+    char log_id[SHORTBUFLEN];
+
+    snprintf(log_id, sizeof(log_id), "%s/%s", config.name, config.type);
+    p_redis_init(&redis_host, log_id, p_redis_thread_produce_common_core_handler);
+  }
 #endif
 
   bgp_prepare_daemon();
   skinny_bgp_daemon();
+
+  return 0;
 }
-
-#if defined WITH_ZMQ
-void bgp_lg_wrapper()
-{
-  /* initialize variables */
-  if (!config.bgp_lg_ip) config.bgp_lg_ip = bgp_lg_default_ip;
-  if (!config.bgp_lg_port) config.bgp_lg_port = BGP_LG_DEFAULT_TCP_PORT;
-  if (!config.bgp_lg_threads) config.bgp_lg_threads = BGP_LG_DEFAULT_THREADS;
-
-  /* initialize threads pool */
-  bgp_lg_pool = allocate_thread_pool(1);
-  assert(bgp_lg_pool);
-  Log(LOG_DEBUG, "DEBUG ( %s/core/lg ): pmbgpd Looking Glass thread initialized\n", config.name, 1);
-
-  /* giving a kick to the BGP thread */
-  send_to_pool(bgp_lg_pool, bgp_lg_daemon, NULL);
-}
-
-void bgp_lg_daemon()
-{
-  char inproc_str[] = "inproc://lg_host_backend", log_id[SHORTBUFLEN];
-  struct p_zmq_host lg_host;
-  int idx;
-
-  memset(&lg_host, 0, sizeof(lg_host));
-
-  snprintf(log_id, sizeof(log_id), "%s/core/lg", config.name);
-  p_zmq_set_log_id(&lg_host, log_id);
-
-  if (config.bgp_lg_user) p_zmq_set_username(&lg_host, config.bgp_lg_user);
-  if (config.bgp_lg_passwd) p_zmq_set_password(&lg_host, config.bgp_lg_passwd);
-
-  p_zmq_router_setup(&lg_host, config.bgp_lg_ip, config.bgp_lg_port);
-  Log(LOG_INFO, "INFO ( %s/core/lg ): Looking Glass listening on %s:%u\n", config.name, config.bgp_lg_ip, config.bgp_lg_port);
-
-  // XXX: more encodings supported in future?
-  lg_host.router_worker.func = &bgp_lg_daemon_worker_json;
-  p_zmq_router_backend_setup(&lg_host, config.bgp_lg_threads, inproc_str);
-}
-
-void bgp_lg_daemon_worker_json(void *zh, void *zs)
-{
-  struct p_zmq_host *lg_host = (struct p_zmq_host *) zh;
-  struct p_zmq_sock *sock = zs;
-  struct bgp_lg_req req;
-  struct bgp_lg_rep ipl_rep, gp_rep;
-  int ret;
-
-  if (!lg_host || !sock) {
-    Log(LOG_ERR, "ERROR ( %s/core/lg ): bgp_lg_daemon_worker no lg_host or sock\nExiting.\n", config.name);
-    exit(1);
-  }
-
-  memset(&ipl_rep, 0, sizeof(ipl_rep));
-  memset(&gp_rep, 0, sizeof(gp_rep));
-
-  for (;;) {
-    memset(&req, 0, sizeof(req));
-    ret = bgp_lg_daemon_decode_query_header_json(sock, &req);
-
-    switch(req.type) {
-    case BGP_LG_QT_IP_LOOKUP:
-      {
-        struct bgp_lg_req_ipl_data query_data;
-
-        req.data = &query_data;
-	memset(req.data, 0, sizeof(struct bgp_lg_req_ipl_data));
-        ret = bgp_lg_daemon_decode_query_ip_lookup_json(sock, req.data);
-
-        bgp_lg_rep_init(&ipl_rep);
-        if (!ret) ret = bgp_lg_daemon_ip_lookup(req.data, &ipl_rep, FUNC_TYPE_BGP); 
-
-        bgp_lg_daemon_encode_reply_ip_lookup_json(sock, &ipl_rep, ret);
-      }
-      break;
-    case BGP_LG_QT_GET_PEERS:
-      bgp_lg_rep_init(&gp_rep);
-      ret = bgp_lg_daemon_get_peers(&gp_rep, FUNC_TYPE_BGP);
-      bgp_lg_daemon_encode_reply_get_peers_json(sock, &gp_rep, ret);
-
-      break;
-    case BGP_LG_QT_UNKNOWN:
-    default:
-      bgp_lg_daemon_encode_reply_unknown_json(sock);
-      break;
-    }
-  }
-}
-
-int bgp_lg_daemon_decode_query_header_json(struct p_zmq_sock *sock, struct bgp_lg_req *req) 
-{
-  json_t *req_obj, *query_type_json, *queries_num_json;
-  json_error_t req_err;
-  char *req_str;
-  int ret = SUCCESS;
-
-  if (!sock || !req) return ERR;
-
-  req_str = p_zmq_recv_str(sock);
-  if (req_str) {
-    req_obj = json_loads(req_str, 0, &req_err);
-    free(req_str);
-  }
-  else {
-    req_obj = NULL;
-    ret = ERR;
-  }
-
-  if (req_obj) {
-    if (!json_is_object(req_obj)) {
-      Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_header_json(): json_is_object() failed.\n", config.name);
-      ret = ERR;
-      goto exit_lane;
-    }
-    else {
-      query_type_json = json_object_get(req_obj, "query_type");
-      if (query_type_json == NULL) {
-        Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_header_json(): no 'query_type' element.\n", config.name);
-        ret = ERR;
-        goto exit_lane;
-      }
-      else {
-	req->type = json_integer_value(query_type_json);
-	json_decref(query_type_json);
-      }
-
-      queries_num_json = json_object_get(req_obj, "queries");
-      if (queries_num_json == NULL) {
-        Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_header_json(): no 'queries' element.\n", config.name);
-        ret = ERR;
-        goto exit_lane;
-      }
-      else {
-        req->num = json_integer_value(queries_num_json);
-        json_decref(queries_num_json);
-      }
-
-      /* XXX: only one query per query message currently supported */
-      if (req->num != 1) {
-        Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_header_json(): 'queries' element != 1.\n", config.name);
-        ret = ERR;
-        goto exit_lane;
-      }
-    }
-
-    exit_lane:
-    json_decref(req_obj);
-  }
-  else {
-    Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_header_json(): invalid request received: %s.\n", config.name, req_err.text);
-    ret = ERR;
-  }
-
-  return ret;
-}
-
-int bgp_lg_daemon_decode_query_ip_lookup_json(struct p_zmq_sock *sock, struct bgp_lg_req_ipl_data *req) 
-{
-  json_error_t req_err;
-  json_t *req_obj, *peer_ip_src_json, *bgp_port_json, *ip_prefix_json, *rd_json;
-  const char *peer_ip_src_str, *ip_prefix_str, *rd_str;
-  char *req_str;
-  int ret = SUCCESS, default_timeout = -1, query_timeout = 0;
-  struct rd_as4 *rd_as4_ptr; 
-  u_int16_t bgp_port = 0;
-
-  if (!sock || !req) return ERR;
-
-  req_str = p_zmq_recv_str(sock);
-
-  if (req_str) {
-    req_obj = json_loads(req_str, 0, &req_err);
-    free(req_str);
-  }
-  else {
-    req_obj = NULL;
-    ret = ERR;
-  }
-
-  if (req_obj) {
-    if (!json_is_object(req_obj)) {
-      Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): json_is_object() failed.\n", config.name);
-      ret = ERR;
-      goto exit_lane;
-    }
-    else {
-      bgp_port_json = json_object_get(req_obj, "peer_tcp_port");
-      if (bgp_port_json) {
-        int bgp_port_int;
-
-        bgp_port_int = json_integer_value(bgp_port_json);
-        if (bgp_port_int >= 0 && bgp_port_int <= 65535) bgp_port = bgp_port_int;
-        else {
-          Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): bogus 'peer_tcp_port' element.\n", config.name);
-          ret = ERR;
-          goto exit_lane;
-        }
-
-        json_decref(bgp_port_json);
-      }
-
-      peer_ip_src_json = json_object_get(req_obj, "peer_ip_src");
-      if (peer_ip_src_json == NULL) {
-	Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): no 'peer_ip_src' element.\n", config.name);
-	ret = ERR;
-	goto exit_lane;
-      }
-      else {
-	struct host_addr peer_ip_src_ha;
-
-	peer_ip_src_str = json_string_value(peer_ip_src_json);
-	str_to_addr(peer_ip_src_str, &peer_ip_src_ha);
-	addr_to_sa(&req->peer, &peer_ip_src_ha, bgp_port);
-	if (!req->peer.sa_family) {
-	  Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): bogus 'peer_ip_src' element.\n", config.name);
-	  ret = ERR;
-	  goto exit_lane;
-	}
-
-        json_decref(peer_ip_src_json);
-      }
-
-      ip_prefix_json = json_object_get(req_obj, "ip_prefix");
-      if (ip_prefix_json == NULL) {
-	Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): no 'ip_prefix' element.\n", config.name);
-	ret = ERR;
-	goto exit_lane;
-      }
-      else {
-	ip_prefix_str = json_string_value(ip_prefix_json);
-	str2prefix(ip_prefix_str, &req->pref);
-	if (!req->pref.family) {
-	  Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): bogus 'ip_prefix' element.\n", config.name);
-	  ret = ERR;
-	  goto exit_lane;
-	}
-
-        json_decref(ip_prefix_json);
-      }
-
-      rd_json = json_object_get(req_obj, "rd");
-      if (rd_json) {
-        rd_str = json_string_value(rd_json);
-        bgp_str2rd(&req->rd, (char *) rd_str);
-	rd_as4_ptr = (struct rd_as4 *) &req->rd;
-        if (!rd_as4_ptr->as) {
-          Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): bogus 'rd' element.\n", config.name);
-          ret = ERR;
-          goto exit_lane;
-        }
-
-        json_decref(rd_json);
-      }
-    }
-
-    exit_lane:
-    json_decref(req_obj);
-  }
-  else {
-    Log(LOG_WARNING, "WARN ( %s/core/lg ): bgp_lg_daemon_decode_query_ip_lookup_json(): invalid request received: %s.\n", config.name, req_err.text);
-    ret = ERR;
-  }
-
-  return ret;
-}
-
-void bgp_lg_daemon_encode_reply_results_json(struct p_zmq_sock *sock, struct bgp_lg_rep *rep, int res, int query_type)
-{
-  json_t *rep_results_obj;
-  char *rep_results_str;
-
-  rep_results_obj = json_object();
-  json_object_set_new_nocheck(rep_results_obj, "results", json_integer(rep->results));
-  json_object_set_new_nocheck(rep_results_obj, "query_type", json_integer(query_type));
-
-  if (!rep->results && res) {
-    switch (res) {
-    case BGP_LOOKUP_ERR:
-      json_object_set_new_nocheck(rep_results_obj, "text", json_string("lookup error"));
-      break;
-    case BGP_LOOKUP_NOPREFIX:
-      json_object_set_new_nocheck(rep_results_obj, "text", json_string("prefix not found"));
-      break;
-    case BGP_LOOKUP_NOPEER:
-      json_object_set_new_nocheck(rep_results_obj, "text", json_string("peer not found"));
-      break;
-    default:
-      json_object_set_new_nocheck(rep_results_obj, "text", json_string("unknown lookup error"));
-      break;
-    }
-  }
-
-  rep_results_str = json_dumps(rep_results_obj, JSON_PRESERVE_ORDER);
-  json_decref(rep_results_obj);
-
-  if (rep_results_str) {
-    if (!rep->results) p_zmq_send_str(sock, rep_results_str);
-    else p_zmq_sendmore_str(sock, rep_results_str);
-
-    free(rep_results_str);
-  }
-}
-
-void bgp_lg_daemon_encode_reply_ip_lookup_json(struct p_zmq_sock *sock, struct bgp_lg_rep *rep, int res) 
-{
-  if (!sock || !rep) return;
-
-  bgp_lg_daemon_encode_reply_results_json(sock, rep, res, BGP_LG_QT_IP_LOOKUP);  
-
-  if (rep->results) {
-    struct bgp_lg_rep_data *data;
-    struct bgp_lg_rep_ipl_data *ipl_data;
-    json_t *rep_data_obj;
-    char *rep_data_str;
-    u_int32_t idx;
-
-    for (idx = 0, data = rep->data; idx < rep->results; idx++) {
-      ipl_data = data->ptr;
-
-      rep_data_str = bgp_lg_daemon_encode_reply_ip_lookup_data_json(ipl_data);
-
-      if (rep_data_str) {
-	if (idx == (rep->results - 1)) p_zmq_send_str(sock, rep_data_str); 
-        else p_zmq_sendmore_str(sock, rep_data_str);
-
-	free(rep_data_str);
-      }
-
-      data = data->next;
-    }
-  }
-}
-
-char *bgp_lg_daemon_encode_reply_ip_lookup_data_json(struct bgp_lg_rep_ipl_data *rep_data)
-{
-  struct bgp_node dummy_node;
-  char event_type[] = "lglass", *data_str = NULL;
-
-  if (rep_data && rep_data->pref) {
-    memset(&dummy_node, 0, sizeof(dummy_node));
-    memcpy(&dummy_node.p, rep_data->pref, sizeof(struct prefix)); 
-
-    bgp_peer_log_msg(&dummy_node, rep_data->info, rep_data->afi, rep_data->safi, event_type,
-		     PRINT_OUTPUT_JSON, &data_str, BGP_LOG_TYPE_MISC);
-  }
-
-  return data_str;
-}
-
-void bgp_lg_daemon_encode_reply_get_peers_json(struct p_zmq_sock *sock, struct bgp_lg_rep *rep, int res) 
-{
-  if (!sock || !rep) return;
-
-  bgp_lg_daemon_encode_reply_results_json(sock, rep, res, BGP_LG_QT_GET_PEERS);
-
-  if (rep->results) {
-    struct bgp_lg_rep_data *data;
-    struct bgp_lg_rep_gp_data *gp_data;
-    json_t *rep_data_obj;
-    char *rep_data_str;
-    u_int32_t idx;
-
-    for (idx = 0, data = rep->data; idx < rep->results; idx++) {
-      gp_data = data->ptr;
-
-      rep_data_str = bgp_lg_daemon_encode_reply_get_peers_data_json(gp_data);
-
-      if (rep_data_str) {
-        if (idx == (rep->results - 1)) p_zmq_send_str(sock, rep_data_str);
-        else p_zmq_sendmore_str(sock, rep_data_str);
-
-        free(rep_data_str);
-      }
-
-      data = data->next;
-    }
-  }
-}
-
-char *bgp_lg_daemon_encode_reply_get_peers_data_json(struct bgp_lg_rep_gp_data *rep_data)
-{
-  struct bgp_misc_structs *bms;
-  char ip_address[INET6_ADDRSTRLEN], *data_str = NULL;
-  json_t *obj = json_object();
-
-  if (rep_data) {
-    struct bgp_peer *peer = rep_data->peer;
-
-    bms = bgp_select_misc_db(peer->type);
-    if (!bms) return NULL;
-
-    addr_to_str(ip_address, &peer->addr);
-    json_object_set_new_nocheck(obj, bms->peer_str, json_string(ip_address));
-
-    addr_to_str(ip_address, &peer->id);
-    json_object_set_new_nocheck(obj, "peer_id", json_string(ip_address));
-
-    json_object_set_new_nocheck(obj, "peer_tcp_port", json_integer((json_int_t)peer->tcp_port));
-    json_object_set_new_nocheck(obj, "peer_as", json_integer((json_int_t)peer->as));
-
-    data_str = compose_json_str(obj); 
-  }
-
-  return data_str;
-}
-
-void bgp_lg_daemon_encode_reply_unknown_json(struct p_zmq_sock *sock)
-{
-  json_t *rep_results_obj;
-  char *rep_results_str;
-
-  if (!sock) return;
-
-  rep_results_obj = json_object();
-  json_object_set_new_nocheck(rep_results_obj, "results", json_integer(FALSE));
-  json_object_set_new_nocheck(rep_results_obj, "query_type", json_integer(BGP_LG_QT_UNKNOWN));
-  json_object_set_new_nocheck(rep_results_obj, "text", json_string("unsupported query_type"));
-
-  rep_results_str = json_dumps(rep_results_obj, JSON_PRESERVE_ORDER);
-  json_decref(rep_results_obj);
-
-  p_zmq_send_str(sock, rep_results_str);
-}
-#endif /* WITH_ZMQ */ 

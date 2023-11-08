@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2013 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -24,8 +24,6 @@ const struct _map_dictionary_line igp_daemon_map_dictionary[] = {
   {"area_id", igp_daemon_map_area_id_handler},
   {"adj_metric", igp_daemon_map_adj_metric_handler},
   {"reach_metric", igp_daemon_map_reach_metric_handler},
-#if defined ENABLE_IPV6
   {"reach6_metric", igp_daemon_map_reach6_metric_handler},
-#endif
   {"", NULL}
 };

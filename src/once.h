@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2019 by Paolo Lucente
 */
 
 /*
@@ -22,26 +22,18 @@
 #ifndef _ONCE_H_
 #define _ONCE_H_
 
-#if defined __PMACCTD_C || defined __NFACCTD_C || defined __SFACCTD_C || defined __UACCTD_C || defined __PMACCT_CLIENT_C || defined __PMTELEMETRYD_C || defined __PMBGPD_C || defined __PMBMPD_C
-#define EXT 
-#else
-#define EXT extern
-#endif
-
-EXT u_int32_t PdataSz, ChBufHdrSz, CharPtrSz, CounterSz, HostAddrSz;
-EXT u_int32_t PpayloadSz, PextrasSz, PmsgSz, PvhdrSz, PtLabelTSz;
-EXT u_int32_t PmLabelTSz;
-EXT u_int32_t NfHdrV5Sz, NfHdrV1Sz, NfHdrV7Sz, NfHdrV8Sz, NfHdrV9Sz;
-EXT u_int32_t IpFixHdrSz;
-EXT u_int32_t NfDataHdrV9Sz, NfTplHdrV9Sz, NfOptTplHdrV9Sz;
-EXT u_int32_t NfTplFieldV9Sz;
-EXT u_int32_t NfDataV1Sz, NfDataV5Sz, NfDataV7Sz;
-EXT u_int32_t IP4HdrSz, IP4TlSz, IP6HdrSz, IP6AddrSz, IP6TlSz; 
-EXT u_int32_t MyTLHdrSz, TCPFlagOff;
-EXT u_int32_t SFSampleSz, SFLAddressSz, SFrenormEntrySz;
-EXT u_int32_t PptrsSz, UDPHdrSz, CSSz, MyTCPHdrSz, IpFlowCmnSz; 
-EXT u_int16_t PbgpSz, PlbgpSz, PnatSz, PmplsSz, PtunSz;
-
-#undef EXT
+extern u_int32_t PdataSz, ChBufHdrSz, CharPtrSz, CounterSz, HostAddrSz;
+extern u_int32_t PpayloadSz, PextrasSz, PmsgSz, PvhdrSz, PtLabelTSz;
+extern u_int32_t PmLabelTSz;
+extern u_int32_t NfHdrV5Sz, NfHdrV9Sz;
+extern u_int32_t IpFixHdrSz;
+extern u_int32_t NfDataHdrV9Sz, NfTplHdrV9Sz, NfOptTplHdrV9Sz;
+extern u_int32_t NfTplFieldV9Sz;
+extern u_int32_t NfDataV5Sz;
+extern u_int32_t IP4HdrSz, IP4TlSz, IP6HdrSz, IP6AddrSz, IP6TlSz;
+extern u_int32_t MyTLHdrSz, TCPFlagOff;
+extern u_int32_t SFSampleSz, SFLAddressSz, SFrenormEntrySz;
+extern u_int32_t PptrsSz, UDPHdrSz, CSSz, MyTCPHdrSz, IpFlowCmnSz;
+extern u_int16_t PbgpSz, PlbgpSz, PnatSz, PmplsSz, PtunSz;
 
 #endif /* _ONCE_H_ */

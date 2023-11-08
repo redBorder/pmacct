@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2016 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2020 by Paolo Lucente
 */
 
 /*
@@ -40,15 +40,15 @@
 #define ERRNO_IO_RETRY(EN) (((EN) == EAGAIN) || ((EN) == EWOULDBLOCK) || ((EN) == EINTR))
 
 /* structures */
-static struct _devices_struct _isis_devices[] = {
+static struct _devices_struct __attribute__((unused))  _isis_devices[] = {
 #if defined DLT_LINUX_SLL
   {isis_sll_handler, DLT_LINUX_SLL},
 #endif
   {NULL, -1},
 };
 
-struct pcap_isis_callback_data {
-  struct pcap_device *device;
+struct pm_pcap_isis_callback_data {
+  struct pm_pcap_device *device;
   struct isis_circuit *circuit;
 };
 
@@ -62,9 +62,7 @@ struct igp_map_entry {
   u_int16_t area_id;
   struct igp_map_metric adj_metric[MAX_IGP_MAP_ELEM];
   struct igp_map_metric reach_metric[MAX_IGP_MAP_ELEM];
-#ifdef ENABLE_IPV6
   struct igp_map_metric reach6_metric[MAX_IGP_MAP_ELEM];
-#endif
   u_int8_t adj_metric_num;
   u_int8_t reach_metric_num;
   u_int8_t reach6_metric_num;
@@ -77,38 +75,31 @@ struct sysid_fragment {
 };
 
 /* prototypes */
-#if (!defined __ISIS_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void nfacctd_isis_wrapper();
-EXT void skinny_isis_daemon();
-EXT void isis_pdu_runner(u_char *, const struct pcap_pkthdr *, const u_char *);
-EXT int iso_handler(register struct packet_ptrs *);
+extern void nfacctd_isis_wrapper();
+extern int skinny_isis_daemon();
+extern void isis_pdu_runner(u_char *, const struct pcap_pkthdr *, const u_char *);
+extern int iso_handler(register struct packet_ptrs *);
 
-EXT int igp_daemon_map_node_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
-EXT int igp_daemon_map_area_id_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
-EXT int igp_daemon_map_adj_metric_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
-EXT int igp_daemon_map_reach_metric_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
-#ifdef ENABLE_IPV6
-EXT int igp_daemon_map_reach6_metric_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
-#endif
-EXT void igp_daemon_map_validate(char *, struct plugin_requests *);
-EXT void igp_daemon_map_initialize(char *, struct plugin_requests *);
-EXT void igp_daemon_map_finalize(char *, struct plugin_requests *);
-EXT int igp_daemon_map_handle_len(int *, int, struct plugin_requests *, char *);
-EXT int igp_daemon_map_handle_lsp_id(char *, struct host_addr *);
-EXT void isis_srcdst_lookup(struct packet_ptrs *);
+extern int igp_daemon_map_node_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
+extern int igp_daemon_map_area_id_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
+extern int igp_daemon_map_adj_metric_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
+extern int igp_daemon_map_reach_metric_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
+extern int igp_daemon_map_reach6_metric_handler(char *, struct id_entry *, char *, struct plugin_requests *, int);
+extern void igp_daemon_map_validate(char *, struct plugin_requests *);
+extern void igp_daemon_map_initialize(char *, struct plugin_requests *);
+extern void igp_daemon_map_finalize(char *, struct plugin_requests *);
+extern int igp_daemon_map_handle_len(int *, int, struct plugin_requests *, char *);
+extern int igp_daemon_map_handle_lsp_id(u_char *, struct host_addr *);
+extern void isis_srcdst_lookup(struct packet_ptrs *);
 
 /* global variables */
-EXT struct thread_master *master;
-EXT struct isis *isis;
-EXT struct in_addr router_id_zebra; /* XXX: do something with this eventually */
-EXT struct timeval isis_now, isis_spf_deadline, isis_psnp_deadline;
-EXT struct igp_map_entry ime;
-EXT pcap_dumper_t *idmm_fd; /* igp_daemon_map : file descriptor for igp_daemon_map_msglog */
-EXT u_int32_t glob_isis_seq_num; 
-EXT struct sysid_fragment sysid_fragment_table[MAX_IGP_MAP_NODES];
-#undef EXT
+extern struct thread_master *master;
+extern struct isis *isis;
+extern struct in_addr router_id_zebra; /* XXX: do something with this eventually */
+extern struct timeval isis_now, isis_spf_deadline, isis_psnp_deadline;
+extern struct igp_map_entry ime;
+extern pcap_dumper_t *idmm_fd; /* igp_daemon_map : file descriptor for igp_daemon_map_msglog */
+extern u_int32_t glob_isis_seq_num; 
+extern struct sysid_fragment sysid_fragment_table[MAX_IGP_MAP_NODES];
+
 #endif

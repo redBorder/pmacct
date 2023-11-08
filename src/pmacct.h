@@ -1,6 +1,6 @@
 /*  
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2018 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -30,9 +30,11 @@
 #include <pcap.h>
 #endif
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
@@ -43,10 +45,6 @@
 
 #if defined HAVE_MALLOPT
 #include <malloc.h>
-#endif
-
-#if defined (HAVE_ZLIB)
-#include <zlib.h>
 #endif
 
 #include <ctype.h>
@@ -67,7 +65,14 @@
 #include <sys/resource.h>
 #include <dirent.h>
 #include <limits.h>
+#include <pwd.h>
+#include <grp.h>
+#include <dlfcn.h>
+#include <math.h>
 #include "pmsearch.h"
+#include "linklist.h"
+#include "filters/bloom.h"
+#include <cdada.h>
 
 #include <sys/mman.h>
 #if !defined (MAP_ANONYMOUS)
@@ -78,6 +83,10 @@
 #define USE_DEVZERO 1
 #endif
 #endif
+
+#include "pmacct-version.h"
+#include "pmacct-build.h"
+#include "pmacct-defines.h"
 
 #if defined (WITH_GEOIP)
 #include <GeoIP.h>
@@ -93,12 +102,6 @@
 #include <ndpi_main.h>
 #endif
 
-#if defined (WITH_ZMQ)
-#include <zmq.h>
-#endif
-
-#include "pmacct-build.h"
-
 #if !defined ETHER_ADDRSTRLEN
 #define ETHER_ADDRSTRLEN 18
 #endif
@@ -109,7 +112,9 @@
 #define INET6_ADDRSTRLEN 46
 #endif
 
-#if (defined SOLARIS) && (defined CPU_sparc)
+#if defined IM_BIG_ENDIAN
+#define ntohs(x) (x)
+#define ntohl(x) (x)
 #define htons(x) (x)
 #define htonl(x) (x)
 #endif
@@ -127,11 +132,7 @@
 #define u_int64_t uint64_t
 #endif
 
-#if defined HAVE_64BIT_COUNTERS
 #define MOREBUFSZ 32
-#else
-#define MOREBUFSZ 0
-#endif
 
 #ifndef LOCK_UN
 #define LOCK_UN 8
@@ -139,12 +140,6 @@
 
 #ifndef LOCK_EX
 #define LOCK_EX 2
-#endif
-
-#ifdef NOINLINE
-#define Inline
-#else
-#define Inline static inline
 #endif
 
 /* Let work the unaligned copy macros the hard way: byte-per byte copy via
@@ -210,7 +205,7 @@ struct plugin_requests {
 };
 
 typedef struct {
-  char *val;
+  u_char *val;
   u_int16_t len;
 } pm_hash_key_t;
 
@@ -227,11 +222,35 @@ typedef struct {
 #include <avro.h>
 #endif
 
-#include "pmacct-defines.h"
+#if (defined WITH_AVRO)
+#if (!defined WITH_JANSSON)
+#error "--enable-avro requires --enable-jansson"
+#endif
+#endif
+
+#if (defined WITH_SERDES)
+#if (!defined WITH_AVRO)
+#error "--enable-serdes requires --enable-avro"
+#endif
+#endif
+
+#ifdef WITH_REDIS
+#include "redis_common.h"
+#endif
+
+#ifdef WITH_GNUTLS
+#include <gnutls/gnutls.h>
+#include <gnutls/dtls.h>
+
+#define PM_GNUTLS_KEYFILE "key.pem"
+#define PM_GNUTLS_CERTFILE "cert.pem"
+#define PM_GNUTLS_CAFILE "ca-certificates.crt"
+#endif
+
+#include "addr.h"
 #include "network.h"
 #include "pretag.h"
 #include "cfg.h"
-#include "util.h"
 #include "xflow_status.h"
 #include "log.h"
 #include "once.h"
@@ -240,33 +259,24 @@ typedef struct {
 /*
  * htonvl(): host to network (byte ordering) variable length
  * ntohvl(): network to host (byer ordering) variable length
- *
- * This is in order to handle meaningfully both 32bit and 64bit
- * counters avoiding a bunch of #if-#else statements.
  */
-#if defined HAVE_64BIT_COUNTERS
 #define htonvl(x) pm_htonll(x)
 #define ntohvl(x) pm_ntohll(x)
 #define CACHE_THRESHOLD UINT64T_THRESHOLD
-#else
-#define htonvl(x) htonl(x)
-#define ntohvl(x) ntohl(x)
-#define CACHE_THRESHOLD UINT32T_THRESHOLD
-#endif
 
 /* structures */
-struct pcap_interface {
+struct pm_pcap_interface {
   u_int32_t ifindex;
   char ifname[IFNAMSIZ];
   int direction;
 };
 
-struct pcap_interfaces {
-  struct pcap_interface *list;
+struct pm_pcap_interfaces {
+  struct pm_pcap_interface *list;
   int num;
 };
 
-struct pcap_device {
+struct pm_pcap_device {
   char str[IFNAMSIZ];
   u_int32_t id;
   pcap_t *dev_desc;
@@ -275,24 +285,40 @@ struct pcap_device {
   int errors; /* error count when reading from a savefile */
   int fd;
   struct _devices_struct *data; 
-  struct pcap_interface *pcap_if;
+  struct pm_pcap_interface *pcap_if;
 };
 
-struct pcap_devices {
-  struct pcap_device list[PCAP_MAX_INTERFACES];
+struct pm_pcap_devices {
+  struct pm_pcap_device list[PCAP_MAX_INTERFACES];
   int num;
 };
 
-struct pcap_callback_data {
+struct pm_pcap_callback_signals {
+  int is_set;
+  sigset_t set;
+};
+
+struct pm_pcap_callback_data {
   u_char * f_agent; 
   u_char * bta_table;
   u_char * bpas_table; 
   u_char * blp_table; 
   u_char * bmed_table; 
   u_char * biss_table; 
-  struct pcap_device *device;
+  struct pm_pcap_device *device;
   u_int32_t ifindex_in;
   u_int32_t ifindex_out;
+  u_int8_t has_tun_prims;
+  struct pm_pcap_callback_signals sig;
+};
+
+struct pm_dump_runner {
+  u_int16_t id;
+  u_int64_t seq;
+  u_int64_t first;
+  u_int64_t last;
+  int noop;
+  void *extra; /* extra data to pass to the runner thread */
 };
 
 struct _protocols_struct {
@@ -317,16 +343,21 @@ struct _primitives_matrix_struct {
   char desc[PRIMITIVE_DESC_LEN];
 };
 
-struct smallbuf {
-  u_char base[SRVBUFLEN];
-  u_char *end;
-  u_char *ptr;
-};	
+struct _id_to_string_struct {
+  u_int64_t id;
+  char str[PRIMITIVE_DESC_LEN];
+};
 
 struct largebuf {
   u_char base[LARGEBUFLEN];
   u_char *end;
   u_char *ptr;
+};
+
+struct largebuf_s {
+  char base[LARGEBUFLEN];
+  char *end;
+  char *ptr;
 };
 
 struct child_ctl2 {
@@ -341,72 +372,56 @@ struct child_ctl2 {
 	x.end = x.base+sizeof(x.base); \
 	x.ptr = x.base;
 
+#include "util.h"
+
 /* prototypes */
 void startup_handle_falling_child();
 void handle_falling_child();
 void ignore_falling_child();
-void my_sigint_handler();
-void reload();
-void push_stats();
-void reload_maps();
-#if (!defined __PMACCTD_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT void pm_pcap_device_initialize(struct pcap_devices *);
-EXT void pm_pcap_device_copy_all(struct pcap_devices *, struct pcap_devices *);
-EXT void pm_pcap_device_copy_entry(struct pcap_devices *, struct pcap_devices *, int);
-EXT int pm_pcap_device_getindex_byifname(struct pcap_devices *, char *);
-EXT pcap_t *pm_pcap_open(const char *, int, int, int, int, int, char *);
-EXT int pm_pcap_add_interface(struct pcap_device *, char *, struct pcap_interface *, int);
-#undef EXT
+void PM_sigint_handler(int);
+void PM_sigalrm_noop_handler(int);
+void reload(int);
+void push_stats(int);
+void reload_maps(int);
+extern void pm_pcap_device_initialize(struct pm_pcap_devices *);
+extern void pm_pcap_device_copy_all(struct pm_pcap_devices *, struct pm_pcap_devices *);
+extern void pm_pcap_device_copy_entry(struct pm_pcap_devices *, struct pm_pcap_devices *, int);
+extern int pm_pcap_device_getindex_by_ifname_direction(struct pm_pcap_devices *, char *, int);
+extern pcap_t *pm_pcap_open(const char *, int, int, int, int, int, char *);
+extern void pm_pcap_add_filter(struct pm_pcap_device *);
+extern int pm_pcap_add_interface(struct pm_pcap_device *, char *, struct pm_pcap_interface *, int);
+extern void pm_pcap_check(struct pm_pcap_device *);
 
-#if (!defined __LL_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT char sll_mac[2][ETH_ADDR_LEN];
+extern void null_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void eth_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void fddi_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void tr_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern u_int16_t mpls_handler(u_char *, u_int16_t *, u_int16_t *, register struct packet_ptrs *);
+extern void ppp_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void ieee_802_11_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void sll_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern void raw_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
+extern u_char *llc_handler(const struct pcap_pkthdr *, u_int, register u_char *, register struct packet_ptrs *);
+extern void chdlc_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
 
-EXT void null_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT void eth_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT void fddi_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT void tr_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT u_int16_t mpls_handler(u_char *, u_int16_t *, u_int16_t *, register struct packet_ptrs *);
-EXT void ppp_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT void ieee_802_11_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT void sll_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT void raw_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-EXT u_char *llc_handler(const struct pcap_pkthdr *, u_int, register u_char *, register struct packet_ptrs *);
-EXT void chdlc_handler(const struct pcap_pkthdr *, register struct packet_ptrs *);
-#undef EXT
-
-#if (!defined __NL_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT int ip_handler(register struct packet_ptrs *);
-EXT int ip6_handler(register struct packet_ptrs *);
-EXT int gtp_tunnel_func(register struct packet_ptrs *);
-EXT int gtp_tunnel_configurator(struct tunnel_handler *, char *);
-EXT void tunnel_registry_init();
-EXT void pcap_cb(u_char *, const struct pcap_pkthdr *, const u_char *);
-EXT int PM_find_id(struct id_table *, struct packet_ptrs *, pm_id_t *, pm_id_t *);
-EXT void compute_once();
-EXT void set_index_pkt_ptrs(struct packet_ptrs *);
-EXT ssize_t recvfrom_savefile(struct pcap_device *, void **, struct sockaddr *, struct timeval **);
-#undef EXT
+extern int ip_handler(register struct packet_ptrs *);
+extern int ip6_handler(register struct packet_ptrs *);
+extern int unknown_etype_handler(register struct packet_ptrs *);
+extern int gtp_tunnel_func(register struct packet_ptrs *);
+extern int gtp_tunnel_configurator(struct tunnel_handler *, char *);
+extern void tunnel_registry_init();
+extern void pm_pcap_cb(u_char *, const struct pcap_pkthdr *, const u_char *);
+extern int PM_find_id(struct id_table *, struct packet_ptrs *, pm_id_t *, pm_id_t *);
+extern void PM_print_stats(time_t);
+extern void compute_once();
+extern void reset_index_pkt_ptrs(struct packet_ptrs *);
+extern void set_index_pkt_ptrs(struct packet_ptrs *);
+extern void PM_evaluate_flow_type(struct packet_ptrs *);
+extern ssize_t recvfrom_savefile(struct pm_pcap_device *, void **, struct sockaddr *, struct timeval **, int *, struct packet_ptrs *);
+extern ssize_t recvfrom_rawip(unsigned char *, size_t, struct sockaddr *, struct packet_ptrs *);
 
 #ifndef HAVE_STRLCPY
 size_t strlcpy(char *, const char *, size_t);
-#endif
-
-#if (defined WITH_JANSSON)
-#if (!defined HAVE_JSON_OBJECT_UPDATE_MISSING)
-int json_object_update_missing(json_t *, json_t *);
-#endif
 #endif
 
 void
@@ -421,28 +436,36 @@ void
 initsetproctitle(int, char**, char**);
 
 /* global variables */
-#if (!defined __PMACCTD_C) && (!defined __NFACCTD_C) && (!defined __SFACCTD_C) && (!defined __UACCTD_C) && (!defined __PMTELEMETRYD_C) && (!defined __PMBGPD_C) && (!defined __PMBMPD_C)
-#define EXT extern
-#else
-#define EXT
-#endif
-EXT struct host_addr mcast_groups[MAX_MCAST_GROUPS];
-EXT int reload_map, reload_map_exec_plugins, reload_geoipv2_file;
-EXT int reload_map_bgp_thread, reload_log_bgp_thread;
-EXT int reload_map_bmp_thread, reload_log_bmp_thread;
-EXT int reload_map_telemetry_thread, reload_log_telemetry_thread;
-EXT int reload_map_pmacctd;
-EXT int reload_log_sf_cnt;
-EXT int data_plugins, tee_plugins;
-EXT struct timeval reload_map_tstamp;
-EXT struct child_ctl2 dump_writers;
-EXT int debug;
-EXT struct configuration config; /* global configuration structure */
-EXT struct plugins_list_entry *plugins_list; /* linked list of each plugin configuration */
-EXT pid_t failed_plugins[MAX_N_PLUGINS]; /* plugins failed during startup phase */
-EXT u_char dummy_tlhdr[16];
-EXT struct pcap_devices device, bkp_device;
-EXT struct pcap_interfaces pcap_if_map, bkp_pcap_if_map;
-EXT struct pcap_stat ps;
-#undef EXT
+extern char sll_mac[2][ETH_ADDR_LEN];
+extern struct host_addr mcast_groups[MAX_MCAST_GROUPS];
+extern int reload_map, reload_map_exec_plugins, reload_geoipv2_file;
+extern int reload_map_bgp_thread, reload_log, reload_log_bgp_thread;
+extern int reload_map_bmp_thread, reload_log_bmp_thread;
+extern int reload_map_rpki_thread, reload_log_rpki_thread;
+extern int reload_map_telemetry_thread, reload_log_telemetry_thread;
+extern int reload_map_pmacctd;
+extern int print_stats;
+extern int reload_log_sf_cnt;
+extern int data_plugins, tee_plugins;
+extern int collector_port;
+extern struct timeval reload_map_tstamp;
+extern struct child_ctl2 dump_writers;
+extern int debug;
+extern struct configuration config; /* global configuration structure */
+extern struct plugins_list_entry *plugins_list; /* linked list of each plugin configuration */
+extern pid_t failed_plugins[MAX_N_PLUGINS]; /* plugins failed during startup phase */
+extern u_char dummy_tlhdr[16], empty_mem_area_256b[SRVBUFLEN];
+extern struct pm_pcap_device device;
+extern struct pm_pcap_devices devices, bkp_devices;
+extern struct pm_pcap_interfaces pm_pcap_if_map, pm_bkp_pcap_if_map;
+extern struct pcap_stat ps;
+extern struct sigaction sighandler_action;
+
+extern char pmacctd_globstr[];
+extern char nfacctd_globstr[];
+extern char sfacctd_globstr[];
+extern char uacctd_globstr[];
+extern char pmtele_globstr[];
+extern char pmbgpd_globstr[];
+extern char pmbmpd_globstr[];
 #endif /* _PMACCT_H_ */

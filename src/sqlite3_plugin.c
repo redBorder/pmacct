@@ -1,6 +1,6 @@
 /*
     pmacct (Promiscuous mode IP Accounting package)
-    pmacct is Copyright (C) 2003-2017 by Paolo Lucente
+    pmacct is Copyright (C) 2003-2022 by Paolo Lucente
 */
 
 /*
@@ -19,34 +19,43 @@
     Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define __SQLITE3_PLUGIN_C
-
 /* includes */
 #include "pmacct.h"
 #include "pmacct-data.h"
 #include "plugin_hooks.h"
 #include "sql_common.h"
+#include "sql_common_m.h"
 #include "sqlite3_plugin.h"
-#include "sql_common_m.c"
+
+char sqlite3_db[] = "/tmp/pmacct.db";
+char sqlite3_table[] = "acct";
+char sqlite3_table_v2[] = "acct_v2";
+char sqlite3_table_v3[] = "acct_v3";
+char sqlite3_table_v4[] = "acct_v4";
+char sqlite3_table_v5[] = "acct_v5";
+char sqlite3_table_v6[] = "acct_v6";
+char sqlite3_table_v7[] = "acct_v7";
+char sqlite3_table_v8[] = "acct_v8";
+char sqlite3_table_bgp[] = "acct_bgp";
 
 /* Functions */
 void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr) 
 {
   struct pkt_data *data;
   struct ports_table pt;
+  struct protos_table prt, tost;
   struct pollfd pfd;
   struct insert_data idata;
   time_t refresh_deadline;
-  int timeout, refresh_timeout;
+  int refresh_timeout;
   int ret, num, recv_budget, poll_bypass;
   struct ring *rg = &((struct channels_list_entry *)ptr)->rg;
   struct ch_status *status = ((struct channels_list_entry *)ptr)->status;
-  struct plugins_list_entry *plugin_data = ((struct channels_list_entry *)ptr)->plugin;
   int datasize = ((struct channels_list_entry *)ptr)->datasize;
   u_int32_t bufsz = ((struct channels_list_entry *)ptr)->bufsize;
   pid_t core_pid = ((struct channels_list_entry *)ptr)->core_pid;
   struct networks_file_data nfd;
-  char *dataptr;
+  unsigned char *dataptr;
 
   unsigned char *rgptr;
   int pollagain = TRUE;
@@ -59,6 +68,10 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   struct p_zmq_host *zmq_host = &((struct channels_list_entry *)ptr)->zmq_host;
 #else
   void *zmq_host = NULL;
+#endif
+
+#ifdef WITH_REDIS
+  struct p_redis_host redis_host;
 #endif
 
   memcpy(&config, cfgptr, sizeof(struct configuration));
@@ -85,7 +98,7 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
   refresh_deadline = idata.now;
   idata.cfg = &config;
 
-  sql_init_maps(&extras, &prim_ptrs, &nt, &nc, &pt);
+  sql_init_maps(&extras, &prim_ptrs, &nt, &nc, &pt, &prt, &tost);
   sql_init_global_buffers();
   sql_init_historical_acct(idata.now, &idata);
   sql_init_triggers(idata.now, &idata);
@@ -106,6 +119,15 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 
   sql_link_backend_descriptors(&bed, &p, &b);
 
+#ifdef WITH_REDIS
+  if (config.redis_host) {
+    char log_id[SHORTBUFLEN];
+
+    snprintf(log_id, sizeof(log_id), "%s/%s", config.name, config.type);
+    p_redis_init(&redis_host, log_id, p_redis_thread_produce_common_plugin_handler);
+  }
+#endif
+
   /* plugin main loop */
   for(;;) {
     poll_again:
@@ -120,31 +142,18 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
     if (ret <= 0) {
       if (getppid() != core_pid) {
         Log(LOG_ERR, "ERROR ( %s/%s ): Core process *seems* gone. Exiting.\n", config.name, config.type);
-        exit_plugin(1);
+        exit_gracefully(1);
       }
 
       if (ret < 0) goto poll_again;
     }
 
     poll_ops:
-    idata.now = time(NULL);
-
-    if (config.sql_history) {
-      while (idata.now > (idata.basetime + idata.timeslot)) {
-        time_t saved_basetime = idata.basetime;
-
-        idata.basetime += idata.timeslot;
-        if (config.sql_history == COUNT_MONTHLY)
-          idata.timeslot = calc_monthly_timeslot(idata.basetime, config.sql_history_howmany, ADD);
-        glob_basetime = idata.basetime;
-        idata.new_basetime = saved_basetime;
-        glob_new_basetime = saved_basetime;
-      }
-    }
+    sql_update_time_reference(&idata);
 
     if (idata.now > refresh_deadline) {
-      if (qq_ptr) sql_cache_flush(queries_queue, qq_ptr, &idata, FALSE);
-      sql_cache_handle_flush_event(&idata, &refresh_deadline, &pt);
+      if (sql_qq_ptr) sql_cache_flush(sql_queries_queue, sql_qq_ptr, &idata, FALSE);
+      sql_cache_handle_flush_event(&idata, &refresh_deadline, &pt, &prt, &tost);
     }
     else {
       if (config.sql_trigger_exec) {
@@ -182,7 +191,7 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
         }
         else {
           if ((ret = read(pipe_fd, &rgptr, sizeof(rgptr))) == 0) 
-	    exit_plugin(1); /* we exit silently; something happened at the write end */
+	    exit_gracefully(1); /* we exit silently; something happened at the write end */
         }
 
         if ((rg->ptr + bufsz) > rg->end) rg->ptr = rg->base;
@@ -195,7 +204,7 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 	  else {
 	    rg_err_count++;
 	    if (config.debug || (rg_err_count > MAX_RG_COUNT_ERR)) {
-              Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected (plugin_buffer_size=%llu plugin_pipe_size=%llu).\n",
+              Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected (plugin_buffer_size=%" PRIu64 " plugin_pipe_size=%" PRIu64 ").\n",
                         config.name, config.type, config.buffer_size, config.pipe_size);
               Log(LOG_WARNING, "WARN ( %s/%s ): Increase values or look for plugin_buffer_size, plugin_pipe_size in CONFIG-KEYS document.\n\n",
                         config.name, config.type);
@@ -212,7 +221,7 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
       }
 #ifdef WITH_ZMQ
       else if (config.pipe_zmq) {
-	ret = p_zmq_plugin_pipe_recv(zmq_host, pipebuf, config.buffer_size);
+	ret = p_zmq_topic_recv(zmq_host, pipebuf, config.buffer_size);
 	if (ret > 0) {
 	  if (seq && (((struct ch_buf_hdr *)pipebuf)->seq != ((seq + 1) % MAX_SEQNUM))) {
 	    Log(LOG_WARNING, "WARN ( %s/%s ): Missing data detected. Sequence received=%u expected=%u\n",
@@ -228,11 +237,10 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
       data = (struct pkt_data *) (pipebuf+sizeof(struct ch_buf_hdr));
 
       if (config.debug_internal_msg) 
-        Log(LOG_DEBUG, "DEBUG ( %s/%s ): buffer received cpid=%u len=%llu seq=%u num_entries=%u\n",
-                config.name, config.type, core_pid, ((struct ch_buf_hdr *)pipebuf)->len,
-                seq, ((struct ch_buf_hdr *)pipebuf)->num);
+        Log(LOG_DEBUG, "DEBUG ( %s/%s ): buffer received len=%" PRIu64 " seq=%u num_entries=%u\n",
+                config.name, config.type, ((struct ch_buf_hdr *)pipebuf)->len, seq,
+                ((struct ch_buf_hdr *)pipebuf)->num);
 
-      if (!config.pipe_check_core_pid || ((struct ch_buf_hdr *)pipebuf)->core_pid == core_pid) {
       while (((struct ch_buf_hdr *)pipebuf)->num > 0) {
         for (num = 0; primptrs_funcs[num]; num++)
           (*primptrs_funcs[num])((u_char *)data, &extras, &prim_ptrs);
@@ -241,12 +249,20 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 	  (*net_funcs[num])(&nt, &nc, &data->primitives, prim_ptrs.pbgp, &nfd);
 
 	if (config.ports_file) {
-	  if (!pt.table[data->primitives.src_port]) data->primitives.src_port = 0;
-	  if (!pt.table[data->primitives.dst_port]) data->primitives.dst_port = 0;
+	  if (!pt.table[data->primitives.src_port]) data->primitives.src_port = PM_L4_PORT_OTHERS;
+	  if (!pt.table[data->primitives.dst_port]) data->primitives.dst_port = PM_L4_PORT_OTHERS;
+	}
+
+	if (config.protos_file) {
+	  if (!prt.table[data->primitives.proto]) data->primitives.proto = PM_IP_PROTO_OTHERS;
+	}
+
+	if (config.tos_file) {
+	  if (!tost.table[data->primitives.tos]) data->primitives.tos = PM_IP_TOS_OTHERS;
 	}
 
         prim_ptrs.data = data;
-        (*insert_func)(&prim_ptrs, &idata);
+        (*sql_insert_func)(&prim_ptrs, &idata);
 
         ((struct ch_buf_hdr *)pipebuf)->num--;
         if (((struct ch_buf_hdr *)pipebuf)->num) {
@@ -255,7 +271,6 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
           else dataptr += prim_ptrs.vlen_next_off;
           data = (struct pkt_data *) dataptr;
         }
-      }
       }
 
       recv_budget++;
@@ -266,7 +281,7 @@ void sqlite3_plugin(int pipe_fd, struct configuration *cfgptr, void *ptr)
 
 int SQLI_cache_dbop(struct DBdesc *db, struct db_cache *cache_elem, struct insert_data *idata)
 {
-  char *ptr_values, *ptr_where, *ptr_mv, *ptr_set, *ptr_insert;
+  char *ptr_values, *ptr_where, *ptr_mv, *ptr_set;
   int num=0, num_set=0, ret=0, have_flows=0, len=0;
 
   if (idata->mv.last_queue_elem) {
@@ -287,7 +302,6 @@ int SQLI_cache_dbop(struct DBdesc *db, struct db_cache *cache_elem, struct inser
   ptr_where = where_clause;
   ptr_values = values_clause; 
   ptr_set = set_clause;
-  ptr_insert = insert_full_clause;
   memset(where_clause, 0, sizeof(where_clause));
   memset(values_clause, 0, sizeof(values_clause));
   memset(set_clause, 0, sizeof(set_clause));
@@ -326,13 +340,8 @@ int SQLI_cache_dbop(struct DBdesc *db, struct db_cache *cache_elem, struct inser
     else {
       strncpy(insert_full_clause, insert_clause, SPACELEFT(insert_full_clause));
       strncat(insert_full_clause, insert_counters_clause, SPACELEFT(insert_full_clause));
-#if defined HAVE_64BIT_COUNTERS
-      if (have_flows) snprintf(ptr_values, SPACELEFT(values_clause), ", %llu, %llu, %llu)", cache_elem->packet_counter, cache_elem->bytes_counter, cache_elem->flows_counter);
-      else snprintf(ptr_values, SPACELEFT(values_clause), ", %llu, %llu)", cache_elem->packet_counter, cache_elem->bytes_counter);
-#else
-      if (have_flows) snprintf(ptr_values, SPACELEFT(values_clause), ", %lu, %lu, %lu)", cache_elem->packet_counter, cache_elem->bytes_counter, cache_elem->flows_counter);
-      else snprintf(ptr_values, SPACELEFT(values_clause), ", %lu, %lu)", cache_elem->packet_counter, cache_elem->bytes_counter);
-#endif
+      if (have_flows) snprintf(ptr_values, SPACELEFT(values_clause), ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 ")", cache_elem->packet_counter, cache_elem->bytes_counter, cache_elem->flows_counter);
+      else snprintf(ptr_values, SPACELEFT(values_clause), ", %" PRIu64 ", %" PRIu64 ")", cache_elem->packet_counter, cache_elem->bytes_counter);
     }
     
     strncpy(sql_data, insert_full_clause, sizeof(sql_data));
@@ -367,7 +376,7 @@ int SQLI_cache_dbop(struct DBdesc *db, struct db_cache *cache_elem, struct inser
 	else {
 	  Log(LOG_ERR, "ERROR ( %s/%s ): 'sql_multi_values' is too small (%d). Try with a larger value.\n",
 	  config.name, config.type, config.sql_multi_values);
-	  exit_plugin(1);
+	  exit_gracefully(1);
 	}
       }
     }
@@ -407,7 +416,7 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
 {
   struct db_cache *LastElemCommitted = NULL;
   time_t start;
-  int j, stop, ret, go_to_pending, saved_index = index;
+  int j, stop, go_to_pending, saved_index = index;
   char orig_insert_clause[LONGSRVBUFLEN], orig_update_clause[LONGSRVBUFLEN], orig_lock_clause[LONGSRVBUFLEN];
   char tmpbuf[LONGLONGSRVBUFLEN], tmptable[SRVBUFLEN];
   struct primitives_ptrs prim_ptrs;
@@ -416,7 +425,7 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
 
   if (!index) {
     Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - START (PID: %u) ***\n", config.name, config.type, writer_pid);
-    Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: 0/0, ET: 0) ***\n", config.name, config.type, writer_pid);
+    Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: 0/0, ET: X) ***\n", config.name, config.type, writer_pid);
     return;
   }
 
@@ -435,8 +444,8 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
   start = time(NULL);
 
   /* re-using pending queries queue stuff from parent and saving clauses */
-  memcpy(pending_queries_queue, queue, index*sizeof(struct db_cache *));
-  pqq_ptr = index;
+  memcpy(sql_pending_queries_queue, queue, index*sizeof(struct db_cache *));
+  sql_pqq_ptr = index;
 
   strlcpy(orig_insert_clause, insert_clause, LONGSRVBUFLEN);
   strlcpy(orig_update_clause, update_clause, LONGSRVBUFLEN);
@@ -444,9 +453,9 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
 
   start:
   memset(&idata->mv, 0, sizeof(struct multi_values));
-  memcpy(queue, pending_queries_queue, pqq_ptr*sizeof(struct db_cache *));
-  memset(pending_queries_queue, 0, pqq_ptr*sizeof(struct db_cache *));
-  index = pqq_ptr; pqq_ptr = 0;
+  memcpy(queue, sql_pending_queries_queue, sql_pqq_ptr*sizeof(struct db_cache *));
+  memset(sql_pending_queries_queue, 0, sql_pqq_ptr*sizeof(struct db_cache *));
+  index = sql_pqq_ptr; sql_pqq_ptr = 0;
 
   /* We check for variable substitution in SQL table */
   if (idata->dyn_table) {
@@ -472,15 +481,16 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
     pm_strftime_same(update_clause, LONGSRVBUFLEN, tmpbuf, &stamp, config.timestamps_utc);
     pm_strftime_same(lock_clause, LONGSRVBUFLEN, tmpbuf, &stamp, config.timestamps_utc);
     pm_strftime_same(idata->dyn_table_name, LONGSRVBUFLEN, tmpbuf, &stamp, config.timestamps_utc);
-    if (config.sql_table_schema) sql_create_table(bed.p, &stamp, &prim_ptrs);
   }
+
+  if (config.sql_table_schema) sql_create_table(bed.p, &queue[0]->basetime, &prim_ptrs);
 
   (*sqlfunc_cbr.lock)(bed.p); 
 
   for (idata->current_queue_elem = 0; idata->current_queue_elem < index; idata->current_queue_elem++) {
     go_to_pending = FALSE;
 
-    if (idata->dyn_table && (!idata->dyn_table_time_only || !config.nfacctd_time_new)) {
+    if (idata->dyn_table && (!idata->dyn_table_time_only || !config.nfacctd_time_new || (config.sql_refresh_time != idata->timeslot))) {
       time_t stamp = 0;
 
       memset(tmpbuf, 0, LONGLONGSRVBUFLEN); // XXX: pedantic?
@@ -493,9 +503,9 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
       pm_strftime_same(tmptable, LONGSRVBUFLEN, tmpbuf, &stamp, config.timestamps_utc);
 
       if (strncmp(idata->dyn_table_name, tmptable, SRVBUFLEN)) {
-        pending_queries_queue[pqq_ptr] = queue[idata->current_queue_elem];
+        sql_pending_queries_queue[sql_pqq_ptr] = queue[idata->current_queue_elem];
 
-        pqq_ptr++;
+        sql_pqq_ptr++;
         go_to_pending = TRUE;
       }
     }
@@ -520,10 +530,10 @@ void SQLI_cache_purge(struct db_cache *queue[], int index, struct insert_data *i
   if (b.fail) Log(LOG_ALERT, "ALERT ( %s/%s ): recovery for SQLite3 daemon failed.\n", config.name, config.type);
 
   /* If we have pending queries then start again */
-  if (pqq_ptr) goto start;
+  if (sql_pqq_ptr) goto start;
   
   idata->elap_time = time(NULL)-start; 
-  Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: %u/%u, ET: %u) ***\n", 
+  Log(LOG_INFO, "INFO ( %s/%s ): *** Purging cache - END (PID: %u, QN: %u/%u, ET: %lu) ***\n", 
 		config.name, config.type, writer_pid, idata->qn, saved_index, idata->elap_time); 
 
   if (config.sql_trigger_exec) {
@@ -585,7 +595,7 @@ int SQLI_compose_static_queries()
 
     if ((config.sql_table_version < 4 || config.sql_table_version >= SQL_TABLE_VERSION_BGP) && !config.sql_optimize_clauses) {
       Log(LOG_ERR, "ERROR ( %s/%s ): The accounting of flows requires SQL table v4. Exiting.\n", config.name, config.type);
-      exit_plugin(1);
+      exit_gracefully(1);
     }
   }
 
@@ -603,7 +613,7 @@ int SQLI_compose_static_queries()
 
   /* "LOCK ..." stuff */
   if (config.sql_locking_style) Log(LOG_WARNING, "WARN ( %s/%s ): sql_locking_style is not supported. Ignored.\n", config.name, config.type);
-  snprintf(lock_clause, sizeof(lock_clause), "BEGIN", config.sql_table);
+  snprintf(lock_clause, sizeof(lock_clause), "BEGIN");
   strncpy(unlock_clause, "COMMIT", sizeof(unlock_clause));
 
   /* "UPDATE ... SET ..." stuff */
@@ -701,7 +711,7 @@ void SQLI_create_dyn_table(struct DBdesc *db, char *buf)
     if (sqlite3_exec(db->desc, buf, NULL, NULL, NULL)) {
       Log(LOG_DEBUG, "DEBUG ( %s/%s ): FAILED query follows:\n%s\n", config.name, config.type, buf);
       SQLI_get_errmsg(db);
-      sql_db_errmsg(db);
+      sql_db_warnmsg(db);
     }
   }
 }
