@@ -139,5 +139,9 @@ rm -rf %{buildroot}/%{_datadir}/pmacct/{CONFIG-KEYS,FAQS,QUICKSTART,UPGRADE,docs
 
 %changelog
 * Thu Sep 28 2023 David Vanhoucke <dvanhoucke@redborder.com> - 1.7.8
+- Update to 1.7.8
+* Thu Apr 7 2022 Eduardo Reyes <eareyes@redborder.com> - 
+- Change services permissions
+* Thu Feb 8 2018 Juan J. Prieto <jjprieto@redborder.com> - 1.7.0-1
 - redborder spec version
 
