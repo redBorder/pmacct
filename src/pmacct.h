@@ -100,7 +100,7 @@
 #ifndef NDPI_LIB_COMPILATION
 #define NDPI_LIB_COMPILATION
 #endif
-#include <ndpi_main.h>
+#include <libndpi/ndpi_main.h>
 #undef NDPI_LIB_COMPILATION
 #endif
 

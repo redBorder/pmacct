@@ -44,3 +44,6 @@ docker/build_success.txt
 
 # JetBrains IDE files
 .idea/
+
+SOURCES
+pkgs
