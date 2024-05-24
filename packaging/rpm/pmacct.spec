@@ -20,7 +20,7 @@ Source10: pmbmpd
 Source11: pmtelemetryd.service
 Source12: pmtelemetryd
 
-Requires: bash redborder-common redborder-rubyrvm bash-completion
+Requires: bash redborder-common redborder-rubyrvm bash-completion librdkafka libndpi
 BuildRequires: gcc
 BuildRequires: make
 BuildRequires: libpcap-devel
