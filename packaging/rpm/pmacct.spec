@@ -20,7 +20,7 @@ Source10: pmbmpd
 Source11: pmtelemetryd.service
 Source12: pmtelemetryd
 
-Requires: bash redborder-common redborder-rubyrvm bash-completion librdkafka libndpi
+Requires: bash redborder-common redborder-rubyrvm bash-completion librdkafka libndpi GeoIP-GeoLite-data GeoIP-devel
 BuildRequires: gcc
 BuildRequires: make
 BuildRequires: libpcap-devel
