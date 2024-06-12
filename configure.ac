@@ -336,13 +336,22 @@ AC_ARG_WITH(pcap-libs,
 	PCAPLIBFOUND=1
   ])
 
+AC_ARG_WITH(pfring-libs,
+  [  --with-pfring-libs=DIR             Search the specified directory for pfring library],
+  [	
+	AC_LINEARIZE_PATH($withval, withval=$absdir)
+	LIBS="${LIBS} -L$withval"
+	PFRINGLIB=$withval
+	PFRINGLIBFOUND=1
+  ])
+
 if test x"$PCAPLIB" != x""; then
   AC_MSG_CHECKING(your own pcap libraries)
   if test -r $PCAPLIB/libpcap.a -o -r $PCAPLIB/libpcap.so; then
     AC_MSG_RESULT(ok)
     PCAP_LIB_FOUND=1
     AC_MSG_CHECKING(for PF_RING library)
-    if test -r $PCAPLIB/libpfring.a -o -r $PCAPLIB/libpfring.so; then
+    if test -r $PFRINGLIB/libpfring.a -o -r $PFRINGLIB/libpfring.so; then
       LIBS="${LIBS} -lpfring -lpcap"
       AC_MSG_RESULT(yes)
       PFRING_LIB_FOUND=1

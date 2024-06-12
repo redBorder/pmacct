@@ -20,7 +20,7 @@ Source10: pmbmpd
 Source11: pmtelemetryd.service
 Source12: pmtelemetryd
 
-Requires: bash redborder-common redborder-rubyrvm bash-completion librdkafka libndpi GeoIP-GeoLite-data GeoIP-devel
+Requires: bash redborder-common redborder-rubyrvm bash-completion librdkafka libndpi GeoIP-GeoLite-data GeoIP-devel pfring libpcap numactl-libs
 BuildRequires: gcc
 BuildRequires: make
 BuildRequires: libpcap-devel
@@ -33,6 +33,7 @@ BuildRequires: librdkafka
 BuildRequires: librdkafka-devel
 BuildRequires: libtool
 BuildRequires: libndpi libndpi-dev
+BuildRequires: pfring libpcap-devel numactl-devel numactl-libs
 
 Requires(post):     systemd
 Requires(preun):    systemd
@@ -54,6 +55,8 @@ export data to tools like RRDtool, GNUPlot, Net-SNMP, MRTG, and Cacti.
 chmod -x sql/pmacct-*
 
 %build
+ls /usr/lib
+
 export CFLAGS="%{optflags} -Wno-return-type -fcommon"
 ./autogen.sh
 %configure \
@@ -61,6 +64,8 @@ export CFLAGS="%{optflags} -Wno-return-type -fcommon"
     --prefix=%{_prefix} \
     --exec-prefix=%{_exec_prefix} \
     --sbindir=%{_sbindir} \
+    --with-pcap-libs=/usr/local/lib \
+    --with-pfring-libs=/usr/lib \
     --enable-l2 \
     --enable-ipv6 \
     --enable-v4-mapped \
@@ -69,8 +74,7 @@ export CFLAGS="%{optflags} -Wno-return-type -fcommon"
     --enable-64bit \
     --enable-threads \
     --enable-kafka \
-    --enable-ndpi
-
+    --enable-ndpi 
 
 make %{?_smp_mflags}
 
