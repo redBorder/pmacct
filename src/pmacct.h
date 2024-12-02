@@ -92,7 +92,7 @@
 #endif
 
 #if defined (WITH_NDPI)
-#include <ndpi_main.h>
+#include <libndpi/ndpi/ndpi_main.h>
 #endif
 
 #if !defined ETHER_ADDRSTRLEN

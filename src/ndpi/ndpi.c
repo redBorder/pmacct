@@ -440,7 +440,7 @@ u_int16_t pm_ndpi_node_guess_undetected_protocol(struct pm_ndpi_workflow *workfl
 {
   if (!flow || !workflow) return 0;
 
-  flow->detected_protocol = ndpi_guess_undetected_protocol(workflow->ndpi_struct,
+  flow->detected_protocol = ndpi_guess_undetected_protocol_v4(workflow->ndpi_struct,
 							   flow->ndpi_flow,
                                                            flow->protocol,
                                                            ntohl(flow->lower_ip),
